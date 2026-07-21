@@ -1,0 +1,252 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { StatusBar } from 'expo-status-bar';
+
+import { StockCard, type Stock } from '@/components/StockCard';
+import { PipelineColors } from '@/constants/pipeline-colors';
+import { fetchStockData, type StockQuote } from '@/services/api';
+
+const TICKERS_STORAGE_KEY = '@pipeline/watchlist_tickers';
+const DEFAULT_TICKERS = ['AAPL', 'TSLA'];
+
+export default function WatchlistScreen() {
+  const [stocks, setStocks] = useState<Stock[]>([]);
+  const [ticker, setTicker] = useState('');
+  const [isAdding, setIsAdding] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Load the saved watchlist on mount: read the ticker symbols from
+  // AsyncStorage (falling back to a default watchlist on first launch),
+  // then fetch fresh data for each from the Python API.
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadInitialStocks() {
+      let tickers: string[];
+      try {
+        const stored = await AsyncStorage.getItem(TICKERS_STORAGE_KEY);
+        tickers = stored ? (JSON.parse(stored) as string[]) : DEFAULT_TICKERS;
+      } catch {
+        tickers = DEFAULT_TICKERS;
+      }
+
+      const results = await Promise.allSettled(tickers.map((t) => fetchStockData(t)));
+
+      const loadedStocks: Stock[] = [];
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          loadedStocks.push({ ticker: tickers[index], ...result.value });
+        }
+      });
+
+      if (isMounted) {
+        setStocks(loadedStocks);
+        setIsInitializing(false);
+      }
+    }
+
+    loadInitialStocks();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Keep AsyncStorage in sync with the current watchlist. Skipped while
+  // initializing so we don't overwrite storage before the saved list loads.
+  useEffect(() => {
+    if (isInitializing) {
+      return;
+    }
+
+    const tickers = stocks.map((stock) => stock.ticker);
+    AsyncStorage.setItem(TICKERS_STORAGE_KEY, JSON.stringify(tickers)).catch((error) => {
+      console.warn('Failed to save watchlist to storage:', error);
+    });
+  }, [stocks, isInitializing]);
+
+  const handleAddTicker = async () => {
+    const normalizedTicker = ticker.trim().toUpperCase();
+    if (!normalizedTicker || isAdding) {
+      return;
+    }
+    if (stocks.some((stock) => stock.ticker === normalizedTicker)) {
+      setTicker('');
+      return;
+    }
+
+    setIsAdding(true);
+    try {
+      const quote = await fetchStockData(normalizedTicker);
+      setStocks((prevStocks) => [...prevStocks, { ticker: normalizedTicker, ...quote }]);
+      setTicker('');
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : `Failed to fetch data for ${normalizedTicker}.`;
+      Alert.alert('Could Not Add Ticker', message);
+    } finally {
+      setIsAdding(false);
+    }
+  };
+
+  const handleDeleteTicker = (tickerToDelete: string) => {
+    setStocks((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
+  };
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    try {
+      const tickersToRefresh = stocks.map((stock) => stock.ticker);
+      const results = await Promise.allSettled(tickersToRefresh.map((t) => fetchStockData(t)));
+
+      // Map successful results back by ticker (rather than by index) so a
+      // concurrent add/delete during the fetch can't misalign the data.
+      const freshQuotes = new Map<string, StockQuote>();
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          freshQuotes.set(tickersToRefresh[index], result.value);
+        }
+      });
+
+      setStocks((prevStocks) =>
+        prevStocks.map((stock) => {
+          const freshQuote = freshQuotes.get(stock.ticker);
+          return freshQuote ? { ticker: stock.ticker, ...freshQuote } : stock;
+        }),
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  return (
+    <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+      <StatusBar style="light" />
+
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>Pipeline</Text>
+      </View>
+
+      <View style={styles.inputRow}>
+        <TextInput
+          style={styles.input}
+          value={ticker}
+          onChangeText={setTicker}
+          placeholder="Add ticker (e.g. MSFT)"
+          placeholderTextColor={PipelineColors.textSecondary}
+          autoCapitalize="characters"
+          autoCorrect={false}
+          returnKeyType="done"
+          editable={!isAdding}
+          onSubmitEditing={handleAddTicker}
+        />
+        <TouchableOpacity
+          style={[styles.addButton, isAdding && styles.addButtonDisabled]}
+          onPress={handleAddTicker}
+          disabled={isAdding}>
+          {isAdding ? (
+            <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+          ) : (
+            <Text style={styles.addButtonText}>Add</Text>
+          )}
+        </TouchableOpacity>
+      </View>
+
+      {isInitializing ? (
+        <View style={styles.initializingContainer}>
+          <ActivityIndicator size="large" color={PipelineColors.textPrimary} />
+          <Text style={styles.initializingText}>Loading your watchlist...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={stocks}
+          keyExtractor={(item) => item.ticker}
+          renderItem={({ item }) => <StockCard stock={item} onDelete={handleDeleteTicker} />}
+          contentContainerStyle={styles.listContent}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor={PipelineColors.textPrimary}
+            />
+          }
+        />
+      )}
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: PipelineColors.background,
+  },
+  header: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  headerTitle: {
+    color: PipelineColors.textPrimary,
+    fontSize: 28,
+    fontWeight: '700',
+  },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    marginBottom: 12,
+    gap: 8,
+  },
+  input: {
+    flex: 1,
+    backgroundColor: PipelineColors.cardBackground,
+    color: PipelineColors.textPrimary,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+  },
+  addButton: {
+    backgroundColor: PipelineColors.bullish,
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    minWidth: 64,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  addButtonDisabled: {
+    opacity: 0.6,
+  },
+  addButtonText: {
+    color: PipelineColors.textPrimary,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  listContent: {
+    paddingBottom: 24,
+  },
+  initializingContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  initializingText: {
+    color: PipelineColors.textSecondary,
+    fontSize: 14,
+  },
+});
