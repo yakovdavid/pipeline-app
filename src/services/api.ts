@@ -3,9 +3,8 @@ export type StockQuote = {
   sma50: number;
 };
 
-// LAN IP of the machine running the FastAPI backend (see /backend).
-// Update this if your development machine's local network address changes.
-const API_BASE_URL = 'http://192.168.1.181:8000';
+// Production FastAPI backend (see /backend), deployed on Render.
+const API_BASE_URL = 'https://pipeline-app-1a68.onrender.com';
 
 export async function fetchStockData(ticker: string): Promise<StockQuote> {
   const normalizedTicker = ticker.trim().toUpperCase();
