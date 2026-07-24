@@ -8,4 +8,7 @@ export const PipelineColors = {
   textSecondary: '#A0A0A0',
   bullish: '#00C853',
   bearish: '#D50000',
+  core: '#1976D2',
+  satellite: '#F57C00',
+  quality: '#8E24AA',
 } as const;

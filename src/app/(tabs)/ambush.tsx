@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Clipboard from 'expo-clipboard';
 import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -7,7 +8,6 @@ import {
   RefreshControl,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -15,13 +15,18 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
 import { StockCard, type Stock } from '@/components/StockCard';
+import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
+import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { fetchStockData, type StockQuote } from '@/services/api';
+import { formatAmbushLines } from '@/utils/report-formatters';
 
-const TICKERS_STORAGE_KEY = '@pipeline/watchlist_tickers';
 const DEFAULT_TICKERS = ['AAPL', 'TSLA'];
 
-export default function WatchlistScreen() {
+// "Ambush Radar" tracks stocks against their 50-day SMA to surface
+// mean-reversion opportunities: a Bearish badge flags a stock trading below
+// its trend, a Bullish badge flags one trading above it.
+export default function AmbushRadarScreen() {
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [ticker, setTicker] = useState('');
   const [isAdding, setIsAdding] = useState(false);
@@ -37,7 +42,7 @@ export default function WatchlistScreen() {
     async function loadInitialStocks() {
       let tickers: string[];
       try {
-        const stored = await AsyncStorage.getItem(TICKERS_STORAGE_KEY);
+        const stored = await AsyncStorage.getItem(AMBUSH_TICKERS_STORAGE_KEY);
         tickers = stored ? (JSON.parse(stored) as string[]) : DEFAULT_TICKERS;
       } catch {
         tickers = DEFAULT_TICKERS;
@@ -73,7 +78,7 @@ export default function WatchlistScreen() {
     }
 
     const tickers = stocks.map((stock) => stock.ticker);
-    AsyncStorage.setItem(TICKERS_STORAGE_KEY, JSON.stringify(tickers)).catch((error) => {
+    AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(tickers)).catch((error) => {
       console.warn('Failed to save watchlist to storage:', error);
     });
   }, [stocks, isInitializing]);
@@ -132,26 +137,41 @@ export default function WatchlistScreen() {
     }
   };
 
+  const handleCopyAmbushData = async () => {
+    const timestamp = new Date().toLocaleString();
+    const report = [`Ambush Radar Report — ${timestamp}`, '', ...formatAmbushLines(stocks)].join(
+      '\n',
+    );
+
+    try {
+      await Clipboard.setStringAsync(report);
+      Alert.alert('Copied', 'Ambush Radar data copied to clipboard.');
+    } catch {
+      Alert.alert('Copy Failed', 'Could not copy Ambush Radar data to the clipboard.');
+    }
+  };
+
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
       <StatusBar style="light" />
 
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Pipeline</Text>
+        <Text style={styles.headerTitle}>Ambush Radar</Text>
+      </View>
+
+      <View style={styles.exportRow}>
+        <TouchableOpacity style={styles.exportButton} onPress={handleCopyAmbushData}>
+          <Text style={styles.exportButtonText}>Copy Ambush Data</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={styles.inputRow}>
-        <TextInput
-          style={styles.input}
+        <TickerAutocomplete
           value={ticker}
           onChangeText={setTicker}
-          placeholder="Add ticker (e.g. MSFT)"
-          placeholderTextColor={PipelineColors.textSecondary}
-          autoCapitalize="characters"
-          autoCorrect={false}
-          returnKeyType="done"
+          onSelectTicker={setTicker}
+          onSubmit={handleAddTicker}
           editable={!isAdding}
-          onSubmitEditing={handleAddTicker}
         />
         <TouchableOpacity
           style={[styles.addButton, isAdding && styles.addButtonDisabled]}
@@ -203,21 +223,28 @@ const styles = StyleSheet.create({
     fontSize: 28,
     fontWeight: '700',
   },
+  exportRow: {
+    paddingHorizontal: 16,
+    marginBottom: 12,
+  },
+  exportButton: {
+    backgroundColor: PipelineColors.cardBackground,
+    borderRadius: 8,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  exportButtonText: {
+    color: PipelineColors.textPrimary,
+    fontSize: 14,
+    fontWeight: '600',
+  },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
     marginBottom: 12,
     gap: 8,
-  },
-  input: {
-    flex: 1,
-    backgroundColor: PipelineColors.cardBackground,
-    color: PipelineColors.textPrimary,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 16,
+    zIndex: 10,
   },
   addButton: {
     backgroundColor: PipelineColors.bullish,

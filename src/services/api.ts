@@ -3,6 +3,12 @@ export type StockQuote = {
   sma50: number;
 };
 
+export type TickerSearchResult = {
+  symbol: string;
+  shortname: string;
+  exchDisp: string;
+};
+
 // Production FastAPI backend (see /backend), deployed on Render.
 const API_BASE_URL = 'https://pipeline-app-1a68.onrender.com';
 
@@ -36,4 +42,33 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
   }
 
   return { price: data.price, sma50: data.sma50 };
+}
+
+// Search-as-you-type autocomplete. Failures are swallowed and reported as
+// "no results" rather than thrown: a flaky network or a slow provider
+// shouldn't surface an error while the user is just typing, since manual
+// ticker entry (followed by Add) still works independently of search.
+export async function searchTickers(query: string): Promise<TickerSearchResult[]> {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    return [];
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/search/${encodeURIComponent(trimmedQuery)}`);
+  } catch {
+    return [];
+  }
+
+  if (!response.ok) {
+    return [];
+  }
+
+  try {
+    const data: unknown = await response.json();
+    return Array.isArray(data) ? (data as TickerSearchResult[]) : [];
+  } catch {
+    return [];
+  }
 }
