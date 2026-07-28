@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -18,42 +18,56 @@ import { StockCard, type Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
+import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { fetchStockData, type StockQuote } from '@/services/api';
+import type { AmbushTickerEntry } from '@/types/ambush';
+import type { AssetType } from '@/types/asset';
+import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
+import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
+import { normalizeTickerInput } from '@/utils/ticker';
 
-const DEFAULT_TICKERS = ['AAPL', 'TSLA'];
+const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
+  { ticker: 'AAPL', assetType: 'Stock' },
+  { ticker: 'TSLA', assetType: 'Stock' },
+];
 
-// "Ambush Radar" tracks stocks against their 50-day SMA to surface
-// mean-reversion opportunities: a Bearish badge flags a stock trading below
-// its trend, a Bullish badge flags one trading above it.
+// "Ambush Radar" tracks stocks and ETFs against their trend to surface
+// mean-reversion opportunities: stocks are judged against SMA50, ETFs
+// against the longer SMA200 (see StockCard for the trend rule itself).
 export default function AmbushRadarScreen() {
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [ticker, setTicker] = useState('');
+  const [selectedAssetType, setSelectedAssetType] = useState<AssetType>('Stock');
   const [isAdding, setIsAdding] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Load the saved watchlist on mount: read the ticker symbols from
+  // Tracks which ETFs have already triggered a structural stop notification
+  // this session, so we notify once per crossing rather than on every
+  // render while the price stays inside the warning zone.
+  const notifiedTickersRef = useRef<Set<string>>(new Set());
+
+  // Load the saved watchlist on mount: read the ticker/assetType pairs from
   // AsyncStorage (falling back to a default watchlist on first launch),
   // then fetch fresh data for each from the Python API.
   useEffect(() => {
     let isMounted = true;
 
     async function loadInitialStocks() {
-      let tickers: string[];
+      let entries: AmbushTickerEntry[];
       try {
-        const stored = await AsyncStorage.getItem(AMBUSH_TICKERS_STORAGE_KEY);
-        tickers = stored ? (JSON.parse(stored) as string[]) : DEFAULT_TICKERS;
+        entries = (await loadAmbushTickerEntries()) ?? DEFAULT_ENTRIES;
       } catch {
-        tickers = DEFAULT_TICKERS;
+        entries = DEFAULT_ENTRIES;
       }
 
-      const results = await Promise.allSettled(tickers.map((t) => fetchStockData(t)));
+      const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
 
       const loadedStocks: Stock[] = [];
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
-          loadedStocks.push({ ticker: tickers[index], ...result.value });
+          loadedStocks.push({ ...entries[index], ...result.value });
         }
       });
 
@@ -77,14 +91,38 @@ export default function AmbushRadarScreen() {
       return;
     }
 
-    const tickers = stocks.map((stock) => stock.ticker);
-    AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(tickers)).catch((error) => {
+    const entries: AmbushTickerEntry[] = stocks.map(({ ticker: symbol, assetType }) => ({
+      ticker: symbol,
+      assetType,
+    }));
+    AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(entries)).catch((error) => {
       console.warn('Failed to save watchlist to storage:', error);
     });
   }, [stocks, isInitializing]);
 
+  // Fire a one-time local notification for any ETF that has just entered
+  // the structural stop warning zone (within 2% of its SMA200). Re-arms if
+  // the price later moves back out, so a later re-entry notifies again.
+  useEffect(() => {
+    stocks.forEach((stock) => {
+      const isNearStructuralStop =
+        stock.assetType === 'ETF' &&
+        stock.sma200 !== null &&
+        stock.price <= stock.sma200 * STRUCTURAL_STOP_THRESHOLD;
+
+      if (isNearStructuralStop) {
+        if (!notifiedTickersRef.current.has(stock.ticker)) {
+          notifiedTickersRef.current.add(stock.ticker);
+          sendStructuralStopNotification(stock.ticker, stock.price, stock.sma200 as number);
+        }
+      } else {
+        notifiedTickersRef.current.delete(stock.ticker);
+      }
+    });
+  }, [stocks]);
+
   const handleAddTicker = async () => {
-    const normalizedTicker = ticker.trim().toUpperCase();
+    const normalizedTicker = normalizeTickerInput(ticker);
     if (!normalizedTicker || isAdding) {
       return;
     }
@@ -96,7 +134,10 @@ export default function AmbushRadarScreen() {
     setIsAdding(true);
     try {
       const quote = await fetchStockData(normalizedTicker);
-      setStocks((prevStocks) => [...prevStocks, { ticker: normalizedTicker, ...quote }]);
+      setStocks((prevStocks) => [
+        ...prevStocks,
+        { ticker: normalizedTicker, assetType: selectedAssetType, ...quote },
+      ]);
       setTicker('');
     } catch (error) {
       const message =
@@ -129,7 +170,7 @@ export default function AmbushRadarScreen() {
       setStocks((prevStocks) =>
         prevStocks.map((stock) => {
           const freshQuote = freshQuotes.get(stock.ticker);
-          return freshQuote ? { ticker: stock.ticker, ...freshQuote } : stock;
+          return freshQuote ? { ...stock, ...freshQuote } : stock;
         }),
       );
     } finally {
@@ -173,6 +214,27 @@ export default function AmbushRadarScreen() {
           onSubmit={handleAddTicker}
           editable={!isAdding}
         />
+      </View>
+
+      <View style={styles.assetTypeRow}>
+        <TouchableOpacity
+          style={[
+            styles.assetTypeButton,
+            { borderColor: PipelineColors.bullish },
+            selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
+          ]}
+          onPress={() => setSelectedAssetType('Stock')}>
+          <Text style={styles.assetTypeButtonText}>Stock</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[
+            styles.assetTypeButton,
+            { borderColor: PipelineColors.core },
+            selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
+          ]}
+          onPress={() => setSelectedAssetType('ETF')}>
+          <Text style={styles.assetTypeButtonText}>ETF</Text>
+        </TouchableOpacity>
         <TouchableOpacity
           style={[styles.addButton, isAdding && styles.addButtonDisabled]}
           onPress={handleAddTicker}
@@ -242,9 +304,29 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
-    marginBottom: 12,
+    marginBottom: 8,
     gap: 8,
     zIndex: 10,
+  },
+  assetTypeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    marginBottom: 12,
+    gap: 8,
+  },
+  assetTypeButton: {
+    flex: 1,
+    borderWidth: 1.5,
+    borderRadius: 8,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  assetTypeButtonText: {
+    color: PipelineColors.textPrimary,
+    fontSize: 14,
+    fontWeight: '600',
   },
   addButton: {
     backgroundColor: PipelineColors.bullish,

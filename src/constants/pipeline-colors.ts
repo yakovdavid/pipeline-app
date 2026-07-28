@@ -11,4 +11,7 @@ export const PipelineColors = {
   core: '#1976D2',
   satellite: '#F57C00',
   quality: '#8E24AA',
+  // Amber caution color: distinct from "bearish" (already-confirmed
+  // downtrend) — used for "approaching a risk threshold" warnings.
+  warning: '#FFA726',
 } as const;

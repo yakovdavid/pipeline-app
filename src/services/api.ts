@@ -1,6 +1,10 @@
 export type StockQuote = {
   price: number;
-  sma50: number;
+  // Yahoo Finance doesn't always publish these for every instrument (e.g. a
+  // very newly listed ticker), so the backend passes that absence through
+  // as null rather than failing the whole request.
+  sma50: number | null;
+  sma200: number | null;
 };
 
 export type TickerSearchResult = {
@@ -37,11 +41,15 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
 
   const data = (await response.json()) as Partial<StockQuote>;
 
-  if (typeof data.price !== 'number' || typeof data.sma50 !== 'number') {
+  if (typeof data.price !== 'number') {
     throw new Error(`Received malformed data for ${normalizedTicker}.`);
   }
 
-  return { price: data.price, sma50: data.sma50 };
+  return {
+    price: data.price,
+    sma50: typeof data.sma50 === 'number' ? data.sma50 : null,
+    sma200: typeof data.sma200 === 'number' ? data.sma200 : null,
+  };
 }
 
 // Search-as-you-type autocomplete. Failures are swallowed and reported as

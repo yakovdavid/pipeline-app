@@ -1,4 +1,5 @@
 import type { Stock } from '@/components/StockCard';
+import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import type { PortfolioStock } from '@/types/portfolio';
 
 // Shared by the Ambush Radar screen's own export and the Portfolio screen's
@@ -8,8 +9,23 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
     return ['  (none)'];
   }
   return stocks.map((stock) => {
-    const trend = stock.price > stock.sma50 ? 'Bullish' : 'Bearish';
-    return `  ${stock.ticker}: Price $${stock.price.toFixed(2)} | SMA50 $${stock.sma50.toFixed(2)} | ${trend}`;
+    // ETFs are judged against SMA200, stocks against SMA50 — matches the
+    // trend rule rendered on the card itself (see StockCard.tsx).
+    const relevantSma = stock.assetType === 'ETF' ? stock.sma200 : stock.sma50;
+    const trend = relevantSma === null ? 'N/A' : stock.price > relevantSma ? 'Bullish' : 'Bearish';
+    const sma50Text = stock.sma50 === null ? 'N/A' : `$${stock.sma50.toFixed(2)}`;
+    const sma200Text = stock.sma200 === null ? 'N/A' : `$${stock.sma200.toFixed(2)}`;
+
+    const isNearStructuralStop =
+      stock.assetType === 'ETF' &&
+      stock.sma200 !== null &&
+      stock.price <= stock.sma200 * STRUCTURAL_STOP_THRESHOLD;
+    const warningSuffix = isNearStructuralStop ? ' [STRUCTURAL STOP WARNING]' : '';
+
+    return (
+      `  ${stock.ticker} (${stock.assetType}): Price $${stock.price.toFixed(2)} | ` +
+      `SMA50 ${sma50Text} | SMA200 ${sma200Text} | ${trend}${warningSuffix}`
+    );
   });
 }
 
@@ -29,7 +45,12 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
     if (sectionStocks.length === 0) {
       lines.push('  (none)');
     } else {
-      sectionStocks.forEach((stock) => lines.push(`  ${stock.ticker}: $${stock.price.toFixed(2)}`));
+      sectionStocks.forEach((stock) => {
+        const totalValue = stock.units * stock.price;
+        lines.push(
+          `  ${stock.ticker}: ${stock.units} units @ $${stock.price.toFixed(2)} = $${totalValue.toFixed(2)}`,
+        );
+      });
     }
 
     if (index < PORTFOLIO_SECTIONS.length - 1) {
