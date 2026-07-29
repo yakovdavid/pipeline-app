@@ -45,6 +45,23 @@ TASE_TICKER_SUFFIX = ".TA"
 USD_ILS_FX_SYMBOL = "ILS=X"
 AGOROT_PER_SHEKEL = 100
 
+# Fallback data source: Yahoo's lighter /v8/finance/chart endpoint, used
+# when yfinance's quoteSummary-backed .info fails (observed: quoteSummary
+# gets blocked on Render's shared IPs even when this endpoint doesn't).
+# It doesn't expose fiftyDayAverage/twoHundredDayAverage directly, so we
+# request a year of daily closes and compute both SMAs ourselves.
+CHART_API_BASE_URL = "https://query2.finance.yahoo.com/v8/finance/chart"
+CHART_HISTORY_RANGE = "1y"
+CHART_HISTORY_INTERVAL = "1d"
+SMA_50_WINDOW = 50
+SMA_200_WINDOW = 200
+
+
+class TickerNotFoundError(Exception):
+    """Raised when Yahoo explicitly reports no data for a ticker, as
+    opposed to a transient network/rate-limit failure — lets callers map
+    this to a 404 instead of a 502."""
+
 # Standard browser headers layered on top of curl_cffi's TLS impersonation.
 # Yahoo Finance rejects requests without something resembling this, whether
 # hit via yfinance or the raw search endpoint.
@@ -107,23 +124,30 @@ def _is_retryable_error(error: Exception) -> bool:
     return any(str(code) in message for code in RETRYABLE_STATUS_CODES)
 
 
-def fetch_with_retry(fetch_fn: Callable[[], T], description: str) -> T:
+def fetch_with_retry(
+    fetch_fn: Callable[[], T],
+    description: str,
+    max_retries: int = MAX_RETRIES,
+    base_backoff_seconds: float = BASE_BACKOFF_SECONDS,
+) -> T:
     """Runs fetch_fn under the shared rate limiter, retrying on 429/503
-    with exponential backoff (2s, 4s, 8s) up to MAX_RETRIES times."""
+    with exponential backoff (base, base*2, base*4, ...) up to max_retries
+    times. Callers with a known-good fallback can pass a smaller
+    max_retries to fail fast instead of burning the full backoff budget."""
     last_error: Exception | None = None
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(max_retries + 1):
         try:
             with yahoo_rate_limiter:
                 return fetch_fn()
         except Exception as error:  # noqa: BLE001 - yfinance/curl_cffi/httpx all raise different types
             last_error = error
-            if attempt >= MAX_RETRIES or not _is_retryable_error(error):
+            if attempt >= max_retries or not _is_retryable_error(error):
                 raise
-            backoff_seconds = BASE_BACKOFF_SECONDS * (2**attempt)
+            backoff_seconds = base_backoff_seconds * (2**attempt)
             print(
                 f"[resilience] {description} failed on attempt {attempt + 1}/"
-                f"{MAX_RETRIES + 1} ({error}); retrying in {backoff_seconds:.0f}s."
+                f"{max_retries + 1} ({error}); retrying in {backoff_seconds:.0f}s."
             )
             time.sleep(backoff_seconds)
 
@@ -183,6 +207,85 @@ app.add_middleware(
 )
 
 
+# The primary (yfinance) path gets a much smaller retry budget than the
+# fallback: if quoteSummary is structurally blocked on this host, retrying
+# it repeatedly with a growing backoff just delays reaching the fallback
+# that's actually likely to work. One quick retry is enough to ride out a
+# one-off transient blip; the chart fallback below gets the full budget.
+PRIMARY_FETCH_MAX_RETRIES = 1
+PRIMARY_FETCH_BASE_BACKOFF_SECONDS = 1.0
+
+
+def _fetch_raw_quote_via_yfinance(symbol: str) -> tuple[float, float | None, float | None]:
+    """Primary data source: yfinance's quoteSummary-backed .info, which
+    directly exposes fiftyDayAverage/twoHundredDayAverage."""
+    info = fetch_with_retry(
+        lambda: yf.Ticker(symbol, session=_yahoo_session).info,
+        description=f"yfinance info fetch for '{symbol}'",
+        max_retries=PRIMARY_FETCH_MAX_RETRIES,
+        base_backoff_seconds=PRIMARY_FETCH_BASE_BACKOFF_SECONDS,
+    )
+
+    raw_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    if not raw_price:
+        raise TickerNotFoundError(f"yfinance returned no price for '{symbol}'")
+
+    return float(raw_price), info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")
+
+
+def _fetch_raw_quote_via_chart_fallback(symbol: str) -> tuple[float, float | None, float | None]:
+    """Fallback data source: a direct request to Yahoo's chart endpoint,
+    bypassing yfinance's quoteSummary machinery entirely. SMA50/SMA200 are
+    computed from the returned daily close history since Yahoo doesn't
+    include those fields on this endpoint."""
+
+    def do_fetch():
+        response = _yahoo_session.get(
+            f"{CHART_API_BASE_URL}/{symbol}",
+            params={"interval": CHART_HISTORY_INTERVAL, "range": CHART_HISTORY_RANGE},
+            timeout=10.0,
+        )
+        # Confirmed by testing: Yahoo returns HTTP 404 (with a well-formed
+        # {"chart": {"result": null, "error": {...}}} body) for an invalid
+        # ticker — that body is parsed below into a clean TickerNotFoundError,
+        # so we deliberately don't raise here for a 404. Any other error
+        # status (429/503/5xx) has no useful body, so it raises normally,
+        # letting fetch_with_retry retry it if appropriate.
+        if response.status_code != 404:
+            response.raise_for_status()
+        return response
+
+    response = fetch_with_retry(do_fetch, description=f"chart API fallback fetch for '{symbol}'")
+
+    try:
+        payload = response.json()
+        chart = payload.get("chart", {})
+        results = chart.get("result") or []
+        if not results:
+            error_description = (chart.get("error") or {}).get("description", "no data returned")
+            raise TickerNotFoundError(f"chart API returned no data for '{symbol}': {error_description}")
+
+        result = results[0]
+        meta = result.get("meta", {})
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+        closes = [close for close in quote.get("close", []) if close is not None]
+
+        price = meta.get("regularMarketPrice")
+        if price is None and closes:
+            price = closes[-1]
+        if price is None:
+            raise TickerNotFoundError(f"chart API returned no usable price for '{symbol}'")
+    except TickerNotFoundError:
+        raise
+    except (KeyError, IndexError, TypeError, ValueError) as parse_error:
+        raise ValueError(f"Failed to parse chart API response for '{symbol}': {parse_error}") from parse_error
+
+    sma50 = sum(closes[-SMA_50_WINDOW:]) / SMA_50_WINDOW if len(closes) >= SMA_50_WINDOW else None
+    sma200 = sum(closes[-SMA_200_WINDOW:]) / SMA_200_WINDOW if len(closes) >= SMA_200_WINDOW else None
+
+    return float(price), sma50, sma200
+
+
 def _fetch_usd_ils_rate() -> float:
     """Fetch the current USD/ILS exchange rate (shekels per one US dollar),
     using the 60s cache and the shared retry/throttle layer."""
@@ -224,25 +327,36 @@ def get_stock(ticker: str) -> dict[str, float | None]:
         return cached_result
 
     try:
-        info = fetch_with_retry(
-            lambda: yf.Ticker(symbol, session=_yahoo_session).info,
-            description=f"stock info fetch for '{symbol}'",
-        )
-    except Exception as error:  # yfinance raises various network/parse errors
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch data for ticker '{symbol}': {error}",
-        ) from error
+        raw_price, raw_sma50, raw_sma200 = _fetch_raw_quote_via_yfinance(symbol)
+    except TickerNotFoundError:
+        # A clean "not found" from yfinance itself is still worth
+        # double-checking against the fallback, since yfinance being
+        # blocked can sometimes surface as an empty/missing-price result
+        # rather than a raised network error.
+        raw_price = raw_sma50 = raw_sma200 = None
+    except Exception as primary_error:  # noqa: BLE001 - yfinance raises many different error types
+        print(f"[resilience] yfinance failed for '{symbol}' ({primary_error}); trying chart API fallback.")
+        raw_price = raw_sma50 = raw_sma200 = None
 
-    raw_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    if not raw_price:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No market data found for ticker '{symbol}'.",
-        )
-
-    raw_sma50 = info.get("fiftyDayAverage")
-    raw_sma200 = info.get("twoHundredDayAverage")
+    if raw_price is None:
+        try:
+            raw_price, raw_sma50, raw_sma200 = _fetch_raw_quote_via_chart_fallback(symbol)
+        except TickerNotFoundError as not_found_error:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No market data found for ticker '{symbol}'.",
+            ) from not_found_error
+        except Exception as fallback_error:  # noqa: BLE001 - network/parse errors from the fallback request
+            # Both data sources failed: return a clean, formatted JSON
+            # error instead of letting an unhandled exception surface as
+            # an opaque 502 from the platform (Render) itself.
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Failed to fetch data for ticker '{symbol}' from both yfinance and "
+                    f"the direct chart API fallback: {fallback_error}"
+                ),
+            ) from fallback_error
 
     if symbol.endswith(TASE_TICKER_SUFFIX):
         # Strict handling: if we can't get a trustworthy FX rate, refuse to
