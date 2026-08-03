@@ -62,6 +62,18 @@ class TickerNotFoundError(Exception):
     opposed to a transient network/rate-limit failure — lets callers map
     this to a 404 instead of a 502."""
 
+
+# Anomaly News Fetcher: flags same-day moves of ANOMALY_THRESHOLD_DEFAULT
+# (4%) or more and surfaces recent headlines to help explain the move.
+# This is supplementary/optional data (opted into via a query param on
+# /api/stock/{ticker}, not fetched by default — see get_stock), so it gets
+# its own small, fast-failing retry budget rather than the full one: a
+# failure here should never hold up the primary price/SMA response.
+ANOMALY_THRESHOLD_DEFAULT = 0.04
+ANOMALY_NEWS_COUNT = 3
+ANOMALY_FETCH_MAX_RETRIES = 1
+ANOMALY_FETCH_BASE_BACKOFF_SECONDS = 1.0
+
 # Standard browser headers layered on top of curl_cffi's TLS impersonation.
 # Yahoo Finance rejects requests without something resembling this, whether
 # hit via yfinance or the raw search endpoint.
@@ -286,6 +298,66 @@ def _fetch_raw_quote_via_chart_fallback(symbol: str) -> tuple[float, float | Non
     return float(price), sma50, sma200
 
 
+def fetch_anomaly_news(ticker_symbol: str, threshold: float = ANOMALY_THRESHOLD_DEFAULT) -> str | None:
+    """Checks whether ticker_symbol moved >= threshold since the prior
+    close and, if so, returns a formatted string naming the move plus its
+    latest news headlines. Returns None when there's no notable move.
+
+    Adapted from a plain yfinance snippet to actually be safe to run
+    against Yahoo from a cloud host: uses the shared TLS-impersonating
+    session (a bare `yf.Ticker(ticker_symbol)` with no session would skip
+    that entirely and risk the exact 429 blocking this file's resilience
+    layer exists to prevent) and a small retry budget via fetch_with_retry
+    instead of an unthrottled direct call.
+    """
+    try:
+        ticker = yf.Ticker(ticker_symbol, session=_yahoo_session)
+
+        hist = fetch_with_retry(
+            lambda: ticker.history(period="5d"),
+            description=f"anomaly history fetch for '{ticker_symbol}'",
+            max_retries=ANOMALY_FETCH_MAX_RETRIES,
+            base_backoff_seconds=ANOMALY_FETCH_BASE_BACKOFF_SECONDS,
+        )
+        if len(hist) < 2:
+            return None
+
+        prev_close = hist["Close"].iloc[-2]
+        current_price = hist["Close"].iloc[-1]
+        pct_change = (current_price - prev_close) / prev_close
+
+        if abs(pct_change) < threshold:
+            return None
+
+        direction = "CRASH" if pct_change < 0 else "SURGE"
+
+        news_data = fetch_with_retry(
+            lambda: ticker.news,
+            description=f"anomaly news fetch for '{ticker_symbol}'",
+            max_retries=ANOMALY_FETCH_MAX_RETRIES,
+            base_backoff_seconds=ANOMALY_FETCH_BASE_BACKOFF_SECONDS,
+        )
+        if not news_data:
+            return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] No recent news found."
+
+        # Verified against the live API: current Yahoo news items nest the
+        # headline under "content" (e.g. article["content"]["title"]), not
+        # as a flat article["title"] — falling back to the flat shape too
+        # in case Yahoo reverts it.
+        headlines = []
+        for article in news_data[:ANOMALY_NEWS_COUNT]:
+            content = article.get("content") or {}
+            title = content.get("title") or article.get("title") or "No Title"
+            headlines.append(title)
+
+        news_str = " | ".join(headlines)
+        return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] NEWS: {news_str}"
+
+    except Exception as error:  # noqa: BLE001 - supplementary data; never let this break the main stock response
+        print(f"[resilience] Anomaly news fetch failed for '{ticker_symbol}': {error}")
+        return None
+
+
 def _fetch_usd_ils_rate() -> float:
     """Fetch the current USD/ILS exchange rate (shekels per one US dollar),
     using the 60s cache and the shared retry/throttle layer."""
@@ -317,12 +389,20 @@ def _fetch_usd_ils_rate() -> float:
 
 
 @app.get("/api/stock/{ticker}")
-def get_stock(ticker: str) -> dict[str, float | None]:
+def get_stock(ticker: str, include_anomaly: bool = False) -> dict[str, float | str | None]:
     symbol = ticker.strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker symbol is required.")
 
-    cached_result = stock_cache.get(symbol)
+    # The anomaly check costs an extra Yahoo call (and, if triggered, a
+    # second one for news) on top of the price/SMA fetch, so it's opt-in
+    # rather than run on every request — this endpoint is called
+    # constantly (search-select, portfolio display, pull-to-refresh) and
+    # unconditionally adding an outbound call to all of that would work
+    # against the rate-limiting this file exists to enforce. The cache key
+    # includes the flag so the two response shapes never collide.
+    cache_key = f"{symbol}:anomaly" if include_anomaly else symbol
+    cached_result = stock_cache.get(cache_key)
     if cached_result is not None:
         return cached_result
 
@@ -377,12 +457,16 @@ def get_stock(ticker: str) -> dict[str, float | None]:
         sma50 = raw_sma50
         sma200 = raw_sma200
 
-    result = {
+    result: dict[str, float | str | None] = {
         "price": round(float(price), 2),
         "sma50": round(float(sma50), 2) if sma50 is not None else None,
         "sma200": round(float(sma200), 2) if sma200 is not None else None,
     }
-    stock_cache.set(symbol, result)
+
+    if include_anomaly:
+        result["anomaly"] = fetch_anomaly_news(symbol)
+
+    stock_cache.set(cache_key, result)
     return result
 
 
