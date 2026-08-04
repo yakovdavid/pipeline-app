@@ -12,6 +12,10 @@ export type Stock = {
   // instrument, so a missing value degrades the UI instead of failing it.
   sma50: number | null;
   sma200: number | null;
+  // Anomaly News Fetcher output: set when today's move is 4%+ and the
+  // backend found explanatory headlines. Not rendered on the card itself
+  // (see report-formatters.ts) — just carried through so exports can use it.
+  anomalyReport: string | null;
 };
 
 export type StockCardProps = {

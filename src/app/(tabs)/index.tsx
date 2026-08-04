@@ -5,6 +5,10 @@ import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -21,10 +25,11 @@ import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { TRAILING_STOP_MULTIPLIER } from '@/constants/thresholds';
-import { fetchStockData } from '@/services/api';
+import { fetchIntel, fetchStockData, type IntelResponse, type StockQuote } from '@/services/api';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
+import { createBackupPayload, parseBackupPayload, restoreBackupPayload, type BackupPayload } from '@/utils/backup';
 import { formatAmbushLines, formatPortfolioLines } from '@/utils/report-formatters';
 import { normalizeTickerInput } from '@/utils/ticker';
 
@@ -59,6 +64,16 @@ export default function PortfolioScreen() {
   const [isInitializing, setIsInitializing] = useState(true);
   const [isExportingAll, setIsExportingAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [isMenuVisible, setIsMenuVisible] = useState(false);
+  const [isAddModalVisible, setIsAddModalVisible] = useState(false);
+  const [isExportingBackup, setIsExportingBackup] = useState(false);
+  const [isImportModalVisible, setIsImportModalVisible] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [isRestoring, setIsRestoring] = useState(false);
+  const [isIntelModalVisible, setIsIntelModalVisible] = useState(false);
+  const [intelTicker, setIntelTicker] = useState('');
+  const [intelResult, setIntelResult] = useState<IntelResponse | null>(null);
+  const [isFetchingIntel, setIsFetchingIntel] = useState(false);
 
   // Load the saved portfolio on mount: read the ticker/category pairs from
   // AsyncStorage, then fetch a fresh live price for each from the Python API.
@@ -94,6 +109,7 @@ export default function PortfolioScreen() {
           loadedStocks.push({
             ...entry,
             price: result.value.price,
+            anomalyReport: result.value.anomalyReport,
             highestWatermark: computeHighestWatermark(
               entry.assetType,
               entry.highestWatermark,
@@ -165,11 +181,13 @@ export default function PortfolioScreen() {
           assetType: selectedAssetType,
           units: parsedUnits,
           price: quote.price,
+          anomalyReport: quote.anomalyReport,
           highestWatermark: computeHighestWatermark(selectedAssetType, null, quote.price),
         },
       ]);
       setTicker('');
       setUnits('1');
+      setIsAddModalVisible(false);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : `Failed to fetch data for ${normalizedTicker}.`;
@@ -212,26 +230,27 @@ export default function PortfolioScreen() {
       const tickersToRefresh = stocks.map((stock) => stock.ticker);
       const results = await Promise.allSettled(tickersToRefresh.map((t) => fetchStockData(t)));
 
-      const freshPrices = new Map<string, number>();
+      const freshQuotes = new Map<string, StockQuote>();
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
-          freshPrices.set(tickersToRefresh[index], result.value.price);
+          freshQuotes.set(tickersToRefresh[index], result.value);
         }
       });
 
       setStocks((prevStocks) =>
         prevStocks.map((stock) => {
-          const freshPrice = freshPrices.get(stock.ticker);
-          if (freshPrice === undefined) {
+          const freshQuote = freshQuotes.get(stock.ticker);
+          if (!freshQuote) {
             return stock;
           }
           return {
             ...stock,
-            price: freshPrice,
+            price: freshQuote.price,
+            anomalyReport: freshQuote.anomalyReport,
             highestWatermark: computeHighestWatermark(
               stock.assetType,
               stock.highestWatermark,
-              freshPrice,
+              freshQuote.price,
             ),
           };
         }),
@@ -293,6 +312,115 @@ export default function PortfolioScreen() {
     }
   };
 
+  const handleExportBackup = async () => {
+    setIsExportingBackup(true);
+    try {
+      const payload = await createBackupPayload();
+      await Clipboard.setStringAsync(JSON.stringify(payload));
+      Alert.alert(
+        'Backup Exported',
+        'Your Portfolio and Ambush Radar data has been copied to the clipboard as JSON. Paste it somewhere safe.',
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to export backup.';
+      Alert.alert('Export Failed', message);
+    } finally {
+      setIsExportingBackup(false);
+    }
+  };
+
+  const handleRestoreBackup = async () => {
+    let payload: BackupPayload;
+    try {
+      payload = parseBackupPayload(importText);
+    } catch (error) {
+      // Strict, on purpose: abort entirely rather than attempt a partial
+      // restore from a backup we can't fully trust.
+      const message = error instanceof Error ? error.message : 'The pasted text is not a valid backup.';
+      Alert.alert('Invalid Backup', message);
+      return;
+    }
+
+    setIsRestoring(true);
+    try {
+      await restoreBackupPayload(payload);
+
+      // Update this screen's own live state immediately (mirrors the
+      // initial-load flow); Ambush Radar's separate mounted screen picks up
+      // its half of the restore the next time its tab gains focus.
+      const results = await Promise.allSettled(
+        payload.portfolio.map((entry) => fetchStockData(entry.ticker)),
+      );
+
+      const hydratedStocks: PortfolioStock[] = [];
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          const entry = payload.portfolio[index];
+          hydratedStocks.push({
+            ...entry,
+            price: result.value.price,
+            anomalyReport: result.value.anomalyReport,
+            highestWatermark: computeHighestWatermark(
+              entry.assetType,
+              entry.highestWatermark,
+              result.value.price,
+            ),
+          });
+        }
+      });
+
+      setStocks(hydratedStocks);
+      setIsImportModalVisible(false);
+      setImportText('');
+      Alert.alert('Backup Restored', 'Your Portfolio and Ambush Radar data has been restored.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to restore the backup.';
+      Alert.alert('Restore Failed', message);
+    } finally {
+      setIsRestoring(false);
+    }
+  };
+
+  const handleFetchIntel = async () => {
+    const normalizedTicker = normalizeTickerInput(intelTicker);
+    if (!normalizedTicker) {
+      Alert.alert('Ticker Required', 'Please enter a ticker symbol.');
+      return;
+    }
+
+    setIsFetchingIntel(true);
+    setIntelResult(null);
+    try {
+      const result = await fetchIntel(normalizedTicker);
+      setIntelResult(result);
+      if (result.news.length === 0) {
+        Alert.alert('No News Found', `No recent news was found for ${result.ticker}.`);
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : `Failed to fetch intel for ${normalizedTicker}.`;
+      Alert.alert('Intel Fetch Failed', message);
+    } finally {
+      setIsFetchingIntel(false);
+    }
+  };
+
+  const handleCopyIntel = async () => {
+    if (!intelResult || intelResult.news.length === 0) {
+      return;
+    }
+
+    const lines = intelResult.news.map((article) => `${article.title} — ${article.publisher}`);
+    const text = [`Intel: ${intelResult.ticker}`, '', ...lines].join('\n');
+
+    try {
+      await Clipboard.setStringAsync(text);
+      Alert.alert('Copied', 'Intel headlines copied to clipboard.');
+    } catch {
+      Alert.alert('Copy Failed', 'Could not copy intel to the clipboard.');
+    }
+  };
+
   const coreStocks = stocks.filter((stock) => stock.category === 'Core');
   const satelliteStocks = stocks.filter((stock) => stock.category === 'Satellite');
   const qualityStocks = stocks.filter((stock) => stock.category === 'Quality');
@@ -307,104 +435,11 @@ export default function PortfolioScreen() {
 
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Portfolio</Text>
-      </View>
-
-      <View style={styles.exportRow}>
-        <TouchableOpacity style={styles.exportButton} onPress={handleCopyPortfolioData}>
-          <Text style={styles.exportButtonText}>Copy Portfolio Data</Text>
-        </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.exportButton, isExportingAll && styles.exportButtonDisabled]}
-          onPress={handleCopyAllData}
-          disabled={isExportingAll}>
-          {isExportingAll ? (
-            <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
-          ) : (
-            <Text style={styles.exportButtonText}>Copy ALL Data</Text>
-          )}
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.inputRow}>
-        <TickerAutocomplete
-          value={ticker}
-          onChangeText={setTicker}
-          onSelectTicker={setTicker}
-          onSubmit={handleAddTicker}
-          editable={!isAdding}
-        />
-        <TextInput
-          style={styles.unitsInput}
-          value={units}
-          onChangeText={setUnits}
-          placeholder="Units"
-          placeholderTextColor={PipelineColors.textSecondary}
-          keyboardType="numeric"
-          editable={!isAdding}
-        />
-      </View>
-
-      <View style={styles.categoryRow}>
-        <TouchableOpacity
-          style={[
-            styles.categoryButton,
-            { borderColor: PipelineColors.core },
-            selectedCategory === 'Core' && { backgroundColor: PipelineColors.core },
-          ]}
-          onPress={() => setSelectedCategory('Core')}>
-          <Text style={styles.categoryButtonText}>Core</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[
-            styles.categoryButton,
-            { borderColor: PipelineColors.satellite },
-            selectedCategory === 'Satellite' && { backgroundColor: PipelineColors.satellite },
-          ]}
-          onPress={() => setSelectedCategory('Satellite')}>
-          <Text style={styles.categoryButtonText}>Satellite</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[
-            styles.categoryButton,
-            { borderColor: PipelineColors.quality },
-            selectedCategory === 'Quality' && { backgroundColor: PipelineColors.quality },
-          ]}
-          onPress={() => setSelectedCategory('Quality')}>
-          <Text style={styles.categoryButtonText}>Quality</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.assetTypeRow}>
-        <TouchableOpacity
-          style={[
-            styles.assetTypeButton,
-            { borderColor: PipelineColors.bullish },
-            selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
-          ]}
-          onPress={() => setSelectedAssetType('Stock')}>
-          <Text style={styles.assetTypeButtonText}>Stock</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[
-            styles.assetTypeButton,
-            { borderColor: PipelineColors.core },
-            selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
-          ]}
-          onPress={() => setSelectedAssetType('ETF')}>
-          <Text style={styles.assetTypeButtonText}>ETF</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.addRow}>
-        <TouchableOpacity
-          style={[styles.addButton, isAdding && styles.addButtonDisabled]}
-          onPress={handleAddTicker}
-          disabled={isAdding}>
-          {isAdding ? (
-            <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
-          ) : (
-            <Text style={styles.addButtonText}>Add to Portfolio</Text>
-          )}
+          onPress={() => setIsMenuVisible(true)}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          accessibilityLabel="More options">
+          <Ionicons name="ellipsis-horizontal" size={24} color={PipelineColors.textPrimary} />
         </TouchableOpacity>
       </View>
 
@@ -473,6 +508,312 @@ export default function PortfolioScreen() {
           )}
         </ScrollView>
       )}
+
+      <TouchableOpacity
+        style={styles.fab}
+        onPress={() => setIsAddModalVisible(true)}
+        accessibilityLabel="Add asset to portfolio">
+        <Ionicons name="add" size={28} color={PipelineColors.textPrimary} />
+      </TouchableOpacity>
+
+      <Modal
+        visible={isMenuVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsMenuVisible(false)}>
+        <Pressable style={styles.menuBackdrop} onPress={() => setIsMenuVisible(false)}>
+          <View style={styles.menuCard}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setIsMenuVisible(false);
+                handleCopyPortfolioData();
+              }}>
+              <Text style={styles.menuItemText}>Copy Portfolio Data</Text>
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              disabled={isExportingAll}
+              onPress={() => {
+                setIsMenuVisible(false);
+                handleCopyAllData();
+              }}>
+              {isExportingAll ? (
+                <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+              ) : (
+                <Text style={styles.menuItemText}>Copy ALL Data</Text>
+              )}
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              disabled={isExportingBackup}
+              onPress={() => {
+                setIsMenuVisible(false);
+                handleExportBackup();
+              }}>
+              {isExportingBackup ? (
+                <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+              ) : (
+                <Text style={styles.menuItemText}>Export Backup (JSON)</Text>
+              )}
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setIsMenuVisible(false);
+                setIsImportModalVisible(true);
+              }}>
+              <Text style={styles.menuItemText}>Import Backup (JSON)</Text>
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setIsMenuVisible(false);
+                setIsIntelModalVisible(true);
+              }}>
+              <Text style={styles.menuItemText}>On-Demand Intel</Text>
+            </TouchableOpacity>
+          </View>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={isAddModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setIsAddModalVisible(false)}>
+        <Pressable style={styles.addModalBackdrop} onPress={() => setIsAddModalVisible(false)}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.addModalKeyboardAvoider}>
+            <View style={styles.addModalSheet}>
+              <View style={styles.addModalHeader}>
+                <Text style={styles.addModalTitle}>Add Asset</Text>
+                <TouchableOpacity
+                  onPress={() => setIsAddModalVisible(false)}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="Close">
+                  <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.inputRow}>
+                <TickerAutocomplete
+                  value={ticker}
+                  onChangeText={setTicker}
+                  onSelectTicker={setTicker}
+                  onSubmit={handleAddTicker}
+                  editable={!isAdding}
+                />
+                <TextInput
+                  style={styles.unitsInput}
+                  value={units}
+                  onChangeText={setUnits}
+                  placeholder="Units"
+                  placeholderTextColor={PipelineColors.textSecondary}
+                  keyboardType="numeric"
+                  editable={!isAdding}
+                />
+              </View>
+
+              <Text style={styles.modalSectionLabel}>Category</Text>
+              <View style={styles.categoryRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.categoryButton,
+                    { borderColor: PipelineColors.core },
+                    selectedCategory === 'Core' && { backgroundColor: PipelineColors.core },
+                  ]}
+                  onPress={() => setSelectedCategory('Core')}>
+                  <Text style={styles.categoryButtonText}>Core</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.categoryButton,
+                    { borderColor: PipelineColors.satellite },
+                    selectedCategory === 'Satellite' && { backgroundColor: PipelineColors.satellite },
+                  ]}
+                  onPress={() => setSelectedCategory('Satellite')}>
+                  <Text style={styles.categoryButtonText}>Satellite</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.categoryButton,
+                    { borderColor: PipelineColors.quality },
+                    selectedCategory === 'Quality' && { backgroundColor: PipelineColors.quality },
+                  ]}
+                  onPress={() => setSelectedCategory('Quality')}>
+                  <Text style={styles.categoryButtonText}>Quality</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.modalSectionLabel}>Asset Type</Text>
+              <View style={styles.assetTypeRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.assetTypeButton,
+                    { borderColor: PipelineColors.bullish },
+                    selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
+                  ]}
+                  onPress={() => setSelectedAssetType('Stock')}>
+                  <Text style={styles.assetTypeButtonText}>Stock</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.assetTypeButton,
+                    { borderColor: PipelineColors.core },
+                    selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
+                  ]}
+                  onPress={() => setSelectedAssetType('ETF')}>
+                  <Text style={styles.assetTypeButtonText}>ETF</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.addRow}>
+                <TouchableOpacity
+                  style={[styles.addButton, isAdding && styles.addButtonDisabled]}
+                  onPress={handleAddTicker}
+                  disabled={isAdding}>
+                  {isAdding ? (
+                    <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                  ) : (
+                    <Text style={styles.addButtonText}>Add to Portfolio</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={isImportModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setIsImportModalVisible(false)}>
+        <Pressable
+          style={styles.addModalBackdrop}
+          onPress={() => !isRestoring && setIsImportModalVisible(false)}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.addModalKeyboardAvoider}>
+            <View style={styles.addModalSheet}>
+              <View style={styles.addModalHeader}>
+                <Text style={styles.addModalTitle}>Import Backup</Text>
+                <TouchableOpacity
+                  onPress={() => setIsImportModalVisible(false)}
+                  disabled={isRestoring}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="Close">
+                  <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.modalSectionLabel}>Paste Backup JSON</Text>
+              <TextInput
+                style={styles.importTextArea}
+                value={importText}
+                onChangeText={setImportText}
+                placeholder="Paste the JSON copied from Export Backup..."
+                placeholderTextColor={PipelineColors.textSecondary}
+                multiline
+                textAlignVertical="top"
+                editable={!isRestoring}
+              />
+
+              <View style={styles.addRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.addButton,
+                    (isRestoring || !importText.trim()) && styles.addButtonDisabled,
+                  ]}
+                  onPress={handleRestoreBackup}
+                  disabled={isRestoring || !importText.trim()}>
+                  {isRestoring ? (
+                    <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                  ) : (
+                    <Text style={styles.addButtonText}>Restore</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={isIntelModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setIsIntelModalVisible(false)}>
+        <Pressable
+          style={styles.addModalBackdrop}
+          onPress={() => !isFetchingIntel && setIsIntelModalVisible(false)}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.addModalKeyboardAvoider}>
+            <View style={styles.addModalSheet}>
+              <View style={styles.addModalHeader}>
+                <Text style={styles.addModalTitle}>On-Demand Intel</Text>
+                <TouchableOpacity
+                  onPress={() => setIsIntelModalVisible(false)}
+                  disabled={isFetchingIntel}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="Close">
+                  <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.inputRow}>
+                <TickerAutocomplete
+                  value={intelTicker}
+                  onChangeText={setIntelTicker}
+                  onSelectTicker={setIntelTicker}
+                  onSubmit={handleFetchIntel}
+                  editable={!isFetchingIntel}
+                />
+                <TouchableOpacity
+                  style={[styles.addButton, isFetchingIntel && styles.addButtonDisabled]}
+                  onPress={handleFetchIntel}
+                  disabled={isFetchingIntel}>
+                  {isFetchingIntel ? (
+                    <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                  ) : (
+                    <Text style={styles.addButtonText}>Fetch Intel</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+
+              {intelResult && intelResult.news.length > 0 && (
+                <ScrollView style={styles.intelResultsScroll} keyboardShouldPersistTaps="handled">
+                  {intelResult.news.map((article, index) => (
+                    <View key={`${article.title}-${index}`} style={styles.intelArticleRow}>
+                      <Text style={styles.intelArticleTitle}>{article.title}</Text>
+                      <Text style={styles.intelArticlePublisher}>{article.publisher}</Text>
+                    </View>
+                  ))}
+                </ScrollView>
+              )}
+
+              {intelResult && intelResult.news.length === 0 && (
+                <Text style={styles.intelEmptyText}>No news found for {intelResult.ticker}.</Text>
+              )}
+
+              {intelResult && intelResult.news.length > 0 && (
+                <View style={styles.addRow}>
+                  <TouchableOpacity style={styles.addButton} onPress={handleCopyIntel}>
+                    <Text style={styles.addButtonText}>Copy Intel</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -637,6 +978,9 @@ const styles = StyleSheet.create({
     backgroundColor: PipelineColors.background,
   },
   header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     paddingHorizontal: 16,
     paddingVertical: 12,
   },
@@ -645,40 +989,16 @@ const styles = StyleSheet.create({
     fontSize: 28,
     fontWeight: '700',
   },
-  exportRow: {
-    flexDirection: 'row',
-    paddingHorizontal: 16,
-    marginBottom: 12,
-    gap: 8,
-  },
-  exportButton: {
-    flex: 1,
-    backgroundColor: PipelineColors.cardBackground,
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 40,
-  },
-  exportButtonDisabled: {
-    opacity: 0.6,
-  },
-  exportButtonText: {
-    color: PipelineColors.textPrimary,
-    fontSize: 13,
-    fontWeight: '600',
-  },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    marginBottom: 8,
+    marginBottom: 16,
     gap: 8,
     zIndex: 10,
   },
   unitsInput: {
     width: 70,
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: PipelineColors.background,
     color: PipelineColors.textPrimary,
     borderRadius: 8,
     paddingHorizontal: 12,
@@ -686,11 +1006,55 @@ const styles = StyleSheet.create({
     fontSize: 16,
     textAlign: 'center',
   },
+  modalSectionLabel: {
+    color: PipelineColors.textSecondary,
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  importTextArea: {
+    backgroundColor: PipelineColors.background,
+    color: PipelineColors.textPrimary,
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 13,
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
+    height: 160,
+    marginBottom: 20,
+  },
+  intelResultsScroll: {
+    maxHeight: 280,
+    backgroundColor: PipelineColors.background,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    marginBottom: 16,
+  },
+  intelArticleRow: {
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PipelineColors.cardBackground,
+  },
+  intelArticleTitle: {
+    color: PipelineColors.textPrimary,
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  intelArticlePublisher: {
+    color: PipelineColors.textSecondary,
+    fontSize: 12,
+  },
+  intelEmptyText: {
+    color: PipelineColors.textSecondary,
+    fontSize: 14,
+    textAlign: 'center',
+    marginVertical: 16,
+  },
   categoryRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    marginBottom: 8,
+    marginBottom: 16,
     gap: 8,
   },
   categoryButton: {
@@ -709,8 +1073,7 @@ const styles = StyleSheet.create({
   assetTypeRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    marginBottom: 8,
+    marginBottom: 20,
     gap: 8,
   },
   assetTypeButton: {
@@ -727,14 +1090,13 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   addRow: {
-    paddingHorizontal: 16,
-    marginBottom: 12,
+    marginBottom: 4,
   },
   addButton: {
     backgroundColor: PipelineColors.bullish,
     borderRadius: 8,
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingVertical: 14,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -908,5 +1270,80 @@ const styles = StyleSheet.create({
   initializingText: {
     color: PipelineColors.textSecondary,
     fontSize: 14,
+  },
+  fab: {
+    position: 'absolute',
+    bottom: 24,
+    right: 24,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: PipelineColors.bullish,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 6,
+    elevation: 8,
+  },
+  menuBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  menuCard: {
+    position: 'absolute',
+    top: 64,
+    right: 16,
+    minWidth: 200,
+    backgroundColor: PipelineColors.cardBackground,
+    borderRadius: 12,
+    paddingVertical: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 8,
+  },
+  menuItem: {
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  menuItemText: {
+    color: PipelineColors.textPrimary,
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  menuDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: PipelineColors.background,
+    marginHorizontal: 12,
+  },
+  addModalBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  addModalKeyboardAvoider: {
+    width: '100%',
+  },
+  addModalSheet: {
+    backgroundColor: PipelineColors.cardBackground,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 32,
+  },
+  addModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 20,
+  },
+  addModalTitle: {
+    color: PipelineColors.textPrimary,
+    fontSize: 18,
+    fontWeight: '700',
   },
 });

@@ -8,7 +8,7 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
   if (stocks.length === 0) {
     return ['  (none)'];
   }
-  return stocks.map((stock) => {
+  return stocks.flatMap((stock) => {
     // ETFs are judged against SMA200, stocks against SMA50 — matches the
     // trend rule rendered on the card itself (see StockCard.tsx).
     const relevantSma = stock.assetType === 'ETF' ? stock.sma200 : stock.sma50;
@@ -22,10 +22,11 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
       stock.price <= stock.sma200 * STRUCTURAL_STOP_THRESHOLD;
     const warningSuffix = isNearStructuralStop ? ' [STRUCTURAL STOP WARNING]' : '';
 
-    return (
+    const line =
       `  ${stock.ticker} (${stock.assetType}): Price $${stock.price.toFixed(2)} | ` +
-      `SMA50 ${sma50Text} | SMA200 ${sma200Text} | ${trend}${warningSuffix}`
-    );
+      `SMA50 ${sma50Text} | SMA200 ${sma200Text} | ${trend}${warningSuffix}`;
+
+    return stock.anomalyReport ? [line, `    ${stock.anomalyReport}`] : [line];
   });
 }
 
@@ -50,6 +51,9 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
         lines.push(
           `  ${stock.ticker}: ${stock.units} units @ $${stock.price.toFixed(2)} = $${totalValue.toFixed(2)}`,
         );
+        if (stock.anomalyReport) {
+          lines.push(`    ${stock.anomalyReport}`);
+        }
       });
     }
 

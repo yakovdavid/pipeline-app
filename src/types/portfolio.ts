@@ -18,4 +18,8 @@ export type PortfolioTickerEntry = {
 
 export type PortfolioStock = PortfolioTickerEntry & {
   price: number;
+  // Anomaly News Fetcher output: live/ephemeral, re-fetched every time —
+  // never persisted, since a stale anomaly note from a prior day would be
+  // actively misleading.
+  anomalyReport: string | null;
 };

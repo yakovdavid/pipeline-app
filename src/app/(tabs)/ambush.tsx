@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
-import { useEffect, useRef, useState } from 'react';
+import { useFocusEffect } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -48,41 +49,45 @@ export default function AmbushRadarScreen() {
   // render while the price stays inside the warning zone.
   const notifiedTickersRef = useRef<Set<string>>(new Set());
 
-  // Load the saved watchlist on mount: read the ticker/assetType pairs from
-  // AsyncStorage (falling back to a default watchlist on first launch),
-  // then fetch fresh data for each from the Python API.
-  useEffect(() => {
-    let isMounted = true;
+  // Load the saved watchlist every time this tab gains focus (including the
+  // initial mount) — not just once on mount — so a backup restored from the
+  // Portfolio tab's Import menu (a separate mounted screen this one has no
+  // direct handle to) is picked up as soon as the user switches back here,
+  // rather than only on the next full app restart.
+  useFocusEffect(
+    useCallback(() => {
+      let isActive = true;
 
-    async function loadInitialStocks() {
-      let entries: AmbushTickerEntry[];
-      try {
-        entries = (await loadAmbushTickerEntries()) ?? DEFAULT_ENTRIES;
-      } catch {
-        entries = DEFAULT_ENTRIES;
-      }
-
-      const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
-
-      const loadedStocks: Stock[] = [];
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          loadedStocks.push({ ...entries[index], ...result.value });
+      async function loadStocks() {
+        let entries: AmbushTickerEntry[];
+        try {
+          entries = (await loadAmbushTickerEntries()) ?? DEFAULT_ENTRIES;
+        } catch {
+          entries = DEFAULT_ENTRIES;
         }
-      });
 
-      if (isMounted) {
-        setStocks(loadedStocks);
-        setIsInitializing(false);
+        const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
+
+        const loadedStocks: Stock[] = [];
+        results.forEach((result, index) => {
+          if (result.status === 'fulfilled') {
+            loadedStocks.push({ ...entries[index], ...result.value });
+          }
+        });
+
+        if (isActive) {
+          setStocks(loadedStocks);
+          setIsInitializing(false);
+        }
       }
-    }
 
-    loadInitialStocks();
+      loadStocks();
 
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+      return () => {
+        isActive = false;
+      };
+    }, []),
+  );
 
   // Keep AsyncStorage in sync with the current watchlist. Skipped while
   // initializing so we don't overwrite storage before the saved list loads.

@@ -5,12 +5,26 @@ export type StockQuote = {
   // as null rather than failing the whole request.
   sma50: number | null;
   sma200: number | null;
+  // Present when the backend's Anomaly News Fetcher detects a same-day
+  // move of 4%+ and finds explanatory headlines; null otherwise (no
+  // notable move, or no news found).
+  anomalyReport: string | null;
 };
 
 export type TickerSearchResult = {
   symbol: string;
   shortname: string;
   exchDisp: string;
+};
+
+export type IntelArticle = {
+  title: string;
+  publisher: string;
+};
+
+export type IntelResponse = {
+  ticker: string;
+  news: IntelArticle[];
 };
 
 // Production FastAPI backend (see /backend), deployed on Render.
@@ -21,7 +35,9 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/api/stock/${normalizedTicker}`);
+    // include_anomaly=true opts into the backend's Anomaly News Fetcher
+    // (an extra, throttled Yahoo call on their side) for every quote fetch.
+    response = await fetch(`${API_BASE_URL}/api/stock/${normalizedTicker}?include_anomaly=true`);
   } catch {
     throw new Error(
       `Could not reach the Pipeline API at ${API_BASE_URL}. Check that the backend is running and that your device is on the same network.`,
@@ -39,7 +55,7 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
     throw new Error(`Failed to fetch data for ${normalizedTicker}: ${detail}`);
   }
 
-  const data = (await response.json()) as Partial<StockQuote>;
+  const data = (await response.json()) as Partial<StockQuote> & { anomaly?: string | null };
 
   if (typeof data.price !== 'number') {
     throw new Error(`Received malformed data for ${normalizedTicker}.`);
@@ -49,7 +65,49 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
     price: data.price,
     sma50: typeof data.sma50 === 'number' ? data.sma50 : null,
     sma200: typeof data.sma200 === 'number' ? data.sma200 : null,
+    anomalyReport: typeof data.anomaly === 'string' ? data.anomaly : null,
   };
+}
+
+// On-Demand Intel: the latest news headlines for a ticker, regardless of
+// whether it moved today. Unlike searchTickers, failures here are thrown
+// (not swallowed) — this is a deliberate, explicit user action ("Fetch
+// Intel"), so the caller should show the user what went wrong.
+export async function fetchIntel(ticker: string): Promise<IntelResponse> {
+  const normalizedTicker = ticker.trim().toUpperCase();
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/intel/${normalizedTicker}`);
+  } catch {
+    throw new Error(
+      `Could not reach the Pipeline API at ${API_BASE_URL}. Check that the backend is running and that your device is on the same network.`,
+    );
+  }
+
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const errorBody = (await response.json()) as { detail?: string };
+      detail = errorBody.detail ?? detail;
+    } catch {
+      // Response body was not valid JSON; fall back to the status text.
+    }
+    throw new Error(`Failed to fetch intel for ${normalizedTicker}: ${detail}`);
+  }
+
+  const data = (await response.json()) as Partial<IntelResponse>;
+
+  if (typeof data.ticker !== 'string' || !Array.isArray(data.news)) {
+    throw new Error(`Received malformed intel data for ${normalizedTicker}.`);
+  }
+
+  const news = data.news.filter(
+    (article): article is IntelArticle =>
+      typeof article?.title === 'string' && typeof article?.publisher === 'string',
+  );
+
+  return { ticker: data.ticker, news };
 }
 
 // Search-as-you-type autocomplete. Failures are swallowed and reported as

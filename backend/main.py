@@ -74,6 +74,13 @@ ANOMALY_NEWS_COUNT = 3
 ANOMALY_FETCH_MAX_RETRIES = 1
 ANOMALY_FETCH_BASE_BACKOFF_SECONDS = 1.0
 
+# On-Demand Intel: a user-triggered (not automatic/high-frequency) request
+# for a ticker's latest headlines regardless of price movement. Since it's
+# a deliberate single action rather than something fired on every list
+# load/refresh, it gets the full default retry budget (see fetch_with_retry)
+# rather than the anomaly fetcher's fail-fast one.
+INTEL_NEWS_COUNT = 5
+
 # Standard browser headers layered on top of curl_cffi's TLS impersonation.
 # Yahoo Finance rejects requests without something resembling this, whether
 # hit via yfinance or the raw search endpoint.
@@ -196,6 +203,7 @@ class TTLCache:
 
 stock_cache = TTLCache(CACHE_TTL_SECONDS)
 fx_rate_cache = TTLCache(CACHE_TTL_SECONDS)
+intel_cache = TTLCache(CACHE_TTL_SECONDS)
 
 # One shared, browser-like session reused across every yfinance call. Safe
 # to share across FastAPI's threadpool workers because yahoo_rate_limiter
@@ -519,6 +527,49 @@ def search_tickers(query: str) -> list[dict[str, str]]:
             break
 
     return results
+
+
+@app.get("/api/intel/{ticker}")
+def get_intel(ticker: str) -> dict[str, object]:
+    """On-Demand Intel: the latest news headlines for a ticker, regardless
+    of whether it moved today. Not a REST/CLI hybrid — this is a plain
+    request/response route, no input() prompts of any kind."""
+    symbol = ticker.strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Ticker symbol is required.")
+
+    cached_result = intel_cache.get(symbol)
+    if cached_result is not None:
+        return cached_result
+
+    try:
+        news_data = fetch_with_retry(
+            lambda: yf.Ticker(symbol, session=_yahoo_session).news,
+            description=f"on-demand intel fetch for '{symbol}'",
+        )
+    except Exception as error:  # noqa: BLE001 - yfinance/curl_cffi raise many different error types
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch intel for ticker '{symbol}': {error}",
+        ) from error
+
+    # Current Yahoo news items nest both the headline and the publisher
+    # under "content" (e.g. article["content"]["title"] and
+    # article["content"]["provider"]["displayName"]) rather than at the
+    # top level — verified against the live API. Falls back to a flat
+    # shape too in case Yahoo reverts it. An empty/missing news list is not
+    # an error: it just yields an empty "news" array.
+    articles: list[dict[str, str]] = []
+    for article in (news_data or [])[:INTEL_NEWS_COUNT]:
+        content = article.get("content") or {}
+        title = content.get("title") or article.get("title") or "No Title"
+        provider = content.get("provider") or {}
+        publisher = provider.get("displayName") or article.get("publisher") or "Unknown Publisher"
+        articles.append({"title": title, "publisher": publisher})
+
+    result = {"ticker": symbol, "news": articles}
+    intel_cache.set(symbol, result)
+    return result
 
 
 if __name__ == "__main__":
