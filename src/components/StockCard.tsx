@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { PipelineColors } from '@/constants/pipeline-colors';
@@ -30,7 +31,12 @@ export type StockCardProps = {
   onDelete: (ticker: string) => void;
 };
 
-export function StockCard({ stock, onDelete }: StockCardProps) {
+// Wrapped in memo() so a price/SMA update on one ticker doesn't re-render
+// every other card in the list — the ambush.tsx list already keeps
+// unaffected Stock objects referentially stable on every state update
+// (add/delete/refresh only replace the entries that actually changed), so
+// this comparison is meaningful, not a no-op.
+export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardProps) {
   const { ticker, assetType, price, sma50, sma200 } = stock;
 
   // ETFs are judged against the longer 200-day trend; individual stocks
@@ -90,7 +96,7 @@ export function StockCard({ stock, onDelete }: StockCardProps) {
       </View>
     </View>
   );
-}
+});
 
 type MomentumBarProps = {
   price: number;

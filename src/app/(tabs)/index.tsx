@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { useEffect, useState } from 'react';
+import { memo, useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -12,6 +12,7 @@ import {
   Pressable,
   RefreshControl,
   ScrollView,
+  SectionList,
   StyleSheet,
   Text,
   TextInput,
@@ -36,6 +37,30 @@ import { normalizeTickerInput } from '@/utils/ticker';
 
 type FilterOption = 'All' | PortfolioCategory;
 const FILTER_OPTIONS: FilterOption[] = ['All', 'Core', 'Satellite', 'Quality'];
+
+type PortfolioListSection = {
+  title: string;
+  category: PortfolioCategory;
+  accentColor: string;
+  data: PortfolioStock[];
+};
+
+// Module-level (not defined inside the component) since these have no
+// closure dependencies — a stable identity across renders, same reasoning
+// as the useCallback-wrapped handlers below.
+function extractPortfolioItemKey(item: PortfolioStock): string {
+  return item.ticker;
+}
+
+function renderPortfolioSectionHeader({ section }: { section: PortfolioListSection }) {
+  return <Text style={[styles.sectionTitle, { color: section.accentColor }]}>{section.title}</Text>;
+}
+
+function renderPortfolioSectionFooter({ section }: { section: PortfolioListSection }) {
+  return section.data.length === 0 ? (
+    <Text style={styles.sectionEmptyText}>No positions yet.</Text>
+  ) : null;
+}
 
 // Tracks the "Highest Watermark" (highest price seen since a Stock position
 // was added) that drives the trailing-stop trigger price. Only meaningful
@@ -84,10 +109,19 @@ export default function PortfolioScreen() {
     let isMounted = true;
 
     async function loadInitialStocks() {
+      // Hydration hardening: a storage read/parse failure must NOT be
+      // treated the same as "the user has no saved positions" — the old
+      // code's `catch { entries = [] }` did exactly that, which then flowed
+      // straight into setStocks([]) and, via the persistence effect below,
+      // permanently overwrote real portfolio data in storage with an empty
+      // array on a mere transient AsyncStorage/JSON error.
       let entries: PortfolioTickerEntry[];
       try {
         const stored = await AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY);
         const parsed = stored ? (JSON.parse(stored) as Partial<PortfolioTickerEntry>[]) : [];
+        if (!Array.isArray(parsed)) {
+          throw new Error('Stored portfolio data is not an array.');
+        }
         // Entries saved before "units", "assetType", or "highestWatermark"
         // existed won't have valid values; backfill them rather than
         // letting totals/trailing-stop math break on undefined/NaN.
@@ -99,8 +133,26 @@ export default function PortfolioScreen() {
           highestWatermark:
             typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
         }));
-      } catch {
-        entries = [];
+      } catch (error) {
+        console.error(
+          '[hydration] Failed to read the Portfolio from storage; retaining the previous ' +
+            'state instead of overwriting it with an empty portfolio.',
+          error,
+        );
+        if (isMounted) {
+          setIsInitializing(false);
+        }
+        return;
+      }
+
+      if (entries.length === 0) {
+        // A genuinely empty, successfully-read portfolio (the user deleted
+        // every position) is valid state, not a failure — show it as-is.
+        if (isMounted) {
+          setStocks([]);
+          setIsInitializing(false);
+        }
+        return;
       }
 
       const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
@@ -123,6 +175,22 @@ export default function PortfolioScreen() {
           });
         }
       });
+
+      if (loadedStocks.length === 0) {
+        // Every single live-quote fetch failed — almost certainly a
+        // network outage, not "these positions don't exist". The storage
+        // read above succeeded and returned real entries, so replacing
+        // them with an empty list here would trigger the exact data-loss
+        // bug being fixed via the persistence effect below.
+        console.error(
+          `[hydration] All ${entries.length} position fetch(es) failed (network issue?); ` +
+            'retaining the previous portfolio instead of clearing it.',
+        );
+        if (isMounted) {
+          setIsInitializing(false);
+        }
+        return;
+      }
 
       if (isMounted) {
         setStocks(loadedStocks);
@@ -204,32 +272,51 @@ export default function PortfolioScreen() {
     }
   };
 
-  const handleDeleteTicker = (tickerToDelete: string) => {
+  // Stable identity (useCallback) is required for the React.memo on
+  // PortfolioStockRow to actually skip re-renders — an inline function here
+  // would be a new reference on every PortfolioScreen render, which would
+  // defeat memo() by changing this prop for every row on every render.
+  const handleDeleteTicker = useCallback((tickerToDelete: string) => {
     setStocks((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
-  };
+  }, []);
 
-  const handleSaveEdit = (tickerToUpdate: string, newUnits: number, newAssetType: AssetType) => {
-    setStocks((prevStocks) =>
-      prevStocks.map((stock) => {
-        if (stock.ticker !== tickerToUpdate) {
-          return stock;
-        }
+  const handleSaveEdit = useCallback(
+    (tickerToUpdate: string, newUnits: number, newAssetType: AssetType) => {
+      setStocks((prevStocks) =>
+        prevStocks.map((stock) => {
+          if (stock.ticker !== tickerToUpdate) {
+            return stock;
+          }
 
-        let highestWatermark: number | null;
-        if (newAssetType !== 'Stock') {
-          highestWatermark = null;
-        } else if (stock.assetType === 'Stock' && stock.highestWatermark !== null) {
-          highestWatermark = stock.highestWatermark;
-        } else {
-          // Just became a Stock position (or never had a watermark yet) —
-          // start tracking from the current price.
-          highestWatermark = stock.price;
-        }
+          let highestWatermark: number | null;
+          if (newAssetType !== 'Stock') {
+            highestWatermark = null;
+          } else if (stock.assetType === 'Stock' && stock.highestWatermark !== null) {
+            highestWatermark = stock.highestWatermark;
+          } else {
+            // Just became a Stock position (or never had a watermark yet) —
+            // start tracking from the current price.
+            highestWatermark = stock.price;
+          }
 
-        return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark };
-      }),
-    );
-  };
+          return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark };
+        }),
+      );
+    },
+    [],
+  );
+
+  const renderPortfolioRow = useCallback(
+    ({ item, section }: { item: PortfolioStock; section: PortfolioListSection }) => (
+      <PortfolioStockRow
+        stock={item}
+        accentColor={section.accentColor}
+        onDelete={handleDeleteTicker}
+        onSaveEdit={handleSaveEdit}
+      />
+    ),
+    [handleDeleteTicker, handleSaveEdit],
+  );
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -380,9 +467,28 @@ export default function PortfolioScreen() {
         }
       });
 
-      setStocks(hydratedStocks);
       setIsImportModalVisible(false);
       setImportText('');
+
+      if (hydratedStocks.length === 0 && payload.portfolio.length > 0) {
+        // Hydration hardening applies here too: storage was already
+        // successfully overwritten with the restored data above, but if
+        // every live-price fetch for it just failed (network issue right
+        // after import), don't also blank out whatever was on screen —
+        // that would be the exact same "wipe on failure" bug, just
+        // triggered from the import flow instead of app startup.
+        console.error(
+          `[hydration] Backup restored to storage, but all ${payload.portfolio.length} ` +
+            'live price fetch(es) failed; retaining the previously displayed portfolio.',
+        );
+        Alert.alert(
+          'Backup Restored',
+          'Your data was saved, but live prices could not be fetched right now. Pull to refresh shortly.',
+        );
+        return;
+      }
+
+      setStocks(hydratedStocks);
       Alert.alert('Backup Restored', 'Your Portfolio and Ambush Radar data has been restored.');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to restore the backup.';
@@ -465,13 +571,29 @@ export default function PortfolioScreen() {
     }
   };
 
-  const coreStocks = stocks.filter((stock) => stock.category === 'Core');
-  const satelliteStocks = stocks.filter((stock) => stock.category === 'Satellite');
-  const qualityStocks = stocks.filter((stock) => stock.category === 'Quality');
-
-  const showCoreSection = activeFilter === 'All' || activeFilter === 'Core';
-  const showSatelliteSection = activeFilter === 'All' || activeFilter === 'Satellite';
-  const showQualitySection = activeFilter === 'All' || activeFilter === 'Quality';
+  const allSections: PortfolioListSection[] = [
+    {
+      title: 'Core (70%)',
+      category: 'Core',
+      accentColor: PipelineColors.core,
+      data: stocks.filter((stock) => stock.category === 'Core'),
+    },
+    {
+      title: 'Satellite (20%)',
+      category: 'Satellite',
+      accentColor: PipelineColors.satellite,
+      data: stocks.filter((stock) => stock.category === 'Satellite'),
+    },
+    {
+      title: 'Quality (10%)',
+      category: 'Quality',
+      accentColor: PipelineColors.quality,
+      data: stocks.filter((stock) => stock.category === 'Quality'),
+    },
+  ];
+  const visibleSections = allSections.filter(
+    (section) => activeFilter === 'All' || activeFilter === section.category,
+  );
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
@@ -514,7 +636,15 @@ export default function PortfolioScreen() {
           <Text style={styles.initializingText}>Loading your portfolio...</Text>
         </View>
       ) : (
-        <ScrollView
+        <SectionList
+          sections={visibleSections}
+          keyExtractor={extractPortfolioItemKey}
+          renderItem={renderPortfolioRow}
+          renderSectionHeader={renderPortfolioSectionHeader}
+          renderSectionFooter={renderPortfolioSectionFooter}
+          initialNumToRender={10}
+          windowSize={5}
+          stickySectionHeadersEnabled={false}
           contentContainerStyle={styles.listContent}
           refreshControl={
             <RefreshControl
@@ -522,35 +652,8 @@ export default function PortfolioScreen() {
               onRefresh={onRefresh}
               tintColor={PipelineColors.textPrimary}
             />
-          }>
-          {showCoreSection && (
-            <PortfolioSection
-              title="Core (70%)"
-              accentColor={PipelineColors.core}
-              stocks={coreStocks}
-              onDelete={handleDeleteTicker}
-              onSaveEdit={handleSaveEdit}
-            />
-          )}
-          {showSatelliteSection && (
-            <PortfolioSection
-              title="Satellite (20%)"
-              accentColor={PipelineColors.satellite}
-              stocks={satelliteStocks}
-              onDelete={handleDeleteTicker}
-              onSaveEdit={handleSaveEdit}
-            />
-          )}
-          {showQualitySection && (
-            <PortfolioSection
-              title="Quality (10%)"
-              accentColor={PipelineColors.quality}
-              stocks={qualityStocks}
-              onDelete={handleDeleteTicker}
-              onSaveEdit={handleSaveEdit}
-            />
-          )}
-        </ScrollView>
+          }
+        />
       )}
 
       <TouchableOpacity
@@ -794,23 +897,24 @@ export default function PortfolioScreen() {
         transparent
         animationType="slide"
         onRequestClose={() => setIsIntelModalVisible(false)}>
-        <Pressable
-          style={styles.addModalBackdrop}
-          onPress={() => !isFetchingIntel && setIsIntelModalVisible(false)}>
+        {/* Plain View, not Pressable: tap-to-dismiss on the backdrop was
+            causing accidental closes while the user scrolled the news
+            results. The modal now only closes via the explicit button. */}
+        <View style={styles.addModalBackdrop}>
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
             style={styles.addModalKeyboardAvoider}>
-            <View style={styles.addModalSheet}>
-              <View style={styles.addModalHeader}>
-                <Text style={styles.addModalTitle}>On-Demand Intel</Text>
-                <TouchableOpacity
-                  onPress={() => setIsIntelModalVisible(false)}
-                  disabled={isFetchingIntel}
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  accessibilityLabel="Close">
-                  <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
-                </TouchableOpacity>
-              </View>
+            <View style={styles.intelModalSheet}>
+              <TouchableOpacity
+                style={styles.intelCloseButton}
+                onPress={() => setIsIntelModalVisible(false)}
+                disabled={isFetchingIntel}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                accessibilityLabel="Close">
+                <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+              </TouchableOpacity>
+
+              <Text style={[styles.addModalTitle, styles.intelModalTitle]}>On-Demand Intel</Text>
 
               <Text style={styles.modalSectionLabel}>Tickers (comma-separated)</Text>
               <View style={styles.inputRow}>
@@ -841,6 +945,7 @@ export default function PortfolioScreen() {
               {intelResult && (
                 <ScrollView
                   style={styles.intelResultsScroll}
+                  nestedScrollEnabled={true}
                   showsVerticalScrollIndicator={true}
                   persistentScrollbar={true}
                   keyboardShouldPersistTaps="handled">
@@ -891,38 +996,9 @@ export default function PortfolioScreen() {
               )}
             </View>
           </KeyboardAvoidingView>
-        </Pressable>
+        </View>
       </Modal>
     </SafeAreaView>
-  );
-}
-
-type PortfolioSectionProps = {
-  title: string;
-  accentColor: string;
-  stocks: PortfolioStock[];
-  onDelete: (ticker: string) => void;
-  onSaveEdit: (ticker: string, units: number, assetType: AssetType) => void;
-};
-
-function PortfolioSection({ title, accentColor, stocks, onDelete, onSaveEdit }: PortfolioSectionProps) {
-  return (
-    <View style={styles.section}>
-      <Text style={[styles.sectionTitle, { color: accentColor }]}>{title}</Text>
-      {stocks.length === 0 ? (
-        <Text style={styles.sectionEmptyText}>No positions yet.</Text>
-      ) : (
-        stocks.map((stock) => (
-          <PortfolioStockRow
-            key={stock.ticker}
-            stock={stock}
-            accentColor={accentColor}
-            onDelete={onDelete}
-            onSaveEdit={onSaveEdit}
-          />
-        ))
-      )}
-    </View>
   );
 }
 
@@ -933,7 +1009,19 @@ type PortfolioStockRowProps = {
   onSaveEdit: (ticker: string, units: number, assetType: AssetType) => void;
 };
 
-function PortfolioStockRow({ stock, accentColor, onDelete, onSaveEdit }: PortfolioStockRowProps) {
+// Wrapped in memo() so updating one position (price refresh, edit, delete)
+// doesn't re-render every other row in the SectionList — stocks state
+// updates already keep unaffected PortfolioStock objects referentially
+// stable (see onRefresh/handleSaveEdit/handleDeleteTicker above), and
+// accentColor/onDelete/onSaveEdit are all stable across renders too (a
+// PipelineColors constant and useCallback-wrapped handlers respectively),
+// so this comparison is meaningful, not a no-op.
+const PortfolioStockRow = memo(function PortfolioStockRow({
+  stock,
+  accentColor,
+  onDelete,
+  onSaveEdit,
+}: PortfolioStockRowProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [unitsText, setUnitsText] = useState(String(stock.units));
   const [editedAssetType, setEditedAssetType] = useState<AssetType>(stock.assetType);
@@ -1074,7 +1162,7 @@ function PortfolioStockRow({ stock, accentColor, onDelete, onSaveEdit }: Portfol
       )}
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   safeArea: {
@@ -1137,7 +1225,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   intelResultsScroll: {
-    maxHeight: 320,
+    flex: 1,
     backgroundColor: PipelineColors.background,
     borderRadius: 8,
     padding: 12,
@@ -1281,25 +1369,28 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 24,
   },
-  section: {
-    backgroundColor: PipelineColors.cardBackground,
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 16,
-  },
+  // SectionList renders headers/items/footers as flat siblings (not nested
+  // inside a per-category wrapper the way the old ScrollView.map version
+  // was), so the section title and each stock card now carry their own
+  // spacing/background instead of inheriting it from a parent "section"
+  // container.
   sectionTitle: {
     fontSize: 16,
     fontWeight: '700',
+    marginTop: 16,
     marginBottom: 10,
   },
   sectionEmptyText: {
     color: PipelineColors.textSecondary,
     fontSize: 14,
+    marginBottom: 4,
   },
   stockCard: {
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: PipelineColors.background,
+    backgroundColor: PipelineColors.cardBackground,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginBottom: 10,
   },
   stockTopRow: {
     flexDirection: 'row',
@@ -1508,5 +1599,28 @@ const styles = StyleSheet.create({
     color: PipelineColors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
+  },
+  // Bounded (not auto-sized) sheet: a % maxHeight is what lets the
+  // intelResultsScroll child below use flex: 1 to fill remaining space
+  // instead of collapsing to its content size.
+  intelModalSheet: {
+    backgroundColor: PipelineColors.cardBackground,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 32,
+    maxHeight: '85%',
+  },
+  intelModalTitle: {
+    marginBottom: 20,
+    paddingRight: 36,
+  },
+  intelCloseButton: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    zIndex: 10,
+    padding: 4,
   },
 });

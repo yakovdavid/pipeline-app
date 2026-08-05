@@ -59,11 +59,36 @@ export default function AmbushRadarScreen() {
       let isActive = true;
 
       async function loadStocks() {
+        // Hydration hardening: a storage read/parse failure is NOT the
+        // same thing as "the user has no saved tickers" — those must be
+        // told apart. Falling back to DEFAULT_ENTRIES here (as this code
+        // used to) would silently overwrite a real watchlist with
+        // AAPL/TSLA on a mere transient AsyncStorage hiccup, and this
+        // effect re-runs on every tab focus (not just app startup), so
+        // that could happen repeatedly during normal use.
         let entries: AmbushTickerEntry[];
         try {
           entries = (await loadAmbushTickerEntries()) ?? DEFAULT_ENTRIES;
-        } catch {
-          entries = DEFAULT_ENTRIES;
+        } catch (error) {
+          console.error(
+            '[hydration] Failed to read the Ambush watchlist from storage; retaining the ' +
+              'previous state instead of falling back to defaults.',
+            error,
+          );
+          if (isActive) {
+            setIsInitializing(false);
+          }
+          return;
+        }
+
+        if (entries.length === 0) {
+          // A genuinely empty, successfully-read list (the user deleted
+          // every ticker) is valid state, not a failure — show it as-is.
+          if (isActive) {
+            setStocks([]);
+            setIsInitializing(false);
+          }
+          return;
         }
 
         const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
@@ -74,6 +99,23 @@ export default function AmbushRadarScreen() {
             loadedStocks.push({ ...entries[index], ...result.value });
           }
         });
+
+        if (loadedStocks.length === 0) {
+          // Every single live-quote fetch failed — almost certainly a
+          // network outage, not "these tickers don't exist". The storage
+          // read above succeeded and returned real tickers, so silently
+          // replacing them with an empty list here would be exactly the
+          // data-loss bug being fixed: the persistence effect below would
+          // then immediately overwrite the real saved watchlist with [].
+          console.error(
+            `[hydration] All ${entries.length} ticker fetch(es) failed (network issue?); ` +
+              'retaining the previous watchlist instead of clearing it.',
+          );
+          if (isActive) {
+            setIsInitializing(false);
+          }
+          return;
+        }
 
         if (isActive) {
           setStocks(loadedStocks);
@@ -153,9 +195,18 @@ export default function AmbushRadarScreen() {
     }
   };
 
-  const handleDeleteTicker = (tickerToDelete: string) => {
+  // Stable identity (useCallback) is required for the React.memo on
+  // StockCard to actually skip re-renders — an inline function here would
+  // be a new reference on every AmbushRadarScreen render, which would
+  // defeat memo() by changing this prop for every row on every render.
+  const handleDeleteTicker = useCallback((tickerToDelete: string) => {
     setStocks((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
-  };
+  }, []);
+
+  const renderStockCard = useCallback(
+    ({ item }: { item: Stock }) => <StockCard stock={item} onDelete={handleDeleteTicker} />,
+    [handleDeleteTicker],
+  );
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -261,7 +312,9 @@ export default function AmbushRadarScreen() {
         <FlatList
           data={stocks}
           keyExtractor={(item) => item.ticker}
-          renderItem={({ item }) => <StockCard stock={item} onDelete={handleDeleteTicker} />}
+          renderItem={renderStockCard}
+          initialNumToRender={10}
+          windowSize={5}
           contentContainerStyle={styles.listContent}
           refreshControl={
             <RefreshControl
