@@ -11,8 +11,10 @@ short-lived in-memory caching) since cloud IPs like Render's are otherwise
 bot-detected and rate-limited (HTTP 429) almost immediately.
 """
 
+import re
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Callable, TypeVar
 
 import yfinance as yf
@@ -80,6 +82,22 @@ ANOMALY_FETCH_BASE_BACKOFF_SECONDS = 1.0
 # load/refresh, it gets the full default retry budget (see fetch_with_retry)
 # rather than the anomaly fetcher's fail-fast one.
 INTEL_NEWS_COUNT = 5
+
+# On-Demand Intel V3.1: batch requests, article timestamps/deep links, and
+# keyword flagging.
+#
+# A batch request makes one Yahoo call per ticker, each spaced >= 1s apart
+# by yahoo_rate_limiter, so an unbounded batch could make a single HTTP
+# request take a very long time (and risk timing out the client or the
+# Render proxy). Capped to a sane size for that reason.
+MAX_BATCH_TICKERS = 10
+
+CRITICAL_ALERT_TAG = "[CRITICAL ALERT]"
+CRITICAL_KEYWORDS = {
+    "earnings", "miss", "beat", "downgrade", "upgrade", "sec", "fraud",
+    "acquisition", "merger", "investigation", "subpoena", "lawsuit",
+    "bankruptcy", "guidance", "cut", "slashing", "probe",
+}
 
 # Standard browser headers layered on top of curl_cffi's TLS impersonation.
 # Yahoo Finance rejects requests without something resembling this, whether
@@ -529,15 +547,92 @@ def search_tickers(query: str) -> list[dict[str, str]]:
     return results
 
 
-@app.get("/api/intel/{ticker}")
-def get_intel(ticker: str) -> dict[str, object]:
-    """On-Demand Intel: the latest news headlines for a ticker, regardless
-    of whether it moved today. Not a REST/CLI hybrid — this is a plain
-    request/response route, no input() prompts of any kind."""
-    symbol = ticker.strip().upper()
-    if not symbol:
-        raise HTTPException(status_code=400, detail="Ticker symbol is required.")
+def _title_has_critical_keyword(title: str) -> bool:
+    """Word-boundary match against CRITICAL_KEYWORDS rather than a raw
+    substring check (`keyword in title.lower()`). A naive substring check
+    would false-positive constantly — e.g. "sec" would match inside
+    "sector"/"securities"/"second", and "cut" inside "execute"/"acute"."""
+    words = set(re.findall(r"[a-z']+", title.lower()))
+    return not CRITICAL_KEYWORDS.isdisjoint(words)
 
+
+def _format_publish_timestamp(raw_timestamp: object) -> str:
+    """Formats a publish time as 'YYYY-MM-DD HH:MM UTC'.
+
+    Yahoo's current news schema publishes an ISO 8601 string under
+    content.pubDate / content.displayTime (e.g. "2026-08-05T14:30:00Z"),
+    not the legacy numeric providerPublishTime Unix timestamp — verified
+    against the live API. Both shapes are handled here in case Yahoo ever
+    reverts, or a different content type returns the older format.
+    """
+    if not raw_timestamp:
+        return "N/A"
+
+    try:
+        if isinstance(raw_timestamp, (int, float)):
+            published_dt = datetime.fromtimestamp(raw_timestamp, tz=timezone.utc)
+        else:
+            published_dt = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+            published_dt = published_dt.astimezone(timezone.utc)
+    except (ValueError, TypeError, OSError):
+        return "N/A"
+
+    return published_dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _extract_article_link(content: dict) -> str:
+    """Extracts the deep link to the article.
+
+    There is no flat "link"/"url" field on the current schema — verified
+    against the live API. The usable URL lives under
+    content.canonicalUrl.url, falling back to content.clickThroughUrl.url,
+    then content.previewUrl, then an empty string if none are present.
+    """
+    canonical_url = content.get("canonicalUrl") or {}
+    if canonical_url.get("url"):
+        return canonical_url["url"]
+
+    click_through_url = content.get("clickThroughUrl") or {}
+    if click_through_url.get("url"):
+        return click_through_url["url"]
+
+    return content.get("previewUrl") or ""
+
+
+def _format_intel_article(article: dict) -> dict[str, object]:
+    """Normalizes one raw yfinance news item into the V3.1 article shape,
+    with a flat-schema fallback for title/publisher in case Yahoo reverts
+    to the older format (content.* is the current, verified shape)."""
+    content = article.get("content") or {}
+
+    title = content.get("title") or article.get("title") or "No Title"
+
+    provider = content.get("provider") or {}
+    publisher = provider.get("displayName") or article.get("publisher") or "Unknown Publisher"
+
+    published_at = _format_publish_timestamp(content.get("pubDate") or content.get("displayTime"))
+    link = _extract_article_link(content)
+    is_critical = _title_has_critical_keyword(title)
+
+    return {
+        "title": title,
+        "publisher": publisher,
+        "published_at": published_at,
+        "link": link,
+        "is_critical": is_critical,
+        "tag": CRITICAL_ALERT_TAG if is_critical else "",
+    }
+
+
+def _fetch_intel_for_ticker(symbol: str) -> dict[str, object]:
+    """Fetches and formats up to INTEL_NEWS_COUNT articles for one ticker.
+
+    Both the fetch and the formatting step are covered by the same
+    try/except so that one malformed or unreachable ticker can never break
+    the rest of a batch request — it just comes back with an "error" field
+    instead of a "news" list, while every other ticker in the batch is
+    unaffected.
+    """
     cached_result = intel_cache.get(symbol)
     if cached_result is not None:
         return cached_result
@@ -547,29 +642,37 @@ def get_intel(ticker: str) -> dict[str, object]:
             lambda: yf.Ticker(symbol, session=_yahoo_session).news,
             description=f"on-demand intel fetch for '{symbol}'",
         )
-    except Exception as error:  # noqa: BLE001 - yfinance/curl_cffi raise many different error types
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch intel for ticker '{symbol}': {error}",
-        ) from error
-
-    # Current Yahoo news items nest both the headline and the publisher
-    # under "content" (e.g. article["content"]["title"] and
-    # article["content"]["provider"]["displayName"]) rather than at the
-    # top level — verified against the live API. Falls back to a flat
-    # shape too in case Yahoo reverts it. An empty/missing news list is not
-    # an error: it just yields an empty "news" array.
-    articles: list[dict[str, str]] = []
-    for article in (news_data or [])[:INTEL_NEWS_COUNT]:
-        content = article.get("content") or {}
-        title = content.get("title") or article.get("title") or "No Title"
-        provider = content.get("provider") or {}
-        publisher = provider.get("displayName") or article.get("publisher") or "Unknown Publisher"
-        articles.append({"title": title, "publisher": publisher})
+        articles = [_format_intel_article(article) for article in (news_data or [])[:INTEL_NEWS_COUNT]]
+    except Exception as error:  # noqa: BLE001 - isolate this ticker's failure from the rest of the batch
+        return {"ticker": symbol, "news": [], "error": f"Failed to fetch intel for '{symbol}': {error}"}
 
     result = {"ticker": symbol, "news": articles}
     intel_cache.set(symbol, result)
     return result
+
+
+@app.get("/api/intel/{tickers}")
+def get_intel(tickers: str) -> dict[str, list[dict[str, object]]]:
+    """On-Demand Intel V3.1: latest news for one or more tickers (comma-
+    separated, e.g. "PLD, UNH, AMT"), regardless of whether they moved
+    today. Each article is timestamped, deep-linked, and flagged for
+    critical keywords. Not a REST/CLI hybrid — this is a plain
+    request/response route, no input() prompts of any kind.
+    """
+    ticker_list = [symbol.strip().upper() for symbol in tickers.split(",")]
+    ticker_list = [symbol for symbol in ticker_list if symbol]
+
+    if not ticker_list:
+        raise HTTPException(status_code=400, detail="At least one ticker symbol is required.")
+
+    if len(ticker_list) > MAX_BATCH_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many tickers in one request (max {MAX_BATCH_TICKERS}); got {len(ticker_list)}.",
+        )
+
+    results = [_fetch_intel_for_ticker(symbol) for symbol in ticker_list]
+    return {"results": results}
 
 
 if __name__ == "__main__":
