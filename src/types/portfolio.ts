@@ -22,4 +22,8 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // never persisted, since a stale anomaly note from a prior day would be
   // actively misleading.
   anomalyReport: string | null;
+  // 52-week high / drawdown from the backend: also live/ephemeral, never
+  // persisted, for the same reason.
+  high52: number | null;
+  drawdownPct: number | null;
 };

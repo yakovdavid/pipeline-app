@@ -254,9 +254,13 @@ PRIMARY_FETCH_MAX_RETRIES = 1
 PRIMARY_FETCH_BASE_BACKOFF_SECONDS = 1.0
 
 
-def _fetch_raw_quote_via_yfinance(symbol: str) -> tuple[float, float | None, float | None]:
+def _fetch_raw_quote_via_yfinance(symbol: str) -> tuple[float, float | None, float | None, float | None]:
     """Primary data source: yfinance's quoteSummary-backed .info, which
-    directly exposes fiftyDayAverage/twoHundredDayAverage."""
+    directly exposes fiftyDayAverage/twoHundredDayAverage/fiftyTwoWeekHigh —
+    the latter is Yahoo's own official 52-week high (accounts for intraday
+    highs), which is both more accurate than manually scanning daily close
+    prices and free (no extra Yahoo call), since it's already part of this
+    same .info payload."""
     info = fetch_with_retry(
         lambda: yf.Ticker(symbol, session=_yahoo_session).info,
         description=f"yfinance info fetch for '{symbol}'",
@@ -268,14 +272,23 @@ def _fetch_raw_quote_via_yfinance(symbol: str) -> tuple[float, float | None, flo
     if not raw_price:
         raise TickerNotFoundError(f"yfinance returned no price for '{symbol}'")
 
-    return float(raw_price), info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")
+    return (
+        float(raw_price),
+        info.get("fiftyDayAverage"),
+        info.get("twoHundredDayAverage"),
+        info.get("fiftyTwoWeekHigh"),
+    )
 
 
-def _fetch_raw_quote_via_chart_fallback(symbol: str) -> tuple[float, float | None, float | None]:
+def _fetch_raw_quote_via_chart_fallback(
+    symbol: str,
+) -> tuple[float, float | None, float | None, float | None]:
     """Fallback data source: a direct request to Yahoo's chart endpoint,
     bypassing yfinance's quoteSummary machinery entirely. SMA50/SMA200 are
     computed from the returned daily close history since Yahoo doesn't
-    include those fields on this endpoint."""
+    include those fields on this endpoint — but it does include
+    fiftyTwoWeekHigh directly in "meta" (same field, verified live), so
+    that one doesn't need to be recomputed."""
 
     def do_fetch():
         response = _yahoo_session.get(
@@ -320,8 +333,9 @@ def _fetch_raw_quote_via_chart_fallback(symbol: str) -> tuple[float, float | Non
 
     sma50 = sum(closes[-SMA_50_WINDOW:]) / SMA_50_WINDOW if len(closes) >= SMA_50_WINDOW else None
     sma200 = sum(closes[-SMA_200_WINDOW:]) / SMA_200_WINDOW if len(closes) >= SMA_200_WINDOW else None
+    high_52 = meta.get("fiftyTwoWeekHigh")
 
-    return float(price), sma50, sma200
+    return float(price), sma50, sma200, high_52
 
 
 def fetch_anomaly_news(ticker_symbol: str, threshold: float = ANOMALY_THRESHOLD_DEFAULT) -> str | None:
@@ -433,20 +447,20 @@ def get_stock(ticker: str, include_anomaly: bool = False) -> dict[str, float | s
         return cached_result
 
     try:
-        raw_price, raw_sma50, raw_sma200 = _fetch_raw_quote_via_yfinance(symbol)
+        raw_price, raw_sma50, raw_sma200, raw_high_52 = _fetch_raw_quote_via_yfinance(symbol)
     except TickerNotFoundError:
         # A clean "not found" from yfinance itself is still worth
         # double-checking against the fallback, since yfinance being
         # blocked can sometimes surface as an empty/missing-price result
         # rather than a raised network error.
-        raw_price = raw_sma50 = raw_sma200 = None
+        raw_price = raw_sma50 = raw_sma200 = raw_high_52 = None
     except Exception as primary_error:  # noqa: BLE001 - yfinance raises many different error types
         print(f"[resilience] yfinance failed for '{symbol}' ({primary_error}); trying chart API fallback.")
-        raw_price = raw_sma50 = raw_sma200 = None
+        raw_price = raw_sma50 = raw_sma200 = raw_high_52 = None
 
     if raw_price is None:
         try:
-            raw_price, raw_sma50, raw_sma200 = _fetch_raw_quote_via_chart_fallback(symbol)
+            raw_price, raw_sma50, raw_sma200, raw_high_52 = _fetch_raw_quote_via_chart_fallback(symbol)
         except TickerNotFoundError as not_found_error:
             raise HTTPException(
                 status_code=404,
@@ -478,15 +492,36 @@ def get_stock(ticker: str, include_anomaly: bool = False) -> dict[str, float | s
         price = to_usd(raw_price)
         sma50 = to_usd(raw_sma50)
         sma200 = to_usd(raw_sma200)
+        high_52 = to_usd(raw_high_52)
     else:
         price = raw_price
         sma50 = raw_sma50
         sma200 = raw_sma200
+        high_52 = raw_high_52
+
+    # 52-week drawdown: how far the current price sits below its 52-week
+    # high, as a negative percentage (0 = at the high, more negative = a
+    # deeper pullback). high_52 <= 0 shouldn't happen for a real security,
+    # but guarded against to avoid a division error on bad upstream data.
+    if high_52 is not None and high_52 > 0:
+        drawdown_pct = round(((price - high_52) / high_52) * 100, 2)
+    else:
+        drawdown_pct = None
+
+    high_52_rounded = round(float(high_52), 2) if high_52 is not None else None
+
+    print(
+        f"[intel] {symbol}: price=${price:.2f} | 52W High="
+        f"{'$' + format(high_52_rounded, '.2f') if high_52_rounded is not None else 'N/A'} | "
+        f"Drawdown={drawdown_pct if drawdown_pct is not None else 'N/A'}%"
+    )
 
     result: dict[str, float | str | None] = {
         "price": round(float(price), 2),
         "sma50": round(float(sma50), 2) if sma50 is not None else None,
         "sma200": round(float(sma200), 2) if sma200 is not None else None,
+        "high_52": high_52_rounded,
+        "drawdown_pct": drawdown_pct,
     }
 
     if include_anomaly:

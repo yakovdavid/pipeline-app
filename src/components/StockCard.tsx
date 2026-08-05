@@ -16,6 +16,13 @@ export type Stock = {
   // backend found explanatory headlines. Not rendered on the card itself
   // (see report-formatters.ts) — just carried through so exports can use it.
   anomalyReport: string | null;
+  // 52-week high / drawdown from the backend. Not rendered here: the
+  // Quality-layer drawdown review styling is a Portfolio-only concept (see
+  // PortfolioStockRow in index.tsx) — Ambush Radar has no "layer"/category
+  // at all, so this pair is carried through for type-compatibility with
+  // StockQuote only, unused by this component's own UI.
+  high52: number | null;
+  drawdownPct: number | null;
 };
 
 export type StockCardProps = {

@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -25,7 +26,7 @@ import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { TRAILING_STOP_MULTIPLIER } from '@/constants/thresholds';
-import { fetchIntel, fetchStockData, type IntelResponse, type StockQuote } from '@/services/api';
+import { fetchIntel, fetchStockData, type IntelBatchResponse, type StockQuote } from '@/services/api';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
@@ -71,8 +72,10 @@ export default function PortfolioScreen() {
   const [importText, setImportText] = useState('');
   const [isRestoring, setIsRestoring] = useState(false);
   const [isIntelModalVisible, setIsIntelModalVisible] = useState(false);
-  const [intelTicker, setIntelTicker] = useState('');
-  const [intelResult, setIntelResult] = useState<IntelResponse | null>(null);
+  // Raw, comma-separated user input (e.g. "PLD, UNH, AMT") — the backend
+  // does the actual per-ticker splitting/trimming, so this is sent as-is.
+  const [intelInput, setIntelInput] = useState('');
+  const [intelResult, setIntelResult] = useState<IntelBatchResponse | null>(null);
   const [isFetchingIntel, setIsFetchingIntel] = useState(false);
 
   // Load the saved portfolio on mount: read the ticker/category pairs from
@@ -110,6 +113,8 @@ export default function PortfolioScreen() {
             ...entry,
             price: result.value.price,
             anomalyReport: result.value.anomalyReport,
+            high52: result.value.high52,
+            drawdownPct: result.value.drawdownPct,
             highestWatermark: computeHighestWatermark(
               entry.assetType,
               entry.highestWatermark,
@@ -182,6 +187,8 @@ export default function PortfolioScreen() {
           units: parsedUnits,
           price: quote.price,
           anomalyReport: quote.anomalyReport,
+          high52: quote.high52,
+          drawdownPct: quote.drawdownPct,
           highestWatermark: computeHighestWatermark(selectedAssetType, null, quote.price),
         },
       ]);
@@ -247,6 +254,8 @@ export default function PortfolioScreen() {
             ...stock,
             price: freshQuote.price,
             anomalyReport: freshQuote.anomalyReport,
+            high52: freshQuote.high52,
+            drawdownPct: freshQuote.drawdownPct,
             highestWatermark: computeHighestWatermark(
               stock.assetType,
               stock.highestWatermark,
@@ -360,6 +369,8 @@ export default function PortfolioScreen() {
             ...entry,
             price: result.value.price,
             anomalyReport: result.value.anomalyReport,
+            high52: result.value.high52,
+            drawdownPct: result.value.drawdownPct,
             highestWatermark: computeHighestWatermark(
               entry.assetType,
               entry.highestWatermark,
@@ -382,36 +393,69 @@ export default function PortfolioScreen() {
   };
 
   const handleFetchIntel = async () => {
-    const normalizedTicker = normalizeTickerInput(intelTicker);
-    if (!normalizedTicker) {
-      Alert.alert('Ticker Required', 'Please enter a ticker symbol.');
+    if (!intelInput.trim()) {
+      Alert.alert('Ticker Required', 'Please enter at least one ticker symbol.');
       return;
     }
 
     setIsFetchingIntel(true);
     setIntelResult(null);
     try {
-      const result = await fetchIntel(normalizedTicker);
+      const result = await fetchIntel(intelInput);
       setIntelResult(result);
-      if (result.news.length === 0) {
-        Alert.alert('No News Found', `No recent news was found for ${result.ticker}.`);
+
+      const hasAnyNews = result.results.some((entry) => entry.news.length > 0);
+      if (!hasAnyNews) {
+        Alert.alert('No News Found', 'No recent news was found for the requested ticker(s).');
       }
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : `Failed to fetch intel for ${normalizedTicker}.`;
+      const message = error instanceof Error ? error.message : 'Failed to fetch intel.';
       Alert.alert('Intel Fetch Failed', message);
     } finally {
       setIsFetchingIntel(false);
     }
   };
 
+  const handleOpenArticleLink = (url: string) => {
+    Linking.openURL(url).catch(() => {
+      Alert.alert('Could Not Open Link', 'This article link could not be opened.');
+    });
+  };
+
   const handleCopyIntel = async () => {
-    if (!intelResult || intelResult.news.length === 0) {
+    if (!intelResult || intelResult.results.length === 0) {
       return;
     }
 
-    const lines = intelResult.news.map((article) => `${article.title} — ${article.publisher}`);
-    const text = [`Intel: ${intelResult.ticker}`, '', ...lines].join('\n');
+    const sectionTexts = intelResult.results.map((entry) => {
+      const lines: string[] = [`=== ${entry.ticker} ===`];
+
+      if (entry.error) {
+        lines.push(`Error: ${entry.error}`);
+        return lines.join('\n');
+      }
+
+      if (entry.news.length === 0) {
+        lines.push('No news found.');
+        return lines.join('\n');
+      }
+
+      entry.news.forEach((article, index) => {
+        if (index > 0) {
+          lines.push('');
+        }
+        if (article.isCritical) {
+          lines.push(article.tag || '[CRITICAL ALERT]');
+        }
+        lines.push(`Title: ${article.title}`);
+        lines.push(`Source: ${article.publisher} | ${article.publishedAt}`);
+        lines.push(`URL: ${article.link || 'N/A'}`);
+      });
+
+      return lines.join('\n');
+    });
+
+    const text = sectionTexts.join('\n\n');
 
     try {
       await Clipboard.setStringAsync(text);
@@ -768,12 +812,18 @@ export default function PortfolioScreen() {
                 </TouchableOpacity>
               </View>
 
+              <Text style={styles.modalSectionLabel}>Tickers (comma-separated)</Text>
               <View style={styles.inputRow}>
-                <TickerAutocomplete
-                  value={intelTicker}
-                  onChangeText={setIntelTicker}
-                  onSelectTicker={setIntelTicker}
-                  onSubmit={handleFetchIntel}
+                <TextInput
+                  style={styles.intelTextInput}
+                  value={intelInput}
+                  onChangeText={setIntelInput}
+                  placeholder="e.g. PLD, UNH, AMT"
+                  placeholderTextColor={PipelineColors.textSecondary}
+                  autoCapitalize="characters"
+                  autoCorrect={false}
+                  returnKeyType="done"
+                  onSubmitEditing={handleFetchIntel}
                   editable={!isFetchingIntel}
                 />
                 <TouchableOpacity
@@ -788,22 +838,51 @@ export default function PortfolioScreen() {
                 </TouchableOpacity>
               </View>
 
-              {intelResult && intelResult.news.length > 0 && (
-                <ScrollView style={styles.intelResultsScroll} keyboardShouldPersistTaps="handled">
-                  {intelResult.news.map((article, index) => (
-                    <View key={`${article.title}-${index}`} style={styles.intelArticleRow}>
-                      <Text style={styles.intelArticleTitle}>{article.title}</Text>
-                      <Text style={styles.intelArticlePublisher}>{article.publisher}</Text>
+              {intelResult && (
+                <ScrollView
+                  style={styles.intelResultsScroll}
+                  showsVerticalScrollIndicator={true}
+                  persistentScrollbar={true}
+                  keyboardShouldPersistTaps="handled">
+                  {intelResult.results.map((entry) => (
+                    <View key={entry.ticker}>
+                      <Text style={styles.intelTickerSectionHeader}>=== {entry.ticker} ===</Text>
+
+                      {entry.error ? (
+                        <Text style={styles.intelErrorText}>Error: {entry.error}</Text>
+                      ) : entry.news.length === 0 ? (
+                        <Text style={styles.intelEmptyText}>No news found for {entry.ticker}.</Text>
+                      ) : (
+                        entry.news.map((article, index) => (
+                          <View key={`${entry.ticker}-${index}`} style={styles.intelArticleCard}>
+                            <View style={styles.intelArticleHeaderRow}>
+                              <Text style={styles.intelArticlePublisher}>{article.publisher}</Text>
+                              <Text style={styles.intelArticleTimestamp}>{article.publishedAt}</Text>
+                            </View>
+                            <Text style={styles.intelArticleTitle}>
+                              {article.isCritical && (
+                                <Text style={styles.intelCriticalInlineTag}>
+                                  {(article.tag || '[CRITICAL ALERT]') + '  '}
+                                </Text>
+                              )}
+                              {article.title}
+                            </Text>
+                            {article.link ? (
+                              <TouchableOpacity
+                                onPress={() => handleOpenArticleLink(article.link)}
+                                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
+                                <Text style={styles.intelLinkButtonText}>Read Full Article →</Text>
+                              </TouchableOpacity>
+                            ) : null}
+                          </View>
+                        ))
+                      )}
                     </View>
                   ))}
                 </ScrollView>
               )}
 
-              {intelResult && intelResult.news.length === 0 && (
-                <Text style={styles.intelEmptyText}>No news found for {intelResult.ticker}.</Text>
-              )}
-
-              {intelResult && intelResult.news.length > 0 && (
+              {intelResult && intelResult.results.length > 0 && (
                 <View style={styles.addRow}>
                   <TouchableOpacity style={styles.addButton} onPress={handleCopyIntel}>
                     <Text style={styles.addButtonText}>Copy Intel</Text>
@@ -860,11 +939,24 @@ function PortfolioStockRow({ stock, accentColor, onDelete, onSaveEdit }: Portfol
   const [editedAssetType, setEditedAssetType] = useState<AssetType>(stock.assetType);
 
   const totalValue = stock.units * stock.price;
+  // Trailing stops are a Satellite-only mechanic: Core positions are meant
+  // to be held through drawdowns, and Quality positions are risk-reviewed
+  // manually (see the drawdown-review styling below) rather than
+  // auto-stopped. A Core/Quality Stock position (which could still have a
+  // tracked highestWatermark from before this rule, or from being
+  // reassigned away from Satellite) must show no TS field at all.
   const trailingStopPrice =
-    stock.assetType === 'Stock' && stock.highestWatermark !== null
+    stock.category === 'Satellite' && stock.assetType === 'Stock' && stock.highestWatermark !== null
       ? stock.highestWatermark * TRAILING_STOP_MULTIPLIER
       : null;
   const isTrailingStopTriggered = trailingStopPrice !== null && stock.price <= trailingStopPrice;
+
+  // Quality-layer review flag: a Quality position that has fallen 15%+
+  // from its 52-week high is flagged for manual review (Quality positions
+  // don't get an automatic trailing stop, so this is the equivalent
+  // "pay attention" signal for that layer instead).
+  const isQualityDrawdownReview =
+    stock.category === 'Quality' && stock.drawdownPct !== null && stock.drawdownPct <= -15;
 
   const handleStartEditing = () => {
     setUnitsText(String(stock.units));
@@ -968,6 +1060,18 @@ function PortfolioStockRow({ stock, accentColor, onDelete, onSaveEdit }: Portfol
           {isTrailingStopTriggered ? '⚠ ' : ''}TS Triggered at: ${trailingStopPrice.toFixed(2)}
         </Text>
       )}
+
+      {!isEditing && stock.high52 !== null && stock.drawdownPct !== null && (
+        <View style={styles.drawdownRow}>
+          <Text
+            style={[styles.drawdownText, isQualityDrawdownReview && styles.drawdownTextReview]}>
+            52W High: ${stock.high52.toFixed(2)} (DD: {stock.drawdownPct.toFixed(2)}%)
+          </Text>
+          {isQualityDrawdownReview && (
+            <Text style={styles.drawdownReviewTag}>[REVIEW]</Text>
+          )}
+        </View>
+      )}
     </View>
   );
 }
@@ -1023,33 +1127,73 @@ const styles = StyleSheet.create({
     height: 160,
     marginBottom: 20,
   },
-  intelResultsScroll: {
-    maxHeight: 280,
+  intelTextInput: {
+    flex: 1,
     backgroundColor: PipelineColors.background,
+    color: PipelineColors.textPrimary,
     borderRadius: 8,
     paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+  },
+  intelResultsScroll: {
+    maxHeight: 320,
+    backgroundColor: PipelineColors.background,
+    borderRadius: 8,
+    padding: 12,
     marginBottom: 16,
   },
-  intelArticleRow: {
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: PipelineColors.cardBackground,
+  intelTickerSectionHeader: {
+    color: PipelineColors.textPrimary,
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  intelArticleCard: {
+    backgroundColor: PipelineColors.cardBackground,
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 10,
+  },
+  intelArticleHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  intelArticlePublisher: {
+    color: PipelineColors.textSecondary,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  intelArticleTimestamp: {
+    color: PipelineColors.textSecondary,
+    fontSize: 11,
   },
   intelArticleTitle: {
     color: PipelineColors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
-    marginBottom: 4,
+    marginBottom: 8,
   },
-  intelArticlePublisher: {
-    color: PipelineColors.textSecondary,
-    fontSize: 12,
+  intelCriticalInlineTag: {
+    color: PipelineColors.bearish,
+    fontWeight: '700',
+  },
+  intelLinkButtonText: {
+    color: PipelineColors.core,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  intelErrorText: {
+    color: PipelineColors.warning,
+    fontSize: 13,
+    marginBottom: 12,
   },
   intelEmptyText: {
     color: PipelineColors.textSecondary,
-    fontSize: 14,
-    textAlign: 'center',
-    marginVertical: 16,
+    fontSize: 13,
+    marginBottom: 12,
   },
   categoryRow: {
     flexDirection: 'row',
@@ -1259,6 +1403,25 @@ const styles = StyleSheet.create({
   },
   trailingStopTriggeredText: {
     color: PipelineColors.warning,
+    fontWeight: '700',
+  },
+  drawdownRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 6,
+  },
+  drawdownText: {
+    color: PipelineColors.textSecondary,
+    fontSize: 12,
+  },
+  drawdownTextReview: {
+    color: PipelineColors.reviewAlert,
+    fontWeight: '700',
+  },
+  drawdownReviewTag: {
+    color: PipelineColors.reviewAlert,
+    fontSize: 12,
     fontWeight: '700',
   },
   initializingContainer: {

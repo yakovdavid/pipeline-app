@@ -14,4 +14,8 @@ export const PipelineColors = {
   // Amber caution color: distinct from "bearish" (already-confirmed
   // downtrend) — used for "approaching a risk threshold" warnings.
   warning: '#FFA726',
+  // Explicit review-alert red for the Quality-layer 52-week drawdown rule
+  // (>= 15% off the high) — deliberately its own color, not reused from
+  // "bearish", so this specific manual-review signal reads distinctly.
+  reviewAlert: '#FF4444',
 } as const;
