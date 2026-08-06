@@ -33,41 +33,68 @@ export async function createBackupPayload(): Promise<BackupPayload> {
   };
 }
 
-function isPortfolioEntry(value: unknown): value is PortfolioTickerEntry {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
-  const entry = value as Record<string, unknown>;
-  return (
-    typeof entry.ticker === 'string' &&
-    entry.ticker.length > 0 &&
-    typeof entry.category === 'string' &&
-    PORTFOLIO_CATEGORIES.includes(entry.category as PortfolioCategory) &&
-    typeof entry.assetType === 'string' &&
-    ASSET_TYPES.includes(entry.assetType as AssetType) &&
-    typeof entry.units === 'number' &&
-    entry.units > 0 &&
-    (entry.highestWatermark === null || typeof entry.highestWatermark === 'number')
-  );
+function normalizeAssetType(value: unknown): AssetType {
+  return typeof value === 'string' && ASSET_TYPES.includes(value as AssetType) ? (value as AssetType) : 'Stock';
 }
 
-function isAmbushEntry(value: unknown): value is AmbushTickerEntry {
+// A ticker is the one thing that can't be fabricated — everything else
+// (category, units, watermark) has a safe default. Also accepts a bare
+// string, since that's the legacy Ambush storage shape (see
+// normalizeAmbushEntries in ambush-storage.ts) and older exports may carry
+// it into either list.
+function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
+  if (typeof value === 'string') {
+    const ticker = value.trim().toUpperCase();
+    return ticker.length > 0
+      ? { ticker, category: 'Satellite', assetType: 'Stock', units: 0, highestWatermark: null }
+      : null;
+  }
   if (typeof value !== 'object' || value === null) {
-    return false;
+    return null;
   }
   const entry = value as Record<string, unknown>;
-  return (
-    typeof entry.ticker === 'string' &&
-    entry.ticker.length > 0 &&
-    typeof entry.assetType === 'string' &&
-    ASSET_TYPES.includes(entry.assetType as AssetType)
-  );
+  if (typeof entry.ticker !== 'string' || entry.ticker.trim().length === 0) {
+    return null;
+  }
+  return {
+    ticker: entry.ticker.trim().toUpperCase(),
+    category:
+      typeof entry.category === 'string' && PORTFOLIO_CATEGORIES.includes(entry.category as PortfolioCategory)
+        ? (entry.category as PortfolioCategory)
+        : 'Satellite',
+    assetType: normalizeAssetType(entry.assetType),
+    units: typeof entry.units === 'number' && entry.units >= 0 ? entry.units : 0,
+    highestWatermark: typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
+  };
 }
 
-// Deliberately strict: this is the disaster-recovery path, so a malformed
-// backup is rejected outright rather than silently patched up the way the
-// normal AsyncStorage loaders backfill old-schema data — hydrating corrupt
-// or partial state here would be worse than just refusing to restore.
+// Ambush entries only ever need ticker + assetType, so any Portfolio-only
+// fields present (category, units, highestWatermark) are simply ignored
+// rather than causing a mismatch.
+function coerceAmbushEntry(value: unknown): AmbushTickerEntry | null {
+  if (typeof value === 'string') {
+    const ticker = value.trim().toUpperCase();
+    return ticker.length > 0 ? { ticker, assetType: 'Stock' } : null;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.ticker !== 'string' || entry.ticker.trim().length === 0) {
+    return null;
+  }
+  return {
+    ticker: entry.ticker.trim().toUpperCase(),
+    assetType: normalizeAssetType(entry.assetType),
+  };
+}
+
+// Coerces each entry individually instead of rejecting the whole list on
+// the first mismatch. The previous all-or-nothing `.every(...)` check meant
+// one Ambush entry missing a Portfolio-only field (or an older export's
+// plain-string tickers) would throw away every other valid ticker in the
+// same list — this repairs what it can and only drops entries with no
+// usable ticker at all.
 export function parseBackupPayload(rawText: string): BackupPayload {
   let parsed: unknown;
   try {
@@ -82,18 +109,32 @@ export function parseBackupPayload(rawText: string): BackupPayload {
 
   const payload = parsed as Record<string, unknown>;
 
-  if (!Array.isArray(payload.portfolio) || !payload.portfolio.every(isPortfolioEntry)) {
-    throw new Error('Backup is missing a valid "portfolio" list.');
+  if (!Array.isArray(payload.portfolio)) {
+    throw new Error('Backup is missing a "portfolio" list.');
   }
-  if (!Array.isArray(payload.ambush) || !payload.ambush.every(isAmbushEntry)) {
-    throw new Error('Backup is missing a valid "ambush" list.');
+  if (!Array.isArray(payload.ambush)) {
+    throw new Error('Backup is missing an "ambush" list.');
+  }
+
+  const portfolio = payload.portfolio
+    .map(coercePortfolioEntry)
+    .filter((entry): entry is PortfolioTickerEntry => entry !== null);
+  const ambush = payload.ambush
+    .map(coerceAmbushEntry)
+    .filter((entry): entry is AmbushTickerEntry => entry !== null);
+
+  if (portfolio.length === 0 && payload.portfolio.length > 0) {
+    throw new Error('None of the "portfolio" entries had a usable ticker symbol.');
+  }
+  if (ambush.length === 0 && payload.ambush.length > 0) {
+    throw new Error('None of the "ambush" entries had a usable ticker symbol.');
   }
 
   return {
     schemaVersion: typeof payload.schemaVersion === 'number' ? payload.schemaVersion : BACKUP_SCHEMA_VERSION,
     exportedAt: typeof payload.exportedAt === 'string' ? payload.exportedAt : new Date().toISOString(),
-    portfolio: payload.portfolio,
-    ambush: payload.ambush,
+    portfolio,
+    ambush,
   };
 }
 

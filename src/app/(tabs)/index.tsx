@@ -1,13 +1,16 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { memo, useCallback, useEffect, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Dimensions,
   KeyboardAvoidingView,
   Linking,
   Modal,
+  PanResponder,
   Platform,
   Pressable,
   RefreshControl,
@@ -19,9 +22,10 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
+import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
@@ -37,6 +41,17 @@ import { normalizeTickerInput } from '@/utils/ticker';
 
 type FilterOption = 'All' | PortfolioCategory;
 const FILTER_OPTIONS: FilterOption[] = ['All', 'Core', 'Satellite', 'Quality'];
+
+// Snap points for the Intel modal's draggable bottom sheet, expressed as
+// pixel heights (not percentages) so PanResponder math below can work with
+// them directly. Drag up from the handle to expand toward MAX; releasing
+// snaps to whichever of DEFAULT/MAX is closer, it never snaps shut — the
+// modal only closes via the explicit close button (see the previous
+// backdrop-tap-to-dismiss fix).
+const SCREEN_HEIGHT = Dimensions.get('window').height;
+const INTEL_SHEET_MIN_HEIGHT = SCREEN_HEIGHT * 0.4;
+const INTEL_SHEET_DEFAULT_HEIGHT = SCREEN_HEIGHT * 0.6;
+const INTEL_SHEET_MAX_HEIGHT = SCREEN_HEIGHT * 0.9;
 
 type PortfolioListSection = {
   title: string;
@@ -102,6 +117,66 @@ export default function PortfolioScreen() {
   const [intelInput, setIntelInput] = useState('');
   const [intelResult, setIntelResult] = useState<IntelBatchResponse | null>(null);
   const [isFetchingIntel, setIsFetchingIntel] = useState(false);
+
+  const insets = useSafeAreaInsets();
+
+  // Drives the Intel modal's draggable bottom sheet height. Lazily
+  // initialized via useState (not useRef().current) so the value stays
+  // stable across renders without reading a ref during render — the
+  // Animated.Value itself is still a mutable object updated imperatively
+  // via setValue/spring, same as the useRef version would have been.
+  const [intelSheetHeight] = useState(() => new Animated.Value(INTEL_SHEET_DEFAULT_HEIGHT));
+  // Snapshots the sheet's height at the start of each drag (via
+  // stopAnimation, read directly off the live Animated.Value) so
+  // onPanResponderMove can compute each frame's height from a fixed
+  // baseline instead of compounding off the previous frame's already-updated
+  // value. Only ever read/written from event handlers, never during render.
+  const gestureStartHeightRef = useRef(INTEL_SHEET_DEFAULT_HEIGHT);
+
+  // The linter can't tell that PanResponder's handler object only reads
+  // gestureStartHeightRef.current from inside gesture callbacks (invoked
+  // later, off the render path) rather than during this initializer's own
+  // execution — PanResponder isn't a recognized event-handler shape to it.
+  // eslint-disable-next-line react-hooks/refs
+  const [intelSheetPanResponder] = useState(() =>
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: (_event, gesture) => Math.abs(gesture.dy) > 4,
+      onPanResponderGrant: () => {
+        intelSheetHeight.stopAnimation((value) => {
+          gestureStartHeightRef.current = value;
+        });
+      },
+      onPanResponderMove: (_event, gesture) => {
+        // Dragging up (negative dy) grows the sheet; dragging down shrinks it.
+        const nextHeight = Math.min(
+          INTEL_SHEET_MAX_HEIGHT,
+          Math.max(INTEL_SHEET_MIN_HEIGHT, gestureStartHeightRef.current - gesture.dy),
+        );
+        intelSheetHeight.setValue(nextHeight);
+      },
+      onPanResponderRelease: (_event, gesture) => {
+        const releasedHeight = Math.min(
+          INTEL_SHEET_MAX_HEIGHT,
+          Math.max(INTEL_SHEET_MIN_HEIGHT, gestureStartHeightRef.current - gesture.dy),
+        );
+        const midpoint = (INTEL_SHEET_MIN_HEIGHT + INTEL_SHEET_MAX_HEIGHT) / 2;
+        Animated.spring(intelSheetHeight, {
+          toValue: releasedHeight > midpoint ? INTEL_SHEET_MAX_HEIGHT : INTEL_SHEET_DEFAULT_HEIGHT,
+          useNativeDriver: false,
+          bounciness: 4,
+        }).start();
+      },
+    }),
+  );
+
+  // Reset to the default snap point every time the modal is (re)opened,
+  // rather than reopening wherever the user last dragged it to.
+  useEffect(() => {
+    if (isIntelModalVisible) {
+      intelSheetHeight.setValue(INTEL_SHEET_DEFAULT_HEIGHT);
+    }
+  }, [isIntelModalVisible, intelSheetHeight]);
 
   // Load the saved portfolio on mount: read the ticker/category pairs from
   // AsyncStorage, then fetch a fresh live price for each from the Python API.
@@ -636,24 +711,28 @@ export default function PortfolioScreen() {
           <Text style={styles.initializingText}>Loading your portfolio...</Text>
         </View>
       ) : (
-        <SectionList
-          sections={visibleSections}
-          keyExtractor={extractPortfolioItemKey}
-          renderItem={renderPortfolioRow}
-          renderSectionHeader={renderPortfolioSectionHeader}
-          renderSectionFooter={renderPortfolioSectionFooter}
-          initialNumToRender={10}
-          windowSize={5}
-          stickySectionHeadersEnabled={false}
-          contentContainerStyle={styles.listContent}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={onRefresh}
-              tintColor={PipelineColors.textPrimary}
-            />
-          }
-        />
+        <View style={styles.listWrapper}>
+          <PullToRefreshLogo isRefreshing={refreshing} />
+          <SectionList
+            sections={visibleSections}
+            keyExtractor={extractPortfolioItemKey}
+            renderItem={renderPortfolioRow}
+            renderSectionHeader={renderPortfolioSectionHeader}
+            renderSectionFooter={renderPortfolioSectionFooter}
+            initialNumToRender={10}
+            windowSize={5}
+            stickySectionHeadersEnabled={false}
+            contentContainerStyle={styles.listContent}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                tintColor="transparent"
+                colors={['transparent']}
+              />
+            }
+          />
+        </View>
       )}
 
       <TouchableOpacity
@@ -904,7 +983,15 @@ export default function PortfolioScreen() {
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
             style={styles.addModalKeyboardAvoider}>
-            <View style={styles.intelModalSheet}>
+            <Animated.View
+              style={[
+                styles.intelModalSheet,
+                { height: intelSheetHeight, paddingBottom: 40 + insets.bottom },
+              ]}>
+              <View style={styles.intelDragHandleArea} {...intelSheetPanResponder.panHandlers}>
+                <View style={styles.intelDragHandle} />
+              </View>
+
               <TouchableOpacity
                 style={styles.intelCloseButton}
                 onPress={() => setIsIntelModalVisible(false)}
@@ -994,7 +1081,7 @@ export default function PortfolioScreen() {
                   </TouchableOpacity>
                 </View>
               )}
-            </View>
+            </Animated.View>
           </KeyboardAvoidingView>
         </View>
       </Modal>
@@ -1365,6 +1452,9 @@ const styles = StyleSheet.create({
   filterButtonTextActive: {
     color: PipelineColors.background,
   },
+  listWrapper: {
+    flex: 1,
+  },
   listContent: {
     paddingHorizontal: 16,
     paddingBottom: 24,
@@ -1600,17 +1690,38 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '700',
   },
-  // Bounded (not auto-sized) sheet: a % maxHeight is what lets the
-  // intelResultsScroll child below use flex: 1 to fill remaining space
-  // instead of collapsing to its content size.
+  // Explicit (not auto-sized) height, driven by intelSheetHeight — that's
+  // what lets the intelResultsScroll child below use flex: 1 to fill
+  // remaining space instead of collapsing to its content size, and what
+  // PanResponder animates between INTEL_SHEET_MIN/DEFAULT/MAX_HEIGHT as the
+  // user drags the handle. paddingBottom is set inline per-instance (40 +
+  // safe-area inset) so "Copy Intel" clears the OS nav bar on Android.
   intelModalSheet: {
     backgroundColor: PipelineColors.cardBackground,
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 32,
-    maxHeight: '85%',
+    paddingTop: 28,
+    overflow: 'hidden',
+  },
+  // Absolutely positioned, narrower than the full sheet width, so its
+  // touchable region doesn't swallow taps meant for intelCloseButton in the
+  // top-right corner.
+  intelDragHandleArea: {
+    position: 'absolute',
+    top: 0,
+    left: 60,
+    right: 60,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 5,
+  },
+  intelDragHandle: {
+    width: 40,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: PipelineColors.textSecondary,
   },
   intelModalTitle: {
     marginBottom: 20,

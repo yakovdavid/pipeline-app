@@ -15,6 +15,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
+import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { StockCard, type Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
@@ -309,21 +310,25 @@ export default function AmbushRadarScreen() {
           <Text style={styles.initializingText}>Loading your watchlist...</Text>
         </View>
       ) : (
-        <FlatList
-          data={stocks}
-          keyExtractor={(item) => item.ticker}
-          renderItem={renderStockCard}
-          initialNumToRender={10}
-          windowSize={5}
-          contentContainerStyle={styles.listContent}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={onRefresh}
-              tintColor={PipelineColors.textPrimary}
-            />
-          }
-        />
+        <View style={styles.listWrapper}>
+          <PullToRefreshLogo isRefreshing={refreshing} />
+          <FlatList
+            data={stocks}
+            keyExtractor={(item) => item.ticker}
+            renderItem={renderStockCard}
+            initialNumToRender={10}
+            windowSize={5}
+            contentContainerStyle={styles.listContent}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                tintColor="transparent"
+                colors={['transparent']}
+              />
+            }
+          />
+        </View>
       )}
     </SafeAreaView>
   );
@@ -402,6 +407,9 @@ const styles = StyleSheet.create({
     color: PipelineColors.textPrimary,
     fontSize: 16,
     fontWeight: '700',
+  },
+  listWrapper: {
+    flex: 1,
   },
   listContent: {
     paddingBottom: 24,
