@@ -76,6 +76,23 @@ ANOMALY_NEWS_COUNT = 3
 ANOMALY_FETCH_MAX_RETRIES = 1
 ANOMALY_FETCH_BASE_BACKOFF_SECONDS = 1.0
 
+# Bifurcated Mean Reversion (Ambush) anomaly thresholds: Sector ETFs are
+# structurally less volatile than individual Stocks (diversified holdings
+# damp out idiosyncratic single-name moves), so one shared threshold would
+# either almost never fire on ETFs (if sized for Stocks) or fire constantly
+# on ordinary Stock noise (if sized for ETFs). Two independent triggers per
+# asset type — either one fires the alert:
+#   - Drawdown: price is >= drawdown_pct below the 52-week high.
+#   - Structural support break: price < SMA50 - (std_dev_multiplier * the
+#     20-day close std dev).
+ANOMALY_STD_DEV_WINDOW = 20
+ANOMALY_HISTORY_PERIOD = "2mo"  # ~40 trading days: comfortable margin over the 20-day window, tolerant of holidays
+DEFAULT_ANOMALY_ASSET_TYPE = "Stock"
+BEARISH_ANOMALY_RULES: dict[str, dict[str, float]] = {
+    "Stock": {"drawdown_pct": 15.0, "std_dev_multiplier": 2.0},
+    "ETF": {"drawdown_pct": 7.0, "std_dev_multiplier": 1.5},
+}
+
 # On-Demand Intel: a user-triggered (not automatic/high-frequency) request
 # for a ticker's latest headlines regardless of price movement. Since it's
 # a deliberate single action rather than something fired on every list
@@ -398,6 +415,105 @@ def fetch_anomaly_news(ticker_symbol: str, threshold: float = ANOMALY_THRESHOLD_
         return None
 
 
+def _calculate_std_dev(closes: list[float], window: int = ANOMALY_STD_DEV_WINDOW) -> float | None:
+    """Population standard deviation of the last `window` daily closes.
+
+    Returns None — not a raised error — when there isn't enough price
+    history to compute a meaningful figure. Callers treat that as "the
+    std-dev trigger can't be evaluated," never as a fetch failure, and
+    ANOMALY_STD_DEV_WINDOW > 0 always, so there's no division-by-zero risk
+    here.
+    """
+    if len(closes) < window:
+        return None
+
+    recent_closes = closes[-window:]
+    mean = sum(recent_closes) / window
+    variance = sum((close - mean) ** 2 for close in recent_closes) / window
+    return variance**0.5
+
+
+def check_mean_reversion_anomaly(
+    ticker_symbol: str,
+    asset_type: str,
+    price: float,
+    sma50: float | None,
+    high_52: float | None,
+    currency_converter: Callable[[float], float] | None = None,
+) -> str | None:
+    """Bifurcated Margin-of-Safety anomaly check for the Ambush Radar / Mean
+    Reversion screen (see BEARISH_ANOMALY_RULES for the per-asset-type
+    thresholds this reads).
+
+    price/sma50/high_52 must already be in the same currency (e.g. already
+    USD-converted for TASE tickers — see get_stock) since the structural
+    support trigger compares them directly. The 20-day close history used
+    for the std dev is fetched fresh here in the ticker's raw currency, so
+    currency_converter (get_stock's `to_usd`) is applied to the computed std
+    dev to bring it onto the same basis — valid because standard deviation
+    scales linearly under a zero-intercept conversion like Agorot -> USD.
+
+    Returns None (not an error) whenever a trigger can't be evaluated at all
+    for lack of data (missing/zero 52-week high, missing SMA50, or fewer
+    than ANOMALY_STD_DEV_WINDOW closes) rather than treating "unknown" as
+    "no anomaly" on one trigger while still checking the other normally.
+    """
+    rules = BEARISH_ANOMALY_RULES.get(asset_type, BEARISH_ANOMALY_RULES[DEFAULT_ANOMALY_ASSET_TYPE])
+    drawdown_threshold_pct = rules["drawdown_pct"]
+    std_dev_multiplier = rules["std_dev_multiplier"]
+
+    triggers: list[str] = []
+
+    # Trigger 1: drawdown from the 52-week high. Guarded against a missing
+    # or non-positive high_52 to avoid a division-by-zero on bad upstream
+    # data (mirrors the guard already used for drawdown_pct in get_stock).
+    if high_52 is not None and high_52 > 0:
+        drawdown_pct = ((price - high_52) / high_52) * 100
+        if drawdown_pct <= -drawdown_threshold_pct:
+            triggers.append(
+                f"{abs(drawdown_pct):.1f}% off its 52-week high "
+                f"(>= {drawdown_threshold_pct:.0f}% {asset_type} threshold)"
+            )
+
+    # Trigger 2: structural support break, SMA50 - (multiplier * 20-day std dev).
+    try:
+        closes = fetch_with_retry(
+            lambda: ticker_history_closes(ticker_symbol),
+            description=f"{ANOMALY_STD_DEV_WINDOW}-day std dev history fetch for '{ticker_symbol}'",
+            max_retries=ANOMALY_FETCH_MAX_RETRIES,
+            base_backoff_seconds=ANOMALY_FETCH_BASE_BACKOFF_SECONDS,
+        )
+    except Exception as error:  # noqa: BLE001 - supplementary data; never let this break the main stock response
+        print(f"[resilience] Std dev history fetch failed for '{ticker_symbol}': {error}")
+        closes = []
+
+    std_dev = _calculate_std_dev(closes)
+    if std_dev is not None and currency_converter is not None:
+        std_dev = currency_converter(std_dev)
+
+    if sma50 is not None and std_dev is not None:
+        support_floor = sma50 - (std_dev_multiplier * std_dev)
+        if price < support_floor:
+            triggers.append(
+                f"price ${price:.2f} broke below its structural support floor "
+                f"${support_floor:.2f} (SMA50 - {std_dev_multiplier:g}x {ANOMALY_STD_DEV_WINDOW}-day std dev)"
+            )
+
+    if not triggers:
+        return None
+
+    return f"[ANOMALY: {asset_type} MEAN REVERSION] " + "; ".join(triggers)
+
+
+def ticker_history_closes(ticker_symbol: str) -> list[float]:
+    """Fetches ANOMALY_HISTORY_PERIOD of daily closes for the 20-day std dev
+    trigger, via the same shared TLS-impersonating session used everywhere
+    else in this file (a bare yf.Ticker() with no session would skip that
+    and risk the 429s the resilience layer exists to prevent)."""
+    history = yf.Ticker(ticker_symbol, session=_yahoo_session).history(period=ANOMALY_HISTORY_PERIOD)
+    return [float(close) for close in history["Close"].tolist()]
+
+
 def _fetch_usd_ils_rate() -> float:
     """Fetch the current USD/ILS exchange rate (shekels per one US dollar),
     using the 60s cache and the shared retry/throttle layer."""
@@ -429,19 +545,30 @@ def _fetch_usd_ils_rate() -> float:
 
 
 @app.get("/api/stock/{ticker}")
-def get_stock(ticker: str, include_anomaly: bool = False) -> dict[str, float | str | None]:
+def get_stock(
+    ticker: str, include_anomaly: bool = False, asset_type: str = DEFAULT_ANOMALY_ASSET_TYPE
+) -> dict[str, float | str | None]:
     symbol = ticker.strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker symbol is required.")
 
-    # The anomaly check costs an extra Yahoo call (and, if triggered, a
-    # second one for news) on top of the price/SMA fetch, so it's opt-in
-    # rather than run on every request — this endpoint is called
-    # constantly (search-select, portfolio display, pull-to-refresh) and
-    # unconditionally adding an outbound call to all of that would work
-    # against the rate-limiting this file exists to enforce. The cache key
-    # includes the flag so the two response shapes never collide.
-    cache_key = f"{symbol}:anomaly" if include_anomaly else symbol
+    # ASSET TYPE IDENTIFICATION: read from the incoming query mapping
+    # ('Stock' vs 'ETF'), case-insensitively, defaulting to 'Stock' for any
+    # missing/unrecognized value — this keeps the endpoint backward
+    # compatible with callers that don't send it yet.
+    normalized_asset_type = "ETF" if asset_type.strip().upper() == "ETF" else "Stock"
+
+    # The anomaly check costs extra Yahoo calls (news history, plus a
+    # separate 20-day close history for the std dev trigger below) on top
+    # of the price/SMA fetch, so it's opt-in rather than run on every
+    # request — this endpoint is called constantly (search-select,
+    # portfolio display, pull-to-refresh) and unconditionally adding those
+    # calls would work against the rate-limiting this file exists to
+    # enforce. The cache key includes both the flag and the asset type
+    # (since the bifurcated thresholds mean the same ticker can produce a
+    # different anomaly string per asset type) so response shapes never
+    # collide.
+    cache_key = f"{symbol}:anomaly:{normalized_asset_type}" if include_anomaly else symbol
     cached_result = stock_cache.get(cache_key)
     if cached_result is not None:
         return cached_result
@@ -499,6 +626,17 @@ def get_stock(ticker: str, include_anomaly: bool = False) -> dict[str, float | s
         sma200 = raw_sma200
         high_52 = raw_high_52
 
+        def to_usd(value: float | None) -> float | None:
+            return value
+
+    # Kept bound to a plain (non-Optional) callable for
+    # check_mean_reversion_anomaly's currency_converter param below, which
+    # always calls it with a real float (the std dev), never None.
+    def to_usd_strict(value: float) -> float:
+        converted = to_usd(value)
+        assert converted is not None  # to_usd(non-None) never returns None
+        return converted
+
     # 52-week drawdown: how far the current price sits below its 52-week
     # high, as a negative percentage (0 = at the high, more negative = a
     # deeper pullback). high_52 <= 0 shouldn't happen for a real security,
@@ -526,6 +664,18 @@ def get_stock(ticker: str, include_anomaly: bool = False) -> dict[str, float | s
 
     if include_anomaly:
         result["anomaly"] = fetch_anomaly_news(symbol)
+        # JSON EXPORT: the bifurcated Margin-of-Safety trigger is appended
+        # under its own key, alongside (not replacing) the existing
+        # day-over-day move detector above, so the frontend Intel modal can
+        # surface either signal independently.
+        result["mean_reversion_anomaly"] = check_mean_reversion_anomaly(
+            symbol,
+            normalized_asset_type,
+            price,
+            sma50,
+            high_52,
+            currency_converter=to_usd_strict,
+        )
 
     stock_cache.set(cache_key, result)
     return result
