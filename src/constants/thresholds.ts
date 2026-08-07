@@ -4,6 +4,12 @@
 // so both agree on exactly the same trigger condition.
 export const STRUCTURAL_STOP_THRESHOLD = 1.02;
 
-// Trailing stop trigger price for 'Stock' positions: 88% of the highest
-// price observed since the position was added (its "Highest Watermark").
-export const TRAILING_STOP_MULTIPLIER = 0.88;
+// Trailing Stop (TS) bifurcation: Satellite is the only category that gets
+// an automatic trailing stop (Core is held through drawdowns, Quality is
+// manually risk-reviewed instead — see PortfolioStockRow). Within
+// Satellite, ETFs are structurally less volatile than individual Stocks, so
+// they get a tighter percentage — a Stock-sized stop would let an ETF give
+// back too much before triggering, while an ETF-sized stop would whipsaw a
+// Stock on ordinary single-name noise.
+export const SATELLITE_STOCK_TS_PCT = 0.12;
+export const SATELLITE_ETF_TS_PCT = 0.07;

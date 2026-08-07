@@ -306,7 +306,7 @@ export default function AmbushRadarScreen() {
 
       {isInitializing ? (
         <View style={styles.initializingContainer}>
-          <ActivityIndicator size="large" color={PipelineColors.textPrimary} />
+          <PullToRefreshLogo isRefreshing overlay={false} />
           <Text style={styles.initializingText}>Loading your watchlist...</Text>
         </View>
       ) : (

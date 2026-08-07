@@ -10,9 +10,11 @@ export type PortfolioTickerEntry = {
   category: PortfolioCategory;
   assetType: AssetType;
   units: number;
-  // Highest price observed for this position since it was added (tracked
-  // for 'Stock' assets only, to drive the trailing-stop trigger price).
-  // Null until the first live price is fetched.
+  // Highest price observed for this position since it was added, tracked
+  // for every asset type (drives the Satellite trailing-stop trigger price
+  // for both Stock and ETF positions — see SATELLITE_STOCK_TS_PCT /
+  // SATELLITE_ETF_TS_PCT in thresholds.ts). Null until the first live price
+  // is fetched.
   highestWatermark: number | null;
 };
 

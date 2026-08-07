@@ -30,7 +30,7 @@ import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { PipelineColors } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
-import { TRAILING_STOP_MULTIPLIER } from '@/constants/thresholds';
+import { SATELLITE_ETF_TS_PCT, SATELLITE_STOCK_TS_PCT } from '@/constants/thresholds';
 import { fetchIntel, fetchStockData, type IntelBatchResponse, type StockQuote } from '@/services/api';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
@@ -77,19 +77,21 @@ function renderPortfolioSectionFooter({ section }: { section: PortfolioListSecti
   ) : null;
 }
 
-// Tracks the "Highest Watermark" (highest price seen since a Stock position
-// was added) that drives the trailing-stop trigger price. Only meaningful
-// for 'Stock' assets — ETFs are judged against SMA200 elsewhere, not a
-// trailing stop.
-function computeHighestWatermark(
-  assetType: AssetType,
-  previousWatermark: number | null,
-  latestPrice: number,
-): number | null {
-  if (assetType !== 'Stock') {
-    return null;
-  }
+// Tracks the "Highest Watermark" (highest price seen since a position was
+// added) that drives the Satellite trailing-stop trigger price for both
+// Stock and ETF positions (see the TS_PCT bifurcation in PortfolioStockRow
+// below). Tracked for every position regardless of category/assetType —
+// category isn't available here, and it's harmless to also track it for
+// Core/Quality positions that never actually use it for a TS calculation.
+function computeHighestWatermark(previousWatermark: number | null, latestPrice: number): number | null {
   return previousWatermark === null ? latestPrice : Math.max(previousWatermark, latestPrice);
+}
+
+// TS bifurcation: only called for Satellite positions (see
+// PortfolioStockRow) — ETFs get a tighter trailing stop than Stocks since
+// they're structurally less volatile.
+function getSatelliteTrailingStopPct(assetType: AssetType): number {
+  return assetType === 'ETF' ? SATELLITE_ETF_TS_PCT : SATELLITE_STOCK_TS_PCT;
 }
 
 // The Fortress 2.0 Model: a 70/20/10 allocation across Core, Satellites, and
@@ -242,11 +244,7 @@ export default function PortfolioScreen() {
             anomalyReport: result.value.anomalyReport,
             high52: result.value.high52,
             drawdownPct: result.value.drawdownPct,
-            highestWatermark: computeHighestWatermark(
-              entry.assetType,
-              entry.highestWatermark,
-              result.value.price,
-            ),
+            highestWatermark: computeHighestWatermark(entry.highestWatermark, result.value.price),
           });
         }
       });
@@ -332,7 +330,7 @@ export default function PortfolioScreen() {
           anomalyReport: quote.anomalyReport,
           high52: quote.high52,
           drawdownPct: quote.drawdownPct,
-          highestWatermark: computeHighestWatermark(selectedAssetType, null, quote.price),
+          highestWatermark: computeHighestWatermark(null, quote.price),
         },
       ]);
       setTicker('');
@@ -363,16 +361,12 @@ export default function PortfolioScreen() {
             return stock;
           }
 
-          let highestWatermark: number | null;
-          if (newAssetType !== 'Stock') {
-            highestWatermark = null;
-          } else if (stock.assetType === 'Stock' && stock.highestWatermark !== null) {
-            highestWatermark = stock.highestWatermark;
-          } else {
-            // Just became a Stock position (or never had a watermark yet) —
-            // start tracking from the current price.
-            highestWatermark = stock.price;
-          }
+          // The watermark is now tracked for every asset type (Satellite
+          // ETFs need it for their own trailing stop too — see
+          // SATELLITE_ETF_TS_PCT), so switching between Stock and ETF no
+          // longer resets it: keep whatever was already being tracked, or
+          // seed it from the current price if this position never had one.
+          const highestWatermark = stock.highestWatermark ?? stock.price;
 
           return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark };
         }),
@@ -418,11 +412,7 @@ export default function PortfolioScreen() {
             anomalyReport: freshQuote.anomalyReport,
             high52: freshQuote.high52,
             drawdownPct: freshQuote.drawdownPct,
-            highestWatermark: computeHighestWatermark(
-              stock.assetType,
-              stock.highestWatermark,
-              freshQuote.price,
-            ),
+            highestWatermark: computeHighestWatermark(stock.highestWatermark, freshQuote.price),
           };
         }),
       );
@@ -533,11 +523,7 @@ export default function PortfolioScreen() {
             anomalyReport: result.value.anomalyReport,
             high52: result.value.high52,
             drawdownPct: result.value.drawdownPct,
-            highestWatermark: computeHighestWatermark(
-              entry.assetType,
-              entry.highestWatermark,
-              result.value.price,
-            ),
+            highestWatermark: computeHighestWatermark(entry.highestWatermark, result.value.price),
           });
         }
       });
@@ -707,7 +693,7 @@ export default function PortfolioScreen() {
 
       {isInitializing ? (
         <View style={styles.initializingContainer}>
-          <ActivityIndicator size="large" color={PipelineColors.textPrimary} />
+          <PullToRefreshLogo isRefreshing overlay={false} />
           <Text style={styles.initializingText}>Loading your portfolio...</Text>
         </View>
       ) : (
@@ -1117,12 +1103,17 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // Trailing stops are a Satellite-only mechanic: Core positions are meant
   // to be held through drawdowns, and Quality positions are risk-reviewed
   // manually (see the drawdown-review styling below) rather than
-  // auto-stopped. A Core/Quality Stock position (which could still have a
-  // tracked highestWatermark from before this rule, or from being
-  // reassigned away from Satellite) must show no TS field at all.
+  // auto-stopped. A Core/Quality position (which could still have a tracked
+  // highestWatermark from before this rule, or from being reassigned away
+  // from Satellite) must show no TS field at all.
+  //
+  // Within Satellite, the percentage is bifurcated by asset type: ETFs are
+  // structurally less volatile than individual Stocks, so they get a
+  // tighter trailing stop (7% vs. 12% — see thresholds.ts).
+  const trailingStopPct = stock.category === 'Satellite' ? getSatelliteTrailingStopPct(stock.assetType) : null;
   const trailingStopPrice =
-    stock.category === 'Satellite' && stock.assetType === 'Stock' && stock.highestWatermark !== null
-      ? stock.highestWatermark * TRAILING_STOP_MULTIPLIER
+    trailingStopPct !== null && stock.highestWatermark !== null
+      ? stock.highestWatermark * (1 - trailingStopPct)
       : null;
   const isTrailingStopTriggered = trailingStopPrice !== null && stock.price <= trailingStopPrice;
 

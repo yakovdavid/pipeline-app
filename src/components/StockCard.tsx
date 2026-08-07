@@ -112,15 +112,15 @@ function MomentumBar({ price, sma50, sma200, isBullish }: MomentumBarProps) {
     return <Text style={styles.momentumFallbackText}>Insufficient SMA data</Text>;
   }
 
+  // The dot's position on the track is intentionally still dynamic — it
+  // maps to where price actually sits between the lower and higher of the
+  // two SMAs, whichever that happens to be this render.
   const low = Math.min(sma50, sma200);
   const high = Math.max(sma50, sma200);
   const range = high - low;
   const rawPosition = range > 0 ? (price - low) / range : 0.5;
   const markerPosition = Math.min(1, Math.max(0, rawPosition));
   const markerColor = isBullish ? PipelineColors.bullish : PipelineColors.bearish;
-
-  const lowLabel = low === sma50 ? 'SMA50' : 'SMA200';
-  const highLabel = high === sma50 ? 'SMA50' : 'SMA200';
 
   return (
     <View style={styles.momentumContainer}>
@@ -132,13 +132,14 @@ function MomentumBar({ price, sma50, sma200, isBullish }: MomentumBarProps) {
           ]}
         />
       </View>
+      {/* Static layout, deliberately NOT tied to which of sma50/sma200 is
+          numerically higher (unlike the dot above): SMA50 always reads on
+          the left and SMA200 always on the right, so the row doesn't swap
+          positions out from under a user scanning the list — a text swap
+          that tracked the dot used to make quick visual scanning unreliable. */}
       <View style={styles.momentumLabelRow}>
-        <Text style={styles.momentumLabelText}>
-          {lowLabel} ${low.toFixed(2)}
-        </Text>
-        <Text style={styles.momentumLabelText}>
-          {highLabel} ${high.toFixed(2)}
-        </Text>
+        <Text style={styles.momentumLabelText}>SMA50 ${sma50.toFixed(2)}</Text>
+        <Text style={styles.momentumLabelText}>SMA200 ${sma200.toFixed(2)}</Text>
       </View>
     </View>
   );

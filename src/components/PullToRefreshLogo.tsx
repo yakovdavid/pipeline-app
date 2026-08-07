@@ -6,14 +6,19 @@ import { PipelineColors } from '@/constants/pipeline-colors';
 
 type PullToRefreshLogoProps = {
   isRefreshing: boolean;
+  // true (default): absolutely positioned above a list, for the
+  // pull-to-refresh case — the screens that use it this way pair it with
+  // tintColor="transparent"/colors={['transparent']} on their RefreshControl
+  // so the native OS spinner stays invisible underneath it.
+  // false: laid out in normal flow, centered by its parent — for the
+  // full-screen initial-load state, which has no list/RefreshControl to
+  // overlay yet. Same badge, same spin, so this one component is the single
+  // visual source of truth for "this screen is loading," on first mount and
+  // on every pull-to-refresh.
+  overlay?: boolean;
 };
 
-// Stands in for the OS's native pull-to-refresh spinner. The screens that
-// render this pair it with tintColor="transparent"/colors={['transparent']}
-// on their RefreshControl, so the native spinner stays invisible while its
-// pull gesture and scroll offset still drive the refresh — this is purely
-// the on-brand visual replacement, spun for as long as isRefreshing is true.
-export function PullToRefreshLogo({ isRefreshing }: PullToRefreshLogoProps) {
+export function PullToRefreshLogo({ isRefreshing, overlay = true }: PullToRefreshLogoProps) {
   const [spinValue] = useState(() => new Animated.Value(0));
 
   useEffect(() => {
@@ -44,7 +49,7 @@ export function PullToRefreshLogo({ isRefreshing }: PullToRefreshLogoProps) {
   const rotate = spinValue.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
 
   return (
-    <View style={styles.container} pointerEvents="none">
+    <View style={overlay ? styles.overlayContainer : styles.inlineContainer} pointerEvents="none">
       <Animated.View style={[styles.badge, { transform: [{ rotate }] }]}>
         <Ionicons name="pulse" size={18} color={PipelineColors.textPrimary} />
       </Animated.View>
@@ -53,13 +58,17 @@ export function PullToRefreshLogo({ isRefreshing }: PullToRefreshLogoProps) {
 }
 
 const styles = StyleSheet.create({
-  container: {
+  overlayContainer: {
     position: 'absolute',
     top: 10,
     left: 0,
     right: 0,
     alignItems: 'center',
     zIndex: 20,
+  },
+  inlineContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   badge: {
     width: 36,
