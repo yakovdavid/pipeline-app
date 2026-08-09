@@ -325,6 +325,7 @@ export default function AmbushRadarScreen() {
                 onRefresh={onRefresh}
                 tintColor="transparent"
                 colors={['transparent']}
+                progressBackgroundColor="transparent"
               />
             }
           />

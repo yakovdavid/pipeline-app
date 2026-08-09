@@ -7,6 +7,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Keyboard,
   KeyboardAvoidingView,
   Linking,
   Modal,
@@ -20,6 +21,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -715,6 +717,7 @@ export default function PortfolioScreen() {
                 onRefresh={onRefresh}
                 tintColor="transparent"
                 colors={['transparent']}
+                progressBackgroundColor="transparent"
               />
             }
           />
@@ -799,105 +802,129 @@ export default function PortfolioScreen() {
         animationType="slide"
         onRequestClose={() => setIsAddModalVisible(false)}>
         <Pressable style={styles.addModalBackdrop} onPress={() => setIsAddModalVisible(false)}>
+          {/* iOS 'padding' pads the whole KeyboardAvoidingView, which is
+              what pushes this bottom sheet up above the keyboard; Android's
+              'height' shrinks it instead (Android's 'padding' behavior
+              doesn't play well with a transparent, flex-end Modal here — it
+              tends to leave the sheet visually unmoved). */}
           <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
             style={styles.addModalKeyboardAvoider}>
-            <View style={styles.addModalSheet}>
-              <View style={styles.addModalHeader}>
-                <Text style={styles.addModalTitle}>Add Asset</Text>
-                <TouchableOpacity
-                  onPress={() => setIsAddModalVisible(false)}
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  accessibilityLabel="Close">
-                  <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
-                </TouchableOpacity>
-              </View>
+            {/* TouchableWithoutFeedback so tapping any non-interactive part
+                of the sheet (not just the backdrop outside it) dismisses
+                the keyboard without closing the whole modal — nested
+                TouchableOpacity/TextInput children still get their own taps
+                as normal, RN's responder system gives them priority. */}
+            <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+              <View style={styles.addAssetModalSheet}>
+                <View style={styles.addModalHeader}>
+                  <Text style={styles.addModalTitle}>Add Asset</Text>
+                  <TouchableOpacity
+                    onPress={() => setIsAddModalVisible(false)}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel="Close">
+                    <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                  </TouchableOpacity>
+                </View>
 
-              <View style={styles.inputRow}>
-                <TickerAutocomplete
-                  value={ticker}
-                  onChangeText={setTicker}
-                  onSelectTicker={setTicker}
-                  onSubmit={handleAddTicker}
-                  editable={!isAdding}
-                />
-                <TextInput
-                  style={styles.unitsInput}
-                  value={units}
-                  onChangeText={setUnits}
-                  placeholder="Units"
-                  placeholderTextColor={PipelineColors.textSecondary}
-                  keyboardType="numeric"
-                  editable={!isAdding}
-                />
-              </View>
+                {/* Bounded (addAssetModalSheet has maxHeight) + flex: 1 here
+                    is what lets this actually scroll instead of just
+                    growing off-screen on a small device once the keyboard
+                    eats into the available height. keyboardShouldPersistTaps
+                    keeps the category/asset-type/add buttons tappable while
+                    the keyboard is still up. */}
+                <ScrollView
+                  style={styles.addAssetModalScroll}
+                  contentContainerStyle={styles.addAssetModalScrollContent}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}>
+                  <View style={styles.inputRow}>
+                    <TickerAutocomplete
+                      value={ticker}
+                      onChangeText={setTicker}
+                      onSelectTicker={setTicker}
+                      onSubmit={handleAddTicker}
+                      editable={!isAdding}
+                    />
+                    <TextInput
+                      style={styles.unitsInput}
+                      value={units}
+                      onChangeText={setUnits}
+                      placeholder="Units"
+                      placeholderTextColor={PipelineColors.textSecondary}
+                      keyboardType="numeric"
+                      editable={!isAdding}
+                    />
+                  </View>
 
-              <Text style={styles.modalSectionLabel}>Category</Text>
-              <View style={styles.categoryRow}>
-                <TouchableOpacity
-                  style={[
-                    styles.categoryButton,
-                    { borderColor: PipelineColors.core },
-                    selectedCategory === 'Core' && { backgroundColor: PipelineColors.core },
-                  ]}
-                  onPress={() => setSelectedCategory('Core')}>
-                  <Text style={styles.categoryButtonText}>Core</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.categoryButton,
-                    { borderColor: PipelineColors.satellite },
-                    selectedCategory === 'Satellite' && { backgroundColor: PipelineColors.satellite },
-                  ]}
-                  onPress={() => setSelectedCategory('Satellite')}>
-                  <Text style={styles.categoryButtonText}>Satellite</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.categoryButton,
-                    { borderColor: PipelineColors.quality },
-                    selectedCategory === 'Quality' && { backgroundColor: PipelineColors.quality },
-                  ]}
-                  onPress={() => setSelectedCategory('Quality')}>
-                  <Text style={styles.categoryButtonText}>Quality</Text>
-                </TouchableOpacity>
-              </View>
+                  <Text style={styles.modalSectionLabel}>Category</Text>
+                  <View style={styles.categoryRow}>
+                    <TouchableOpacity
+                      style={[
+                        styles.categoryButton,
+                        { borderColor: PipelineColors.core },
+                        selectedCategory === 'Core' && { backgroundColor: PipelineColors.core },
+                      ]}
+                      onPress={() => setSelectedCategory('Core')}>
+                      <Text style={styles.categoryButtonText}>Core</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.categoryButton,
+                        { borderColor: PipelineColors.satellite },
+                        selectedCategory === 'Satellite' && { backgroundColor: PipelineColors.satellite },
+                      ]}
+                      onPress={() => setSelectedCategory('Satellite')}>
+                      <Text style={styles.categoryButtonText}>Satellite</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.categoryButton,
+                        { borderColor: PipelineColors.quality },
+                        selectedCategory === 'Quality' && { backgroundColor: PipelineColors.quality },
+                      ]}
+                      onPress={() => setSelectedCategory('Quality')}>
+                      <Text style={styles.categoryButtonText}>Quality</Text>
+                    </TouchableOpacity>
+                  </View>
 
-              <Text style={styles.modalSectionLabel}>Asset Type</Text>
-              <View style={styles.assetTypeRow}>
-                <TouchableOpacity
-                  style={[
-                    styles.assetTypeButton,
-                    { borderColor: PipelineColors.bullish },
-                    selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
-                  ]}
-                  onPress={() => setSelectedAssetType('Stock')}>
-                  <Text style={styles.assetTypeButtonText}>Stock</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.assetTypeButton,
-                    { borderColor: PipelineColors.core },
-                    selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
-                  ]}
-                  onPress={() => setSelectedAssetType('ETF')}>
-                  <Text style={styles.assetTypeButtonText}>ETF</Text>
-                </TouchableOpacity>
-              </View>
+                  <Text style={styles.modalSectionLabel}>Asset Type</Text>
+                  <View style={styles.assetTypeRow}>
+                    <TouchableOpacity
+                      style={[
+                        styles.assetTypeButton,
+                        { borderColor: PipelineColors.bullish },
+                        selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
+                      ]}
+                      onPress={() => setSelectedAssetType('Stock')}>
+                      <Text style={styles.assetTypeButtonText}>Stock</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.assetTypeButton,
+                        { borderColor: PipelineColors.core },
+                        selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
+                      ]}
+                      onPress={() => setSelectedAssetType('ETF')}>
+                      <Text style={styles.assetTypeButtonText}>ETF</Text>
+                    </TouchableOpacity>
+                  </View>
 
-              <View style={styles.addRow}>
-                <TouchableOpacity
-                  style={[styles.addButton, isAdding && styles.addButtonDisabled]}
-                  onPress={handleAddTicker}
-                  disabled={isAdding}>
-                  {isAdding ? (
-                    <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
-                  ) : (
-                    <Text style={styles.addButtonText}>Add to Portfolio</Text>
-                  )}
-                </TouchableOpacity>
+                  <View style={styles.addRow}>
+                    <TouchableOpacity
+                      style={[styles.addButton, isAdding && styles.addButtonDisabled]}
+                      onPress={handleAddTicker}
+                      disabled={isAdding}>
+                      {isAdding ? (
+                        <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                      ) : (
+                        <Text style={styles.addButtonText}>Add to Portfolio</Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                </ScrollView>
               </View>
-            </View>
+            </TouchableWithoutFeedback>
           </KeyboardAvoidingView>
         </Pressable>
       </Modal>
@@ -1680,6 +1707,25 @@ const styles = StyleSheet.create({
     color: PipelineColors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
+  },
+  // Add Asset modal only (not shared with addModalSheet, used by Import
+  // Backup): bounded by maxHeight rather than auto-sized, so the
+  // addAssetModalScroll child below can use flex: 1 to actually fill —
+  // and scroll within — the remaining space once the keyboard eats into
+  // the available screen height, instead of just growing off-screen.
+  addAssetModalSheet: {
+    backgroundColor: PipelineColors.cardBackground,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    maxHeight: '90%',
+  },
+  addAssetModalScroll: {
+    flex: 1,
+  },
+  addAssetModalScrollContent: {
+    paddingBottom: 32,
   },
   // Explicit (not auto-sized) height, driven by intelSheetHeight — that's
   // what lets the intelResultsScroll child below use flex: 1 to fill
