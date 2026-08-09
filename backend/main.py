@@ -11,6 +11,7 @@ short-lived in-memory caching) since cloud IPs like Render's are otherwise
 bot-detected and rate-limited (HTTP 429) almost immediately.
 """
 
+import random
 import re
 import threading
 import time
@@ -109,6 +110,14 @@ INTEL_NEWS_COUNT = 5
 # Render proxy). Capped to a sane size for that reason.
 MAX_BATCH_TICKERS = 10
 
+# Jitter added between tickers in the batch Intel loop (get_intel), on top
+# of — not a replacement for — yahoo_rate_limiter's own >= 1s spacing
+# between individual outbound HTTP calls: a small randomized pause between
+# tickers means a multi-ticker batch doesn't itself read as a mechanical,
+# fixed-interval burst to Yahoo's bot detection.
+TICKER_LOOP_JITTER_MIN_SECONDS = 0.5
+TICKER_LOOP_JITTER_MAX_SECONDS = 1.5
+
 CRITICAL_ALERT_TAG = "[CRITICAL ALERT]"
 CRITICAL_KEYWORDS = {
     "earnings", "miss", "beat", "downgrade", "upgrade", "sec", "fraud",
@@ -118,16 +127,41 @@ CRITICAL_KEYWORDS = {
 
 # Standard browser headers layered on top of curl_cffi's TLS impersonation.
 # Yahoo Finance rejects requests without something resembling this, whether
-# hit via yfinance or the raw search endpoint.
+# hit via yfinance or the raw search endpoint. User-Agent is deliberately
+# NOT included here — it's rotated per-attempt from USER_AGENTS below (see
+# _rotate_user_agent) rather than fixed.
 YAHOO_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
 }
+
+# Rotated per-attempt (see _rotate_user_agent, called from fetch_with_retry
+# before every attempt — the initial one and every retry) so consecutive
+# requests, including retries of the exact same call, never repeat an
+# identical fingerprint for Yahoo's bot detection to key on. Deliberately
+# spans multiple OSes/browser engines: desktop (Windows, macOS) and mobile
+# (iOS, Android).
+USER_AGENTS: list[str] = [
+    # Windows / Chrome
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    # Windows / Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+    # macOS / Safari
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    # macOS / Chrome
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    # iOS / Safari
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    # Android / Chrome
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+]
 
 # --- Request throttling ------------------------------------------------
 # Yahoo bot-detects near-instantly on repeated bursts from the same IP, so
@@ -160,7 +194,12 @@ class YahooRateLimiter:
 yahoo_rate_limiter = YahooRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
 
 # --- Retry with exponential backoff -------------------------------------
-MAX_RETRIES = 3
+# Anti-rate-limit default: up to 3 total attempts (1 initial + 2 retries),
+# backing off 2s then 4s between them (base_backoff_seconds * 2**attempt) —
+# this is what stands between a single transient 429 and a completely
+# failed ticker fetch (observed live on tickers like DTCR under the old,
+# thinner retry budget).
+MAX_RETRIES = 2
 BASE_BACKOFF_SECONDS = 2.0
 RETRYABLE_STATUS_CODES = {429, 503}
 
@@ -168,14 +207,35 @@ T = TypeVar("T")
 
 
 def _is_retryable_error(error: Exception) -> bool:
+    """True for a 429/503 HTTP status, or any generic network-level failure
+    (connection refused, DNS failure, read/connect timeout — no response
+    was ever received) — both are transient conditions worth retrying with
+    backoff rather than failing the request outright."""
     response = getattr(error, "response", None)
     status_code = getattr(response, "status_code", None)
     if status_code in RETRYABLE_STATUS_CODES:
         return True
-    # Some yfinance/curl_cffi failure paths don't attach a `.response`
-    # object; fall back to sniffing the error message for the status code.
+
+    # curl_cffi's requests-compatible exception hierarchy mirrors
+    # `requests`' own — this is the "generic network error" case (a
+    # ConnectionError, Timeout, etc. that never got as far as a response).
+    if isinstance(error, _http_backend.exceptions.RequestException):
+        return True
+
+    # Some yfinance failure paths re-raise as a plain Exception that loses
+    # the original exception type/`.response`; fall back to sniffing the
+    # message for a retryable status code.
     message = str(error)
     return any(str(code) in message for code in RETRYABLE_STATUS_CODES)
+
+
+def _rotate_user_agent() -> None:
+    """Randomly picks a User-Agent from USER_AGENTS and applies it to the
+    shared Yahoo session. Called from fetch_with_retry before every single
+    attempt — the first one and every retry — not just on retries, so no
+    two outbound requests (even a retry of the exact same call) ever carry
+    an identical fingerprint."""
+    _yahoo_session.headers["User-Agent"] = random.choice(USER_AGENTS)
 
 
 def fetch_with_retry(
@@ -184,13 +244,16 @@ def fetch_with_retry(
     max_retries: int = MAX_RETRIES,
     base_backoff_seconds: float = BASE_BACKOFF_SECONDS,
 ) -> T:
-    """Runs fetch_fn under the shared rate limiter, retrying on 429/503
-    with exponential backoff (base, base*2, base*4, ...) up to max_retries
-    times. Callers with a known-good fallback can pass a smaller
+    """Runs fetch_fn under the shared rate limiter, retrying on a 429/503 or
+    a generic network error with exponential backoff (base, base*2, base*4,
+    ...) up to max_retries times. A freshly randomized User-Agent (see
+    _rotate_user_agent) is applied to the shared session before every
+    attempt. Callers with a known-good fallback can pass a smaller
     max_retries to fail fast instead of burning the full backoff budget."""
     last_error: Exception | None = None
 
     for attempt in range(max_retries + 1):
+        _rotate_user_agent()
         try:
             with yahoo_rate_limiter:
                 return fetch_fn()
@@ -201,7 +264,7 @@ def fetch_with_retry(
             backoff_seconds = base_backoff_seconds * (2**attempt)
             print(
                 f"[resilience] {description} failed on attempt {attempt + 1}/"
-                f"{max_retries + 1} ({error}); retrying in {backoff_seconds:.0f}s."
+                f"{max_retries + 1} ({error}); retrying in {backoff_seconds:.0f}s with a new User-Agent."
             )
             time.sleep(backoff_seconds)
 
@@ -248,6 +311,7 @@ if _HAS_CURL_CFFI:
 else:  # pragma: no cover - depends on host platform
     _yahoo_session = _http_backend.Session()
 _yahoo_session.headers.update(YAHOO_BROWSER_HEADERS)
+_yahoo_session.headers["User-Agent"] = random.choice(USER_AGENTS)
 
 app = FastAPI(title="Pipeline Stock API")
 
@@ -262,13 +326,19 @@ app.add_middleware(
 )
 
 
-# The primary (yfinance) path gets a much smaller retry budget than the
-# fallback: if quoteSummary is structurally blocked on this host, retrying
-# it repeatedly with a growing backoff just delays reaching the fallback
-# that's actually likely to work. One quick retry is enough to ride out a
-# one-off transient blip; the chart fallback below gets the full budget.
-PRIMARY_FETCH_MAX_RETRIES = 1
-PRIMARY_FETCH_BASE_BACKOFF_SECONDS = 1.0
+# Anti-rate-limit architecture: the primary (yfinance) path gets a full,
+# genuine retry budget — up to 3 attempts total (1 initial + 2 retries),
+# backing off 2s then 4s — before this file gives up on it and tries the
+# chart API fallback. Previously this fired only one fail-fast retry with a
+# 1s backoff, which was too thin to survive real, observed 429 bursts on
+# specific tickers (e.g. DTCR): it gave up on yfinance almost immediately,
+# and the fallback then had to carry the entire burden of the same
+# rate-limited window with barely more of a head start. The chart fallback
+# below still gets its own equally full budget (MAX_RETRIES/
+# BASE_BACKOFF_SECONDS defaults), so a ticker now survives up to ~3 attempts
+# against *each* data source before failing outright.
+PRIMARY_FETCH_MAX_RETRIES = 2
+PRIMARY_FETCH_BASE_BACKOFF_SECONDS = 2.0
 
 
 def _fetch_raw_quote_via_yfinance(symbol: str) -> tuple[float, float | None, float | None, float | None]:
@@ -305,7 +375,12 @@ def _fetch_raw_quote_via_chart_fallback(
     computed from the returned daily close history since Yahoo doesn't
     include those fields on this endpoint — but it does include
     fiftyTwoWeekHigh directly in "meta" (same field, verified live), so
-    that one doesn't need to be recomputed."""
+    that one doesn't need to be recomputed.
+
+    Routed through fetch_with_retry just like the primary path, so it gets
+    the exact same anti-rate-limit treatment: up to 3 attempts with 2s/4s
+    backoff, and a freshly randomized User-Agent applied to the shared
+    session before each one."""
 
     def do_fetch():
         response = _yahoo_session.get(
@@ -856,7 +931,16 @@ def get_intel(tickers: str) -> dict[str, list[dict[str, object]]]:
             detail=f"Too many tickers in one request (max {MAX_BATCH_TICKERS}); got {len(ticker_list)}.",
         )
 
-    results = [_fetch_intel_for_ticker(symbol) for symbol in ticker_list]
+    # JITTER: a small random pause between tickers (not before the first
+    # one) so this main batch loop doesn't hit Yahoo with a burst of
+    # back-to-back requests, on top of yahoo_rate_limiter's own per-call
+    # spacing enforced inside fetch_with_retry.
+    results: list[dict[str, object]] = []
+    for index, symbol in enumerate(ticker_list):
+        if index > 0:
+            time.sleep(random.uniform(TICKER_LOOP_JITTER_MIN_SECONDS, TICKER_LOOP_JITTER_MAX_SECONDS))
+        results.append(_fetch_intel_for_ticker(symbol))
+
     return {"results": results}
 
 
