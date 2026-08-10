@@ -2,21 +2,22 @@ import { Ionicons } from '@expo/vector-icons';
 import { Tabs } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { PipelineColors } from '@/constants/pipeline-colors';
+import { usePipelineTheme } from '@/contexts/theme-context';
 
 export default function TabsLayout() {
   const insets = useSafeAreaInsets();
+  const { colors } = usePipelineTheme();
 
   return (
     <Tabs
       initialRouteName="ambush"
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: PipelineColors.bullish,
-        tabBarInactiveTintColor: PipelineColors.textSecondary,
+        tabBarActiveTintColor: colors.bullish,
+        tabBarInactiveTintColor: colors.textSecondary,
         tabBarStyle: {
-          backgroundColor: PipelineColors.background,
-          borderTopColor: PipelineColors.cardBackground,
+          backgroundColor: colors.background,
+          borderTopColor: colors.cardBackground,
           borderTopWidth: 1,
           // Dynamic safe-area handling: extend the bar height by the
           // device's actual bottom inset (Android system nav bar / gesture

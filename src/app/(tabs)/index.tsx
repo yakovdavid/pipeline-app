@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -30,9 +30,10 @@ import { StatusBar } from 'expo-status-bar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
-import { PipelineColors } from '@/constants/pipeline-colors';
+import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { SATELLITE_ETF_TS_PCT, SATELLITE_STOCK_TS_PCT } from '@/constants/thresholds';
+import { usePipelineTheme } from '@/contexts/theme-context';
 import { fetchIntel, fetchStockData, type IntelBatchResponse, type StockQuote } from '@/services/api';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
@@ -62,21 +63,18 @@ type PortfolioListSection = {
   data: PortfolioStock[];
 };
 
-// Module-level (not defined inside the component) since these have no
-// closure dependencies — a stable identity across renders, same reasoning
-// as the useCallback-wrapped handlers below.
+// The return type of createStyles (defined at the bottom of this file) —
+// aliased here so it can be used in prop types above that definition.
+type PortfolioStyles = ReturnType<typeof createStyles>;
+
+// Module-level (not defined inside the component) since it has no closure
+// dependencies at all — not even styles/colors — a stable identity across
+// renders, same reasoning as the useCallback-wrapped handlers below.
+// renderPortfolioSectionHeader/Footer, by contrast, need the live
+// (theme-dependent) `styles`, so they're defined inside PortfolioScreen via
+// useCallback instead of living here at module level.
 function extractPortfolioItemKey(item: PortfolioStock): string {
   return item.ticker;
-}
-
-function renderPortfolioSectionHeader({ section }: { section: PortfolioListSection }) {
-  return <Text style={[styles.sectionTitle, { color: section.accentColor }]}>{section.title}</Text>;
-}
-
-function renderPortfolioSectionFooter({ section }: { section: PortfolioListSection }) {
-  return section.data.length === 0 ? (
-    <Text style={styles.sectionEmptyText}>No positions yet.</Text>
-  ) : null;
 }
 
 // Tracks the "Highest Watermark" (highest price seen since a position was
@@ -122,7 +120,31 @@ export default function PortfolioScreen() {
   const [intelResult, setIntelResult] = useState<IntelBatchResponse | null>(null);
   const [isFetchingIntel, setIsFetchingIntel] = useState(false);
 
+  const { colors, isDarkMode, toggleTheme } = usePipelineTheme();
+  // Re-derived only when the active theme actually changes (StyleSheet.create
+  // bakes in whatever colors it's given at call time, so this can't be a
+  // module-level constant the way it used to be — see createStyles below).
+  const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
+
   const insets = useSafeAreaInsets();
+
+  // Moved inside the component (were module-level functions before the
+  // theme toggle existed) since they now need the live, theme-dependent
+  // `styles` in their closure. Stable via useCallback, re-created only when
+  // styles itself changes — same referential-stability reasoning as
+  // renderPortfolioRow below.
+  const renderPortfolioSectionHeader = useCallback(
+    ({ section }: { section: PortfolioListSection }) => (
+      <Text style={[styles.sectionTitle, { color: section.accentColor }]}>{section.title}</Text>
+    ),
+    [styles],
+  );
+
+  const renderPortfolioSectionFooter = useCallback(
+    ({ section }: { section: PortfolioListSection }) =>
+      section.data.length === 0 ? <Text style={styles.sectionEmptyText}>No positions yet.</Text> : null,
+    [styles],
+  );
 
   // Drives the Intel modal's draggable bottom sheet height. Lazily
   // initialized via useState (not useRef().current) so the value stays
@@ -384,9 +406,11 @@ export default function PortfolioScreen() {
         accentColor={section.accentColor}
         onDelete={handleDeleteTicker}
         onSaveEdit={handleSaveEdit}
+        colors={colors}
+        styles={styles}
       />
     ),
-    [handleDeleteTicker, handleSaveEdit],
+    [handleDeleteTicker, handleSaveEdit, colors, styles],
   );
 
   const onRefresh = async () => {
@@ -638,19 +662,19 @@ export default function PortfolioScreen() {
     {
       title: 'Core (70%)',
       category: 'Core',
-      accentColor: PipelineColors.core,
+      accentColor: colors.core,
       data: stocks.filter((stock) => stock.category === 'Core'),
     },
     {
       title: 'Satellite (20%)',
       category: 'Satellite',
-      accentColor: PipelineColors.satellite,
+      accentColor: colors.satellite,
       data: stocks.filter((stock) => stock.category === 'Satellite'),
     },
     {
       title: 'Quality (10%)',
       category: 'Quality',
-      accentColor: PipelineColors.quality,
+      accentColor: colors.quality,
       data: stocks.filter((stock) => stock.category === 'Quality'),
     },
   ];
@@ -660,7 +684,7 @@ export default function PortfolioScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
-      <StatusBar style="light" />
+      <StatusBar style={isDarkMode ? 'light' : 'dark'} />
 
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Portfolio</Text>
@@ -668,7 +692,7 @@ export default function PortfolioScreen() {
           onPress={() => setIsMenuVisible(true)}
           hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
           accessibilityLabel="More options">
-          <Ionicons name="ellipsis-horizontal" size={24} color={PipelineColors.textPrimary} />
+          <Ionicons name="ellipsis-horizontal" size={24} color={colors.textPrimary} />
         </TouchableOpacity>
       </View>
 
@@ -728,7 +752,7 @@ export default function PortfolioScreen() {
         style={styles.fab}
         onPress={() => setIsAddModalVisible(true)}
         accessibilityLabel="Add asset to portfolio">
-        <Ionicons name="add" size={28} color={PipelineColors.textPrimary} />
+        <Ionicons name="add" size={28} color={colors.textPrimary} />
       </TouchableOpacity>
 
       <Modal
@@ -755,7 +779,7 @@ export default function PortfolioScreen() {
                 handleCopyAllData();
               }}>
               {isExportingAll ? (
-                <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                <ActivityIndicator size="small" color={colors.textPrimary} />
               ) : (
                 <Text style={styles.menuItemText}>Copy ALL Data</Text>
               )}
@@ -769,7 +793,7 @@ export default function PortfolioScreen() {
                 handleExportBackup();
               }}>
               {isExportingBackup ? (
-                <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                <ActivityIndicator size="small" color={colors.textPrimary} />
               ) : (
                 <Text style={styles.menuItemText}>Export Backup (JSON)</Text>
               )}
@@ -792,6 +816,17 @@ export default function PortfolioScreen() {
               }}>
               <Text style={styles.menuItemText}>On-Demand Intel</Text>
             </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setIsMenuVisible(false);
+                toggleTheme();
+              }}>
+              <Text style={styles.menuItemText}>
+                {isDarkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              </Text>
+            </TouchableOpacity>
           </View>
         </Pressable>
       </Modal>
@@ -799,31 +834,36 @@ export default function PortfolioScreen() {
       <Modal
         visible={isAddModalVisible}
         transparent
-        animationType="slide"
+        animationType="fade"
         onRequestClose={() => setIsAddModalVisible(false)}>
-        <Pressable style={styles.addModalBackdrop} onPress={() => setIsAddModalVisible(false)}>
-          {/* iOS 'padding' pads the whole KeyboardAvoidingView, which is
-              what pushes this bottom sheet up above the keyboard; Android's
-              'height' shrinks it instead (Android's 'padding' behavior
-              doesn't play well with a transparent, flex-end Modal here — it
-              tends to leave the sheet visually unmoved). */}
+        {/* Root cause of the "squashed sliver" bug this replaces: the old
+            bottom-sheet layout gave the KeyboardAvoidingView no flex/height
+            of its own (just width: '100%', sized to content, anchored via
+            the backdrop's justifyContent: 'flex-end') while also using
+            behavior="height" on Android — with no intrinsic height to
+            shrink FROM, that behavior could resolve to a near-zero height
+            once the keyboard opened. Centering the card instead (flex: 1
+            on both the backdrop and the KeyboardAvoidingView, the latter
+            with justifyContent/alignItems: 'center') gives both a real,
+            unambiguous size at every step, keyboard open or not. */}
+        <Pressable style={styles.addAssetModalBackdrop} onPress={() => setIsAddModalVisible(false)}>
           <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            style={styles.addModalKeyboardAvoider}>
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.addAssetModalAvoider}>
             {/* TouchableWithoutFeedback so tapping any non-interactive part
-                of the sheet (not just the backdrop outside it) dismisses
+                of the card (not just the backdrop outside it) dismisses
                 the keyboard without closing the whole modal — nested
                 TouchableOpacity/TextInput children still get their own taps
                 as normal, RN's responder system gives them priority. */}
             <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-              <View style={styles.addAssetModalSheet}>
+              <View style={styles.addAssetModalCard}>
                 <View style={styles.addModalHeader}>
                   <Text style={styles.addModalTitle}>Add Asset</Text>
                   <TouchableOpacity
                     onPress={() => setIsAddModalVisible(false)}
                     hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                     accessibilityLabel="Close">
-                    <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                    <Ionicons name="close" size={22} color={colors.textSecondary} />
                   </TouchableOpacity>
                 </View>
 
@@ -851,7 +891,7 @@ export default function PortfolioScreen() {
                       value={units}
                       onChangeText={setUnits}
                       placeholder="Units"
-                      placeholderTextColor={PipelineColors.textSecondary}
+                      placeholderTextColor={colors.textSecondary}
                       keyboardType="numeric"
                       editable={!isAdding}
                     />
@@ -862,8 +902,8 @@ export default function PortfolioScreen() {
                     <TouchableOpacity
                       style={[
                         styles.categoryButton,
-                        { borderColor: PipelineColors.core },
-                        selectedCategory === 'Core' && { backgroundColor: PipelineColors.core },
+                        { borderColor: colors.core },
+                        selectedCategory === 'Core' && { backgroundColor: colors.core },
                       ]}
                       onPress={() => setSelectedCategory('Core')}>
                       <Text style={styles.categoryButtonText}>Core</Text>
@@ -871,8 +911,8 @@ export default function PortfolioScreen() {
                     <TouchableOpacity
                       style={[
                         styles.categoryButton,
-                        { borderColor: PipelineColors.satellite },
-                        selectedCategory === 'Satellite' && { backgroundColor: PipelineColors.satellite },
+                        { borderColor: colors.satellite },
+                        selectedCategory === 'Satellite' && { backgroundColor: colors.satellite },
                       ]}
                       onPress={() => setSelectedCategory('Satellite')}>
                       <Text style={styles.categoryButtonText}>Satellite</Text>
@@ -880,8 +920,8 @@ export default function PortfolioScreen() {
                     <TouchableOpacity
                       style={[
                         styles.categoryButton,
-                        { borderColor: PipelineColors.quality },
-                        selectedCategory === 'Quality' && { backgroundColor: PipelineColors.quality },
+                        { borderColor: colors.quality },
+                        selectedCategory === 'Quality' && { backgroundColor: colors.quality },
                       ]}
                       onPress={() => setSelectedCategory('Quality')}>
                       <Text style={styles.categoryButtonText}>Quality</Text>
@@ -893,8 +933,8 @@ export default function PortfolioScreen() {
                     <TouchableOpacity
                       style={[
                         styles.assetTypeButton,
-                        { borderColor: PipelineColors.bullish },
-                        selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
+                        { borderColor: colors.bullish },
+                        selectedAssetType === 'Stock' && { backgroundColor: colors.bullish },
                       ]}
                       onPress={() => setSelectedAssetType('Stock')}>
                       <Text style={styles.assetTypeButtonText}>Stock</Text>
@@ -902,8 +942,8 @@ export default function PortfolioScreen() {
                     <TouchableOpacity
                       style={[
                         styles.assetTypeButton,
-                        { borderColor: PipelineColors.core },
-                        selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
+                        { borderColor: colors.core },
+                        selectedAssetType === 'ETF' && { backgroundColor: colors.core },
                       ]}
                       onPress={() => setSelectedAssetType('ETF')}>
                       <Text style={styles.assetTypeButtonText}>ETF</Text>
@@ -916,7 +956,7 @@ export default function PortfolioScreen() {
                       onPress={handleAddTicker}
                       disabled={isAdding}>
                       {isAdding ? (
-                        <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                        <ActivityIndicator size="small" color={colors.textPrimary} />
                       ) : (
                         <Text style={styles.addButtonText}>Add to Portfolio</Text>
                       )}
@@ -948,7 +988,7 @@ export default function PortfolioScreen() {
                   disabled={isRestoring}
                   hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                   accessibilityLabel="Close">
-                  <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                  <Ionicons name="close" size={22} color={colors.textSecondary} />
                 </TouchableOpacity>
               </View>
 
@@ -958,7 +998,7 @@ export default function PortfolioScreen() {
                 value={importText}
                 onChangeText={setImportText}
                 placeholder="Paste the JSON copied from Export Backup..."
-                placeholderTextColor={PipelineColors.textSecondary}
+                placeholderTextColor={colors.textSecondary}
                 multiline
                 textAlignVertical="top"
                 editable={!isRestoring}
@@ -973,7 +1013,7 @@ export default function PortfolioScreen() {
                   onPress={handleRestoreBackup}
                   disabled={isRestoring || !importText.trim()}>
                   {isRestoring ? (
-                    <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                    <ActivityIndicator size="small" color={colors.textPrimary} />
                   ) : (
                     <Text style={styles.addButtonText}>Restore</Text>
                   )}
@@ -1011,7 +1051,7 @@ export default function PortfolioScreen() {
                 disabled={isFetchingIntel}
                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                 accessibilityLabel="Close">
-                <Ionicons name="close" size={22} color={PipelineColors.textSecondary} />
+                <Ionicons name="close" size={22} color={colors.textSecondary} />
               </TouchableOpacity>
 
               <Text style={[styles.addModalTitle, styles.intelModalTitle]}>On-Demand Intel</Text>
@@ -1023,7 +1063,7 @@ export default function PortfolioScreen() {
                   value={intelInput}
                   onChangeText={setIntelInput}
                   placeholder="e.g. PLD, UNH, AMT"
-                  placeholderTextColor={PipelineColors.textSecondary}
+                  placeholderTextColor={colors.textSecondary}
                   autoCapitalize="characters"
                   autoCorrect={false}
                   returnKeyType="done"
@@ -1035,7 +1075,7 @@ export default function PortfolioScreen() {
                   onPress={handleFetchIntel}
                   disabled={isFetchingIntel}>
                   {isFetchingIntel ? (
-                    <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+                    <ActivityIndicator size="small" color={colors.textPrimary} />
                   ) : (
                     <Text style={styles.addButtonText}>Fetch Intel</Text>
                   )}
@@ -1107,20 +1147,30 @@ type PortfolioStockRowProps = {
   accentColor: string;
   onDelete: (ticker: string) => void;
   onSaveEdit: (ticker: string, units: number, assetType: AssetType) => void;
+  colors: PipelineColorScheme;
+  styles: PortfolioStyles;
 };
 
 // Wrapped in memo() so updating one position (price refresh, edit, delete)
 // doesn't re-render every other row in the SectionList — stocks state
 // updates already keep unaffected PortfolioStock objects referentially
 // stable (see onRefresh/handleSaveEdit/handleDeleteTicker above), and
-// accentColor/onDelete/onSaveEdit are all stable across renders too (a
-// PipelineColors constant and useCallback-wrapped handlers respectively),
-// so this comparison is meaningful, not a no-op.
+// accentColor/onDelete/onSaveEdit/colors/styles are all stable across
+// renders too (a fixed per-theme accent color, useCallback-wrapped
+// handlers, and the parent's own useMemo-derived theme values respectively
+// — colors and styles only actually change reference on a real theme
+// toggle), so
+// this comparison is meaningful, not a no-op. memo() only shallow-compares
+// props, not context, but this component reads no context of its own —
+// colors/styles arrive as props from PortfolioScreen, which is what
+// actually re-renders on a theme change and passes the new values down.
 const PortfolioStockRow = memo(function PortfolioStockRow({
   stock,
   accentColor,
   onDelete,
   onSaveEdit,
+  colors,
+  styles,
 }: PortfolioStockRowProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [unitsText, setUnitsText] = useState(String(stock.units));
@@ -1203,15 +1253,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               onPress={handleSaveEdit}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
               accessibilityLabel={`Save changes for ${stock.ticker}`}>
-              <Ionicons name="checkmark" size={20} color={PipelineColors.bullish} />
+              <Ionicons name="checkmark" size={20} color={colors.bullish} />
             </TouchableOpacity>
           </View>
           <View style={styles.editAssetTypeRow}>
             <TouchableOpacity
               style={[
                 styles.editAssetTypeButton,
-                { borderColor: PipelineColors.bullish },
-                editedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
+                { borderColor: colors.bullish },
+                editedAssetType === 'Stock' && { backgroundColor: colors.bullish },
               ]}
               onPress={() => setEditedAssetType('Stock')}>
               <Text style={styles.editAssetTypeButtonText}>Stock</Text>
@@ -1219,8 +1269,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             <TouchableOpacity
               style={[
                 styles.editAssetTypeButton,
-                { borderColor: PipelineColors.core },
-                editedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
+                { borderColor: colors.core },
+                editedAssetType === 'ETF' && { backgroundColor: colors.core },
               ]}
               onPress={() => setEditedAssetType('ETF')}>
               <Text style={styles.editAssetTypeButtonText}>ETF</Text>
@@ -1237,7 +1287,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               onPress={handleStartEditing}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
               accessibilityLabel={`Edit ${stock.ticker}`}>
-              <Ionicons name="pencil" size={14} color={PipelineColors.textSecondary} />
+              <Ionicons name="pencil" size={14} color={colors.textSecondary} />
             </TouchableOpacity>
           </View>
           <Text style={styles.stockTotalValue}>${totalValue.toFixed(2)}</Text>
@@ -1269,10 +1319,18 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   );
 });
 
-const styles = StyleSheet.create({
+// A factory (not a module-level StyleSheet.create) so it can be re-derived
+// whenever the active theme changes — StyleSheet.create bakes in whatever
+// color values it's given at the moment it's called, so a module-level call
+// would freeze in whichever theme happened to be active on first import and
+// never update. Called from a useMemo(() => createStyles(colors,
+// isDarkMode), [colors, isDarkMode]) inside PortfolioScreen, so it only
+// actually re-runs on a real theme change, not on every render.
+function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
+  return StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: PipelineColors.background,
+    backgroundColor: colors.background,
   },
   header: {
     flexDirection: 'row',
@@ -1282,7 +1340,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
   },
   headerTitle: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 28,
     fontWeight: '700',
   },
@@ -1295,8 +1353,8 @@ const styles = StyleSheet.create({
   },
   unitsInput: {
     width: 70,
-    backgroundColor: PipelineColors.background,
-    color: PipelineColors.textPrimary,
+    backgroundColor: colors.background,
+    color: colors.textPrimary,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -1304,15 +1362,15 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   modalSectionLabel: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 12,
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 8,
   },
   importTextArea: {
-    backgroundColor: PipelineColors.background,
-    color: PipelineColors.textPrimary,
+    backgroundColor: colors.background,
+    color: colors.textPrimary,
     borderRadius: 8,
     padding: 12,
     fontSize: 13,
@@ -1322,8 +1380,8 @@ const styles = StyleSheet.create({
   },
   intelTextInput: {
     flex: 1,
-    backgroundColor: PipelineColors.background,
-    color: PipelineColors.textPrimary,
+    backgroundColor: colors.background,
+    color: colors.textPrimary,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -1331,19 +1389,19 @@ const styles = StyleSheet.create({
   },
   intelResultsScroll: {
     flex: 1,
-    backgroundColor: PipelineColors.background,
+    backgroundColor: colors.background,
     borderRadius: 8,
     padding: 12,
     marginBottom: 16,
   },
   intelTickerSectionHeader: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '700',
     marginBottom: 8,
   },
   intelArticleCard: {
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: colors.cardBackground,
     borderRadius: 8,
     padding: 12,
     marginBottom: 10,
@@ -1355,36 +1413,36 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   intelArticlePublisher: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 12,
     fontWeight: '600',
   },
   intelArticleTimestamp: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 11,
   },
   intelArticleTitle: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
     marginBottom: 8,
   },
   intelCriticalInlineTag: {
-    color: PipelineColors.bearish,
+    color: colors.bearish,
     fontWeight: '700',
   },
   intelLinkButtonText: {
-    color: PipelineColors.core,
+    color: colors.core,
     fontSize: 13,
     fontWeight: '600',
   },
   intelErrorText: {
-    color: PipelineColors.warning,
+    color: colors.warning,
     fontSize: 13,
     marginBottom: 12,
   },
   intelEmptyText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 13,
     marginBottom: 12,
   },
@@ -1403,7 +1461,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   categoryButtonText: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
   },
@@ -1422,7 +1480,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   assetTypeButtonText: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
   },
@@ -1430,7 +1488,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   addButton: {
-    backgroundColor: PipelineColors.bullish,
+    backgroundColor: colors.bullish,
     borderRadius: 8,
     paddingHorizontal: 16,
     paddingVertical: 14,
@@ -1441,7 +1499,7 @@ const styles = StyleSheet.create({
     opacity: 0.6,
   },
   addButtonText: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 16,
     fontWeight: '700',
   },
@@ -1454,21 +1512,21 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   filterButton: {
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: colors.cardBackground,
     borderRadius: 16,
     paddingHorizontal: 16,
     paddingVertical: 8,
   },
   filterButtonActive: {
-    backgroundColor: PipelineColors.textPrimary,
+    backgroundColor: colors.textPrimary,
   },
   filterButtonText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 13,
     fontWeight: '600',
   },
   filterButtonTextActive: {
-    color: PipelineColors.background,
+    color: colors.background,
   },
   listWrapper: {
     flex: 1,
@@ -1489,16 +1547,28 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   sectionEmptyText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 14,
     marginBottom: 4,
   },
   stockCard: {
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: colors.cardBackground,
     borderRadius: 12,
     paddingHorizontal: 16,
     paddingVertical: 12,
     marginBottom: 10,
+    // Light theme's white cards need a subtle shadow to read as distinct/
+    // elevated against the light-gray page background; dark theme's cards
+    // already contrast against the near-black background without one.
+    ...(isDarkMode
+      ? null
+      : {
+          shadowColor: '#000',
+          shadowOpacity: 0.08,
+          shadowRadius: 6,
+          shadowOffset: { width: 0, height: 2 },
+          elevation: 2,
+        }),
   },
   stockTopRow: {
     flexDirection: 'row',
@@ -1512,18 +1582,18 @@ const styles = StyleSheet.create({
   },
   stockTicker: {
     flex: 1,
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 16,
     fontWeight: '700',
   },
   assetTypeBadge: {
-    backgroundColor: PipelineColors.background,
+    backgroundColor: colors.background,
     borderRadius: 4,
     paddingHorizontal: 6,
     paddingVertical: 2,
   },
   assetTypeBadgeText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 10,
     fontWeight: '700',
   },
@@ -1533,12 +1603,12 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   categoryBadgeText: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '700',
   },
   deleteButtonText: {
-    color: PipelineColors.bearish,
+    color: colors.bearish,
     fontSize: 16,
     fontWeight: '700',
   },
@@ -1549,11 +1619,11 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   stockDetailText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 13,
   },
   stockTotalValue: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 15,
     fontWeight: '600',
   },
@@ -1572,8 +1642,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   unitsEditInput: {
-    backgroundColor: PipelineColors.background,
-    color: PipelineColors.textPrimary,
+    backgroundColor: colors.background,
+    color: colors.textPrimary,
     borderRadius: 6,
     paddingHorizontal: 8,
     paddingVertical: 4,
@@ -1591,17 +1661,17 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   editAssetTypeButtonText: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '600',
   },
   trailingStopText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 12,
     marginTop: 6,
   },
   trailingStopTriggeredText: {
-    color: PipelineColors.warning,
+    color: colors.warning,
     fontWeight: '700',
   },
   drawdownRow: {
@@ -1611,15 +1681,15 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   drawdownText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 12,
   },
   drawdownTextReview: {
-    color: PipelineColors.reviewAlert,
+    color: colors.reviewAlert,
     fontWeight: '700',
   },
   drawdownReviewTag: {
-    color: PipelineColors.reviewAlert,
+    color: colors.reviewAlert,
     fontSize: 12,
     fontWeight: '700',
   },
@@ -1630,7 +1700,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   initializingText: {
-    color: PipelineColors.textSecondary,
+    color: colors.textSecondary,
     fontSize: 14,
   },
   fab: {
@@ -1640,7 +1710,7 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: PipelineColors.bullish,
+    backgroundColor: colors.bullish,
     alignItems: 'center',
     justifyContent: 'center',
     shadowColor: '#000',
@@ -1658,7 +1728,7 @@ const styles = StyleSheet.create({
     top: 64,
     right: 16,
     minWidth: 200,
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: colors.cardBackground,
     borderRadius: 12,
     paddingVertical: 4,
     shadowColor: '#000',
@@ -1672,13 +1742,13 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
   },
   menuItemText: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 15,
     fontWeight: '600',
   },
   menuDivider: {
     height: StyleSheet.hairlineWidth,
-    backgroundColor: PipelineColors.background,
+    backgroundColor: colors.background,
     marginHorizontal: 12,
   },
   addModalBackdrop: {
@@ -1690,7 +1760,7 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   addModalSheet: {
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: colors.cardBackground,
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     paddingHorizontal: 16,
@@ -1704,22 +1774,40 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   addModalTitle: {
-    color: PipelineColors.textPrimary,
+    color: colors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
   },
   // Add Asset modal only (not shared with addModalSheet, used by Import
-  // Backup): bounded by maxHeight rather than auto-sized, so the
-  // addAssetModalScroll child below can use flex: 1 to actually fill —
-  // and scroll within — the remaining space once the keyboard eats into
-  // the available screen height, instead of just growing off-screen.
-  addAssetModalSheet: {
-    backgroundColor: PipelineColors.cardBackground,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
+  // Backup) — a centered card, not a bottom sheet: full-screen dim layer.
+  addAssetModalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  // flex: 1 (a real, unambiguous size to begin with) + justifyContent/
+  // alignItems: 'center' is what centers addAssetModalCard and keeps it
+  // that way whether or not the keyboard is open — see the root-cause note
+  // above this modal's JSX.
+  addAssetModalAvoider: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  // Bounded (maxHeight, not auto-sized) so the addAssetModalScroll child
+  // below can use flex: 1 to actually fill — and scroll within — the
+  // remaining space on a small device, instead of just growing off-screen.
+  addAssetModalCard: {
+    width: '90%',
+    maxHeight: '85%',
+    backgroundColor: colors.cardBackground,
+    borderRadius: 20,
     paddingHorizontal: 16,
     paddingTop: 16,
-    maxHeight: '90%',
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 12,
   },
   addAssetModalScroll: {
     flex: 1,
@@ -1734,7 +1822,7 @@ const styles = StyleSheet.create({
   // user drags the handle. paddingBottom is set inline per-instance (40 +
   // safe-area inset) so "Copy Intel" clears the OS nav bar on Android.
   intelModalSheet: {
-    backgroundColor: PipelineColors.cardBackground,
+    backgroundColor: colors.cardBackground,
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     paddingHorizontal: 16,
@@ -1758,7 +1846,7 @@ const styles = StyleSheet.create({
     width: 40,
     height: 5,
     borderRadius: 3,
-    backgroundColor: PipelineColors.textSecondary,
+    backgroundColor: colors.textSecondary,
   },
   intelModalTitle: {
     marginBottom: 20,
@@ -1771,4 +1859,5 @@ const styles = StyleSheet.create({
     zIndex: 10,
     padding: 4,
   },
-});
+  });
+}

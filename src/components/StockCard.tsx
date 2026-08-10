@@ -1,8 +1,9 @@
-import { memo } from 'react';
+import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
-import { PipelineColors } from '@/constants/pipeline-colors';
+import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
+import { usePipelineTheme } from '@/contexts/theme-context';
 import type { AssetType } from '@/types/asset';
 
 export type Stock = {
@@ -31,12 +32,19 @@ export type StockCardProps = {
   onDelete: (ticker: string) => void;
 };
 
+type StockCardStyles = ReturnType<typeof createStyles>;
+
 // Wrapped in memo() so a price/SMA update on one ticker doesn't re-render
 // every other card in the list — the ambush.tsx list already keeps
 // unaffected Stock objects referentially stable on every state update
 // (add/delete/refresh only replace the entries that actually changed), so
-// this comparison is meaningful, not a no-op.
+// this comparison is meaningful, not a no-op. memo() only shallow-compares
+// props, not context, so this still re-renders correctly on a theme toggle
+// (usePipelineTheme() below is a context read, unaffected by memo).
 export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardProps) {
+  const { colors, isDarkMode } = usePipelineTheme();
+  const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
+
   const { ticker, assetType, price, sma50, sma200 } = stock;
 
   // ETFs are judged against the longer 200-day trend; individual stocks
@@ -77,16 +85,23 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
       </View>
 
       <View style={[styles.row, styles.bottomRow]}>
-        <MomentumBar price={price} sma50={sma50} sma200={sma200} isBullish={isBullish} />
+        <MomentumBar
+          price={price}
+          sma50={sma50}
+          sma200={sma200}
+          isBullish={isBullish}
+          colors={colors}
+          styles={styles}
+        />
         <View
           style={[
             styles.badge,
             {
               backgroundColor: !hasTrendData
-                ? PipelineColors.textSecondary
+                ? colors.textSecondary
                 : isBullish
-                  ? PipelineColors.bullish
-                  : PipelineColors.bearish,
+                  ? colors.bullish
+                  : colors.bearish,
             },
           ]}>
           <Text style={styles.badgeText}>
@@ -103,11 +118,16 @@ type MomentumBarProps = {
   sma50: number | null;
   sma200: number | null;
   isBullish: boolean;
+  colors: PipelineColorScheme;
+  styles: StockCardStyles;
 };
 
 // Minimalist visual showing where the current price sits relative to the
 // SMA50/SMA200 range, replacing the old plain "SMA 50: $X" text line.
-function MomentumBar({ price, sma50, sma200, isBullish }: MomentumBarProps) {
+// A private sub-component of StockCard (not exported/reused elsewhere), so
+// it takes colors/styles as props from its parent's already-memoized theme
+// read rather than calling usePipelineTheme() again itself.
+function MomentumBar({ price, sma50, sma200, isBullish, colors, styles }: MomentumBarProps) {
   if (sma50 === null || sma200 === null) {
     return <Text style={styles.momentumFallbackText}>Insufficient SMA data</Text>;
   }
@@ -120,7 +140,7 @@ function MomentumBar({ price, sma50, sma200, isBullish }: MomentumBarProps) {
   const range = high - low;
   const rawPosition = range > 0 ? (price - low) / range : 0.5;
   const markerPosition = Math.min(1, Math.max(0, rawPosition));
-  const markerColor = isBullish ? PipelineColors.bullish : PipelineColors.bearish;
+  const markerColor = isBullish ? colors.bullish : colors.bearish;
 
   return (
     <View style={styles.momentumContainer}>
@@ -145,113 +165,136 @@ function MomentumBar({ price, sma50, sma200, isBullish }: MomentumBarProps) {
   );
 }
 
-const styles = StyleSheet.create({
-  card: {
-    backgroundColor: PipelineColors.cardBackground,
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    marginHorizontal: 16,
-    marginBottom: 12,
-    overflow: 'hidden',
-  },
-  warningBanner: {
-    backgroundColor: PipelineColors.warning,
-    marginHorizontal: -16,
-    marginTop: -14,
-    marginBottom: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 6,
-  },
-  warningBannerText: {
-    color: PipelineColors.background,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  bottomRow: {
-    marginTop: 12,
-    alignItems: 'flex-start',
-  },
-  tickerGroup: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  ticker: {
-    color: PipelineColors.textPrimary,
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  assetTypeBadge: {
-    backgroundColor: PipelineColors.background,
-    borderRadius: 4,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-  },
-  assetTypeBadgeText: {
-    color: PipelineColors.textSecondary,
-    fontSize: 10,
-    fontWeight: '700',
-  },
-  priceGroup: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  price: {
-    color: PipelineColors.textPrimary,
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  deleteButtonText: {
-    color: PipelineColors.bearish,
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  badge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-    marginLeft: 12,
-  },
-  badgeText: {
-    color: PipelineColors.textPrimary,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  momentumContainer: {
-    flex: 1,
-  },
-  momentumFallbackText: {
-    flex: 1,
-    color: PipelineColors.textSecondary,
-    fontSize: 13,
-  },
-  momentumTrack: {
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: PipelineColors.background,
-    justifyContent: 'center',
-  },
-  momentumMarker: {
-    position: 'absolute',
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    marginLeft: -6,
-  },
-  momentumLabelRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: 6,
-  },
-  momentumLabelText: {
-    color: PipelineColors.textSecondary,
-    fontSize: 11,
-  },
-});
+// A factory (not a module-level StyleSheet.create) so it can be re-derived
+// whenever the active theme changes — StyleSheet.create bakes in whatever
+// color values it's given at the moment it's called, so a module-level call
+// would freeze in whichever theme happened to be active on first import and
+// never update. Called from a useMemo(() => createStyles(colors, isDarkMode),
+// [colors, isDarkMode]) above, so it only actually re-runs on a real
+// theme change, not on every render.
+function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
+  return StyleSheet.create({
+    card: {
+      backgroundColor: colors.cardBackground,
+      borderRadius: 12,
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+      marginHorizontal: 16,
+      marginBottom: 12,
+      overflow: 'hidden',
+      // Light theme's white cards need a subtle shadow to read as
+      // distinct/elevated against the light-gray page background; dark
+      // theme's cards already contrast against the near-black background
+      // without one, so the shadow is skipped there rather than rendering
+      // an invisible-but-still-computed one.
+      ...(isDarkMode
+        ? null
+        : {
+            shadowColor: '#000',
+            shadowOpacity: 0.08,
+            shadowRadius: 6,
+            shadowOffset: { width: 0, height: 2 },
+            elevation: 2,
+          }),
+    },
+    warningBanner: {
+      backgroundColor: colors.warning,
+      marginHorizontal: -16,
+      marginTop: -14,
+      marginBottom: 10,
+      paddingHorizontal: 16,
+      paddingVertical: 6,
+    },
+    warningBannerText: {
+      color: colors.warningText,
+      fontSize: 12,
+      fontWeight: '700',
+    },
+    row: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    bottomRow: {
+      marginTop: 12,
+      alignItems: 'flex-start',
+    },
+    tickerGroup: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+    },
+    ticker: {
+      color: colors.textPrimary,
+      fontSize: 18,
+      fontWeight: '700',
+    },
+    assetTypeBadge: {
+      backgroundColor: colors.background,
+      borderRadius: 4,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+    },
+    assetTypeBadgeText: {
+      color: colors.textSecondary,
+      fontSize: 10,
+      fontWeight: '700',
+    },
+    priceGroup: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+    },
+    price: {
+      color: colors.textPrimary,
+      fontSize: 18,
+      fontWeight: '600',
+    },
+    deleteButtonText: {
+      color: colors.bearish,
+      fontSize: 16,
+      fontWeight: '700',
+    },
+    badge: {
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+      borderRadius: 6,
+      marginLeft: 12,
+    },
+    badgeText: {
+      color: colors.textPrimary,
+      fontSize: 12,
+      fontWeight: '700',
+    },
+    momentumContainer: {
+      flex: 1,
+    },
+    momentumFallbackText: {
+      flex: 1,
+      color: colors.textSecondary,
+      fontSize: 13,
+    },
+    momentumTrack: {
+      height: 6,
+      borderRadius: 3,
+      backgroundColor: colors.background,
+      justifyContent: 'center',
+    },
+    momentumMarker: {
+      position: 'absolute',
+      width: 12,
+      height: 12,
+      borderRadius: 6,
+      marginLeft: -6,
+    },
+    momentumLabelRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      marginTop: 6,
+    },
+    momentumLabelText: {
+      color: colors.textSecondary,
+      fontSize: 11,
+    },
+  });
+}

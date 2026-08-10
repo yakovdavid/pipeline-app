@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import { useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -18,9 +18,10 @@ import { StatusBar } from 'expo-status-bar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { StockCard, type Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
-import { PipelineColors } from '@/constants/pipeline-colors';
+import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
+import { usePipelineTheme } from '@/contexts/theme-context';
 import { fetchStockData, type StockQuote } from '@/services/api';
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
@@ -38,6 +39,9 @@ const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
 // mean-reversion opportunities: stocks are judged against SMA50, ETFs
 // against the longer SMA200 (see StockCard for the trend rule itself).
 export default function AmbushRadarScreen() {
+  const { colors, isDarkMode } = usePipelineTheme();
+  const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
+
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [ticker, setTicker] = useState('');
   const [selectedAssetType, setSelectedAssetType] = useState<AssetType>('Stock');
@@ -251,7 +255,7 @@ export default function AmbushRadarScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
-      <StatusBar style="light" />
+      <StatusBar style={isDarkMode ? 'light' : 'dark'} />
 
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Ambush Radar</Text>
@@ -277,8 +281,8 @@ export default function AmbushRadarScreen() {
         <TouchableOpacity
           style={[
             styles.assetTypeButton,
-            { borderColor: PipelineColors.bullish },
-            selectedAssetType === 'Stock' && { backgroundColor: PipelineColors.bullish },
+            { borderColor: colors.bullish },
+            selectedAssetType === 'Stock' && { backgroundColor: colors.bullish },
           ]}
           onPress={() => setSelectedAssetType('Stock')}>
           <Text style={styles.assetTypeButtonText}>Stock</Text>
@@ -286,8 +290,8 @@ export default function AmbushRadarScreen() {
         <TouchableOpacity
           style={[
             styles.assetTypeButton,
-            { borderColor: PipelineColors.core },
-            selectedAssetType === 'ETF' && { backgroundColor: PipelineColors.core },
+            { borderColor: colors.core },
+            selectedAssetType === 'ETF' && { backgroundColor: colors.core },
           ]}
           onPress={() => setSelectedAssetType('ETF')}>
           <Text style={styles.assetTypeButtonText}>ETF</Text>
@@ -297,7 +301,7 @@ export default function AmbushRadarScreen() {
           onPress={handleAddTicker}
           disabled={isAdding}>
           {isAdding ? (
-            <ActivityIndicator size="small" color={PipelineColors.textPrimary} />
+            <ActivityIndicator size="small" color={colors.textPrimary} />
           ) : (
             <Text style={styles.addButtonText}>Add</Text>
           )}
@@ -335,94 +339,110 @@ export default function AmbushRadarScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: PipelineColors.background,
-  },
-  header: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  headerTitle: {
-    color: PipelineColors.textPrimary,
-    fontSize: 28,
-    fontWeight: '700',
-  },
-  exportRow: {
-    paddingHorizontal: 16,
-    marginBottom: 12,
-  },
-  exportButton: {
-    backgroundColor: PipelineColors.cardBackground,
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: 'center',
-  },
-  exportButtonText: {
-    color: PipelineColors.textPrimary,
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  inputRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    marginBottom: 8,
-    gap: 8,
-    zIndex: 10,
-  },
-  assetTypeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    marginBottom: 12,
-    gap: 8,
-  },
-  assetTypeButton: {
-    flex: 1,
-    borderWidth: 1.5,
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  assetTypeButtonText: {
-    color: PipelineColors.textPrimary,
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  addButton: {
-    backgroundColor: PipelineColors.bullish,
-    borderRadius: 8,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    minWidth: 64,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  addButtonDisabled: {
-    opacity: 0.6,
-  },
-  addButtonText: {
-    color: PipelineColors.textPrimary,
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  listWrapper: {
-    flex: 1,
-  },
-  listContent: {
-    paddingBottom: 24,
-  },
-  initializingContainer: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-  },
-  initializingText: {
-    color: PipelineColors.textSecondary,
-    fontSize: 14,
-  },
-});
+// A factory (not a module-level StyleSheet.create) so it can be re-derived
+// whenever the active theme changes — see the identical note in
+// StockCard.tsx. Called from a useMemo(() => createStyles(colors,
+// isDarkMode), [colors, isDarkMode]) above, so it only actually re-runs on
+// a real theme change, not on every render.
+function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
+  return StyleSheet.create({
+    safeArea: {
+      flex: 1,
+      backgroundColor: colors.background,
+    },
+    header: {
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+    },
+    headerTitle: {
+      color: colors.textPrimary,
+      fontSize: 28,
+      fontWeight: '700',
+    },
+    exportRow: {
+      paddingHorizontal: 16,
+      marginBottom: 12,
+    },
+    exportButton: {
+      backgroundColor: colors.cardBackground,
+      borderRadius: 8,
+      paddingVertical: 10,
+      alignItems: 'center',
+      ...(isDarkMode
+        ? null
+        : {
+            shadowColor: '#000',
+            shadowOpacity: 0.08,
+            shadowRadius: 4,
+            shadowOffset: { width: 0, height: 1 },
+            elevation: 1,
+          }),
+    },
+    exportButtonText: {
+      color: colors.textPrimary,
+      fontSize: 14,
+      fontWeight: '600',
+    },
+    inputRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      marginBottom: 8,
+      gap: 8,
+      zIndex: 10,
+    },
+    assetTypeRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      marginBottom: 12,
+      gap: 8,
+    },
+    assetTypeButton: {
+      flex: 1,
+      borderWidth: 1.5,
+      borderRadius: 8,
+      paddingVertical: 10,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    assetTypeButtonText: {
+      color: colors.textPrimary,
+      fontSize: 14,
+      fontWeight: '600',
+    },
+    addButton: {
+      backgroundColor: colors.bullish,
+      borderRadius: 8,
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      minWidth: 64,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    addButtonDisabled: {
+      opacity: 0.6,
+    },
+    addButtonText: {
+      color: colors.textPrimary,
+      fontSize: 16,
+      fontWeight: '700',
+    },
+    listWrapper: {
+      flex: 1,
+    },
+    listContent: {
+      paddingBottom: 24,
+    },
+    initializingContainer: {
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 12,
+    },
+    initializingText: {
+      color: colors.textSecondary,
+      fontSize: 14,
+    },
+  });
+}

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   StyleSheet,
@@ -8,7 +8,8 @@ import {
   View,
 } from 'react-native';
 
-import { PipelineColors } from '@/constants/pipeline-colors';
+import type { PipelineColorScheme } from '@/constants/pipeline-colors';
+import { usePipelineTheme } from '@/contexts/theme-context';
 import { useTickerSearch } from '@/hooks/useTickerSearch';
 
 // Delay hiding the dropdown on blur so a tap on a row registers first —
@@ -31,6 +32,9 @@ export function TickerAutocomplete({
   onSubmit,
   editable,
 }: TickerAutocompleteProps) {
+  const { colors } = usePipelineTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
   const [isFocused, setIsFocused] = useState(false);
   const { results, isSearching } = useTickerSearch(value);
 
@@ -48,7 +52,7 @@ export function TickerAutocomplete({
         value={value}
         onChangeText={onChangeText}
         placeholder="Add ticker (e.g. MSFT)"
-        placeholderTextColor={PipelineColors.textSecondary}
+        placeholderTextColor={colors.textSecondary}
         autoCapitalize="characters"
         autoCorrect={false}
         returnKeyType="done"
@@ -62,7 +66,7 @@ export function TickerAutocomplete({
         <View style={styles.dropdown}>
           {isSearching ? (
             <View style={styles.dropdownRow}>
-              <ActivityIndicator size="small" color={PipelineColors.textSecondary} />
+              <ActivityIndicator size="small" color={colors.textSecondary} />
             </View>
           ) : (
             results.map((result) => (
@@ -82,38 +86,42 @@ export function TickerAutocomplete({
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    position: 'relative',
-    zIndex: 10,
-  },
-  input: {
-    backgroundColor: PipelineColors.cardBackground,
-    color: PipelineColors.textPrimary,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 16,
-  },
-  dropdown: {
-    position: 'absolute',
-    top: '100%',
-    left: 0,
-    right: 0,
-    marginTop: 4,
-    backgroundColor: PipelineColors.cardBackground,
-    borderRadius: 8,
-    paddingVertical: 4,
-    zIndex: 20,
-    elevation: 6,
-  },
-  dropdownRow: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  dropdownText: {
-    color: PipelineColors.textPrimary,
-    fontSize: 14,
-  },
-});
+// Factory (not a module-level StyleSheet.create) so it re-derives whenever
+// the active theme changes — see the identical note in StockCard.tsx.
+function createStyles(colors: PipelineColorScheme) {
+  return StyleSheet.create({
+    container: {
+      flex: 1,
+      position: 'relative',
+      zIndex: 10,
+    },
+    input: {
+      backgroundColor: colors.cardBackground,
+      color: colors.textPrimary,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 16,
+    },
+    dropdown: {
+      position: 'absolute',
+      top: '100%',
+      left: 0,
+      right: 0,
+      marginTop: 4,
+      backgroundColor: colors.cardBackground,
+      borderRadius: 8,
+      paddingVertical: 4,
+      zIndex: 20,
+      elevation: 6,
+    },
+    dropdownRow: {
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+    },
+    dropdownText: {
+      color: colors.textPrimary,
+      fontSize: 14,
+    },
+  });
+}
