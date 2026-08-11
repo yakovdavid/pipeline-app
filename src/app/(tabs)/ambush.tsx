@@ -330,6 +330,13 @@ export default function AmbushRadarScreen() {
                 tintColor="transparent"
                 colors={['transparent']}
                 progressBackgroundColor="transparent"
+                // Android's native SwipeRefreshLayout circle carries its own
+                // baked-in drop shadow/elevation that colors={['transparent']}
+                // + progressBackgroundColor="transparent" can't fully hide —
+                // it still shows as a faint smudge in Light Mode. Pushing the
+                // whole progress view off-screen is what actually eliminates
+                // it, leaving PullToRefreshLogo as the only visible indicator.
+                progressViewOffset={-50}
               />
             }
           />

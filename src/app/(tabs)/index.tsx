@@ -688,12 +688,24 @@ export default function PortfolioScreen() {
 
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Portfolio</Text>
-        <TouchableOpacity
-          onPress={() => setIsMenuVisible(true)}
-          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-          accessibilityLabel="More options">
-          <Ionicons name="ellipsis-horizontal" size={24} color={colors.textPrimary} />
-        </TouchableOpacity>
+        <View style={styles.headerActions}>
+          {/* Standalone theme toggle, separate from the "More options"
+              dropdown — a single-tap action belongs in the header itself,
+              not buried in a menu. Icon reflects the CURRENT theme (sun
+              while light, moon while dark); tapping switches to the other. */}
+          <TouchableOpacity
+            onPress={toggleTheme}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            accessibilityLabel={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+            <Ionicons name={isDarkMode ? 'moon' : 'sunny'} size={22} color={colors.textPrimary} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => setIsMenuVisible(true)}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            accessibilityLabel="More options">
+            <Ionicons name="ellipsis-horizontal" size={24} color={colors.textPrimary} />
+          </TouchableOpacity>
+        </View>
       </View>
 
       <ScrollView
@@ -742,6 +754,13 @@ export default function PortfolioScreen() {
                 tintColor="transparent"
                 colors={['transparent']}
                 progressBackgroundColor="transparent"
+                // Android's native SwipeRefreshLayout circle carries its own
+                // baked-in drop shadow/elevation that colors={['transparent']}
+                // + progressBackgroundColor="transparent" can't fully hide —
+                // it still shows as a faint smudge in Light Mode. Pushing the
+                // whole progress view off-screen is what actually eliminates
+                // it, leaving PullToRefreshLogo as the only visible indicator.
+                progressViewOffset={-50}
               />
             }
           />
@@ -762,6 +781,8 @@ export default function PortfolioScreen() {
         onRequestClose={() => setIsMenuVisible(false)}>
         <Pressable style={styles.menuBackdrop} onPress={() => setIsMenuVisible(false)}>
           <View style={styles.menuCard}>
+            {/* Group 1: data export actions that read the current on-screen
+                state directly (no extra modal). */}
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
@@ -770,7 +791,6 @@ export default function PortfolioScreen() {
               }}>
               <Text style={styles.menuItemText}>Copy Portfolio Data</Text>
             </TouchableOpacity>
-            <View style={styles.menuDivider} />
             <TouchableOpacity
               style={styles.menuItem}
               disabled={isExportingAll}
@@ -785,6 +805,7 @@ export default function PortfolioScreen() {
               )}
             </TouchableOpacity>
             <View style={styles.menuDivider} />
+            {/* Group 2: JSON backup import/export. */}
             <TouchableOpacity
               style={styles.menuItem}
               disabled={isExportingBackup}
@@ -798,7 +819,6 @@ export default function PortfolioScreen() {
                 <Text style={styles.menuItemText}>Export Backup (JSON)</Text>
               )}
             </TouchableOpacity>
-            <View style={styles.menuDivider} />
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
@@ -808,6 +828,10 @@ export default function PortfolioScreen() {
               <Text style={styles.menuItemText}>Import Backup (JSON)</Text>
             </TouchableOpacity>
             <View style={styles.menuDivider} />
+            {/* Group 3: On-Demand Intel. Theme toggle used to live here as a
+                trailing text item — it's now a standalone icon button in the
+                header itself (see headerActions above), a single-tap
+                action doesn't belong buried in a dropdown. */}
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
@@ -815,17 +839,6 @@ export default function PortfolioScreen() {
                 setIsIntelModalVisible(true);
               }}>
               <Text style={styles.menuItemText}>On-Demand Intel</Text>
-            </TouchableOpacity>
-            <View style={styles.menuDivider} />
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                setIsMenuVisible(false);
-                toggleTheme();
-              }}>
-              <Text style={styles.menuItemText}>
-                {isDarkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-              </Text>
             </TouchableOpacity>
           </View>
         </Pressable>
@@ -845,7 +858,17 @@ export default function PortfolioScreen() {
             once the keyboard opened. Centering the card instead (flex: 1
             on both the backdrop and the KeyboardAvoidingView, the latter
             with justifyContent/alignItems: 'center') gives both a real,
-            unambiguous size at every step, keyboard open or not. */}
+            unambiguous size at every step, keyboard open or not.
+
+            A second, subtler version of the same bug survived that first
+            fix: addAssetModalCard still had a percentage maxHeight, and its
+            ScrollView still had flex: 1 — Android Modals don't inherit a
+            keyboard-triggered window resize the way a normal screen does,
+            so that flex/percentage combo could still resolve to ~0 height
+            during the resize pass. addAssetModalCard/addAssetModalScroll
+            below are now deliberately INTRINSIC height (no flex: 1, no
+            maxHeight) instead, so the card just sizes to its own content
+            every time. */}
         <Pressable style={styles.addAssetModalBackdrop} onPress={() => setIsAddModalVisible(false)}>
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -867,12 +890,12 @@ export default function PortfolioScreen() {
                   </TouchableOpacity>
                 </View>
 
-                {/* Bounded (addAssetModalSheet has maxHeight) + flex: 1 here
-                    is what lets this actually scroll instead of just
-                    growing off-screen on a small device once the keyboard
-                    eats into the available height. keyboardShouldPersistTaps
-                    keeps the category/asset-type/add buttons tappable while
-                    the keyboard is still up. */}
+                {/* Intrinsic height (no flex: 1 — see addAssetModalScroll's
+                    definition below for why), so this form just sizes to
+                    its own content instead of stretching/collapsing against
+                    a bounded parent. keyboardShouldPersistTaps keeps the
+                    category/asset-type/add buttons tappable while the
+                    keyboard is still up. */}
                 <ScrollView
                   style={styles.addAssetModalScroll}
                   contentContainerStyle={styles.addAssetModalScrollContent}
@@ -1344,6 +1367,11 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     fontSize: 28,
     fontWeight: '700',
   },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
+  },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1793,12 +1821,17 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     justifyContent: 'center',
     alignItems: 'center',
   },
-  // Bounded (maxHeight, not auto-sized) so the addAssetModalScroll child
-  // below can use flex: 1 to actually fill — and scroll within — the
-  // remaining space on a small device, instead of just growing off-screen.
+  // Deliberately an INTRINSIC height — no flex: 1, no maxHeight/height of
+  // any kind. This is the actual fix for the "squashed to 0" bug: a flex/
+  // percentage-bound card nested inside a KeyboardAvoidingView can resolve
+  // to a zero or near-zero height on Android during the keyboard's resize
+  // pass, since Android Modals don't inherit the resized window the same
+  // way a normal screen does. An intrinsic-height card just sizes to its
+  // own content every time, keyboard open or not, and addAssetModalAvoider
+  // above (flex: 1 + justifyContent/alignItems: 'center') centers whatever
+  // that size turns out to be.
   addAssetModalCard: {
     width: '90%',
-    maxHeight: '85%',
     backgroundColor: colors.cardBackground,
     borderRadius: 20,
     paddingHorizontal: 16,
@@ -1809,11 +1842,17 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     shadowOffset: { width: 0, height: 6 },
     elevation: 12,
   },
+  // No flex: 1 here either, for the same reason as addAssetModalCard above
+  // — this form is short enough to always fit at its intrinsic size, so it
+  // doesn't need to flex-fill or scroll-clip against a bounded parent.
+  // Still a ScrollView (not a plain View) purely to keep
+  // keyboardShouldPersistTaps="handled" for the category/asset-type/add
+  // buttons while a text input has focus.
   addAssetModalScroll: {
-    flex: 1,
+    flexGrow: 0,
   },
   addAssetModalScrollContent: {
-    paddingBottom: 32,
+    paddingBottom: 24,
   },
   // Explicit (not auto-sized) height, driven by intelSheetHeight — that's
   // what lets the intelResultsScroll child below use flex: 1 to fill
