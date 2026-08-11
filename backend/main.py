@@ -60,6 +60,34 @@ SMA_50_WINDOW = 50
 SMA_200_WINDOW = 200
 
 
+def _normalize_ticker_symbol(raw_ticker: str) -> str:
+    """TASE ticker interceptor: normalizes a raw user-supplied ticker and,
+    when applicable, appends the Tel Aviv Stock Exchange suffix — without
+    ever having to change data providers, since yfinance already
+    understands '<security number>.TA' as an ordinary symbol.
+
+    Yahoo Finance identifies TASE securities by their raw numeric security
+    number plus a '.TA' suffix (e.g. '1081124.TA'), not the bare number a
+    user would naturally type or paste from a TASE listing (e.g.
+    '1081124'). A symbol that, after trimming, consists entirely of digits
+    is unambiguously a TASE security number — there's no such thing as an
+    all-numeric ticker on any other exchange this app supports — so it's
+    auto-suffixed here. Anything containing a letter ('AAPL', 'BRK-B', ...)
+    is left exactly as-is.
+
+    Called once, centrally, from every endpoint that accepts a raw ticker
+    (get_stock, which backs both Portfolio and Ambush Radar fetching, and
+    get_intel) rather than requiring each to special-case it — from that
+    point on the rest of the pipeline, including get_stock's existing
+    Agorot -> USD conversion (already keyed off this same '.TA' suffix),
+    treats it as a standard Yahoo Finance symbol.
+    """
+    symbol = raw_ticker.strip().upper()
+    if symbol.isdigit():
+        return f"{symbol}{TASE_TICKER_SUFFIX}"
+    return symbol
+
+
 class TickerNotFoundError(Exception):
     """Raised when Yahoo explicitly reports no data for a ticker, as
     opposed to a transient network/rate-limit failure — lets callers map
@@ -623,7 +651,12 @@ def _fetch_usd_ils_rate() -> float:
 def get_stock(
     ticker: str, include_anomaly: bool = False, asset_type: str = DEFAULT_ANOMALY_ASSET_TYPE
 ) -> dict[str, float | str | None]:
-    symbol = ticker.strip().upper()
+    # TASE TICKER INTERCEPTOR: a bare numeric security number (e.g.
+    # "1081124") is auto-suffixed to "1081124.TA" here, before anything
+    # else touches it, so the rest of this function — and every helper it
+    # calls, including the Agorot -> USD conversion below — processes it as
+    # an ordinary Yahoo Finance symbol without any special-casing of its own.
+    symbol = _normalize_ticker_symbol(ticker)
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker symbol is required.")
 
@@ -919,7 +952,10 @@ def get_intel(tickers: str) -> dict[str, list[dict[str, object]]]:
     critical keywords. Not a REST/CLI hybrid — this is a plain
     request/response route, no input() prompts of any kind.
     """
-    ticker_list = [symbol.strip().upper() for symbol in tickers.split(",")]
+    # TASE TICKER INTERCEPTOR: same normalization as get_stock — a bare
+    # numeric security number is auto-suffixed with '.TA' so each ticker in
+    # the batch is treated as an ordinary Yahoo Finance symbol downstream.
+    ticker_list = [_normalize_ticker_symbol(symbol) for symbol in tickers.split(",")]
     ticker_list = [symbol for symbol in ticker_list if symbol]
 
     if not ticker_list:
