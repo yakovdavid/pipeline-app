@@ -7,14 +7,24 @@ Finance's search API.
 
 Includes a resilience layer around every outbound Yahoo Finance call
 (browser header/TLS spoofing, request throttling, retry with backoff, and
-short-lived in-memory caching) since cloud IPs like Render's are otherwise
-bot-detected and rate-limited (HTTP 429) almost immediately.
+in-memory caching) since cloud IPs like Render's are otherwise bot-detected
+and rate-limited (HTTP 429) almost immediately. Two further architecture
+decisions specifically target that: (1) a 15-minute TICKER_CACHE in front of
+every outbound ticker fetch, so N concurrent requests for the same ticker
+(e.g. every screen refreshing the same watchlist at once — the "thundering
+herd") collapse into at most one real Yahoo call; (2) the primary fetch path
+never calls yf.Ticker(t).info — the heaviest, most rate-limit-prone
+quoteSummary endpoint yfinance exposes — in favor of the much lighter
+yf.Ticker(t).fast_info plus one history(period="1y") call, from which price,
+52-week high, SMA50/SMA200, and the daily closes both anomaly checks need
+are all derived.
 """
 
 import random
 import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, TypeVar
 
@@ -49,10 +59,11 @@ USD_ILS_FX_SYMBOL = "ILS=X"
 AGOROT_PER_SHEKEL = 100
 
 # Fallback data source: Yahoo's lighter /v8/finance/chart endpoint, used
-# when yfinance's quoteSummary-backed .info fails (observed: quoteSummary
-# gets blocked on Render's shared IPs even when this endpoint doesn't).
-# It doesn't expose fiftyDayAverage/twoHundredDayAverage directly, so we
-# request a year of daily closes and compute both SMAs ourselves.
+# when yfinance's own history()/fast_info calls fail outright (observed:
+# yfinance's session handling gets blocked on Render's shared IPs even when
+# a hand-rolled request through this file's own resilient session doesn't).
+# Same 1-year daily-close history as the primary path, so SMA50/SMA200/
+# 52-week-high are computed identically regardless of which path succeeded.
 CHART_API_BASE_URL = "https://query2.finance.yahoo.com/v8/finance/chart"
 CHART_HISTORY_RANGE = "1y"
 CHART_HISTORY_INTERVAL = "1d"
@@ -97,9 +108,13 @@ class TickerNotFoundError(Exception):
 # Anomaly News Fetcher: flags same-day moves of ANOMALY_THRESHOLD_DEFAULT
 # (4%) or more and surfaces recent headlines to help explain the move.
 # This is supplementary/optional data (opted into via a query param on
-# /api/stock/{ticker}, not fetched by default — see get_stock), so it gets
-# its own small, fast-failing retry budget rather than the full one: a
-# failure here should never hold up the primary price/SMA response.
+# /api/stock/{ticker}, not fetched by default — see get_stock). The
+# day-over-day move itself is now derived from the already-fetched
+# TickerSnapshot's closes (see fetch_anomaly_news), so the only Yahoo call
+# this can still make is the news fetch itself, gated behind the threshold
+# actually being crossed — it keeps its own small, fast-failing retry
+# budget for that call regardless, since it should never hold up the
+# primary price/SMA response.
 ANOMALY_THRESHOLD_DEFAULT = 0.04
 ANOMALY_NEWS_COUNT = 3
 ANOMALY_FETCH_MAX_RETRIES = 1
@@ -115,7 +130,6 @@ ANOMALY_FETCH_BASE_BACKOFF_SECONDS = 1.0
 #   - Structural support break: price < SMA50 - (std_dev_multiplier * the
 #     20-day close std dev).
 ANOMALY_STD_DEV_WINDOW = 20
-ANOMALY_HISTORY_PERIOD = "2mo"  # ~40 trading days: comfortable margin over the 20-day window, tolerant of holidays
 DEFAULT_ANOMALY_ASSET_TYPE = "Stock"
 BEARISH_ANOMALY_RULES: dict[str, dict[str, float]] = {
     "Stock": {"drawdown_pct": 15.0, "std_dev_multiplier": 2.0},
@@ -301,8 +315,8 @@ def fetch_with_retry(
     raise last_error
 
 
-# --- Short-lived in-memory cache ----------------------------------------
-CACHE_TTL_SECONDS = 60.0
+# --- Short-lived in-memory cache (formatted responses / FX / news) ------
+CACHE_TTL_SECONDS = 900.0  # 15 minutes — aligned with TICKER_CACHE below.
 
 
 class TTLCache:
@@ -331,6 +345,65 @@ stock_cache = TTLCache(CACHE_TTL_SECONDS)
 fx_rate_cache = TTLCache(CACHE_TTL_SECONDS)
 intel_cache = TTLCache(CACHE_TTL_SECONDS)
 
+
+@dataclass
+class TickerSnapshot:
+    """The minimal, cacheable slice of Yahoo data needed for everything
+    this file computes about a ticker: the primary price/SMA/drawdown
+    response AND both anomaly checks (day-over-day move, 20-day std dev) —
+    all derived from ONE 1-year history fetch (+ one fast_info call for a
+    real-time current price), never from the heavy, rate-limit-prone
+    `.info`/quoteSummary endpoint.
+    """
+
+    price: float
+    sma50: float | None
+    sma200: float | None
+    high_52: float | None
+    # Ascending-date daily closes from the same 1-year history fetch used
+    # to compute sma50/sma200/high_52 above, in the ticker's raw/native
+    # currency (unconverted for TASE tickers). Reused directly by both
+    # fetch_anomaly_news (day-over-day % change — scale-invariant, so raw
+    # currency is fine as-is) and check_mean_reversion_anomaly (20-day std
+    # dev, currency-converted by the caller when needed) — neither makes
+    # its own separate Yahoo history call any more.
+    closes: list[float]
+
+
+# --- In-memory ticker snapshot cache (THE SPEED FIX) ---------------------
+# A plain, global dict — not hidden behind another abstraction — keyed by
+# normalized ticker symbol, storing (cached_at, TickerSnapshot) pairs.
+# Checked before ANY outbound Yahoo call for that ticker (see get_stock): a
+# cache hit returns instantly with zero network activity, which is what
+# actually solves the "thundering herd" problem — many concurrent requests
+# for the same handful of tickers (every screen refreshing its watchlist at
+# once) collapsing into at most one real Yahoo fetch every 15 minutes,
+# instead of one Yahoo fetch per request.
+TICKER_CACHE: dict[str, tuple[float, TickerSnapshot]] = {}
+TICKER_CACHE_TTL_SECONDS = 900.0  # 15 minutes
+_ticker_cache_lock = threading.Lock()
+
+
+def _get_cached_ticker_snapshot(symbol: str) -> TickerSnapshot | None:
+    """Returns the cached snapshot for symbol if one exists and hasn't
+    expired, else None. time.monotonic() (not time.time()) so this is
+    immune to wall-clock adjustments, matching the TTLCache class above."""
+    with _ticker_cache_lock:
+        entry = TICKER_CACHE.get(symbol)
+        if entry is None:
+            return None
+        cached_at, snapshot = entry
+        if time.monotonic() - cached_at > TICKER_CACHE_TTL_SECONDS:
+            del TICKER_CACHE[symbol]
+            return None
+        return snapshot
+
+
+def _set_cached_ticker_snapshot(symbol: str, snapshot: TickerSnapshot) -> None:
+    with _ticker_cache_lock:
+        TICKER_CACHE[symbol] = (time.monotonic(), snapshot)
+
+
 # One shared, browser-like session reused across every yfinance call. Safe
 # to share across FastAPI's threadpool workers because yahoo_rate_limiter
 # already guarantees only one outbound call using it runs at a time.
@@ -357,53 +430,81 @@ app.add_middleware(
 # Anti-rate-limit architecture: the primary (yfinance) path gets a full,
 # genuine retry budget — up to 3 attempts total (1 initial + 2 retries),
 # backing off 2s then 4s — before this file gives up on it and tries the
-# chart API fallback. Previously this fired only one fail-fast retry with a
-# 1s backoff, which was too thin to survive real, observed 429 bursts on
-# specific tickers (e.g. DTCR): it gave up on yfinance almost immediately,
-# and the fallback then had to carry the entire burden of the same
-# rate-limited window with barely more of a head start. The chart fallback
-# below still gets its own equally full budget (MAX_RETRIES/
-# BASE_BACKOFF_SECONDS defaults), so a ticker now survives up to ~3 attempts
-# against *each* data source before failing outright.
+# chart API fallback. The chart fallback below gets its own equally full
+# budget (MAX_RETRIES/BASE_BACKOFF_SECONDS defaults), so a ticker survives
+# up to ~3 attempts against *each* data source before failing outright.
 PRIMARY_FETCH_MAX_RETRIES = 2
 PRIMARY_FETCH_BASE_BACKOFF_SECONDS = 2.0
+TICKER_HISTORY_PERIOD = "1y"
 
 
-def _fetch_raw_quote_via_yfinance(symbol: str) -> tuple[float, float | None, float | None, float | None]:
-    """Primary data source: yfinance's quoteSummary-backed .info, which
-    directly exposes fiftyDayAverage/twoHundredDayAverage/fiftyTwoWeekHigh —
-    the latter is Yahoo's own official 52-week high (accounts for intraday
-    highs), which is both more accurate than manually scanning daily close
-    prices and free (no extra Yahoo call), since it's already part of this
-    same .info payload."""
-    info = fetch_with_retry(
-        lambda: yf.Ticker(symbol, session=_yahoo_session).info,
-        description=f"yfinance info fetch for '{symbol}'",
+def _fetch_ticker_snapshot_via_yfinance(symbol: str) -> TickerSnapshot:
+    """Primary data source: yf.Ticker(symbol).fast_info for a real-time
+    current price, plus ONE yf.Ticker(symbol).history(period="1y") call for
+    everything else (SMA50/SMA200, 52-week high, and the daily closes the
+    anomaly checks reuse) — deliberately never yf.Ticker(symbol).info,
+    which pulls the full quoteSummary payload and is by far the most
+    rate-limit-prone endpoint yfinance exposes. SMA50/SMA200 are always
+    computed here from the closes ourselves (not read from fast_info's own
+    fifty_day_average/two_hundred_day_average fields), so the calculation
+    is identical regardless of whether this path or the chart API fallback
+    below ends up serving the request.
+    """
+    ticker = yf.Ticker(symbol, session=_yahoo_session)
+
+    history = fetch_with_retry(
+        lambda: ticker.history(period=TICKER_HISTORY_PERIOD),
+        description=f"yfinance {TICKER_HISTORY_PERIOD} history fetch for '{symbol}'",
         max_retries=PRIMARY_FETCH_MAX_RETRIES,
         base_backoff_seconds=PRIMARY_FETCH_BASE_BACKOFF_SECONDS,
     )
+    if history.empty:
+        raise TickerNotFoundError(f"yfinance returned no price history for '{symbol}'")
 
-    raw_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    if not raw_price:
-        raise TickerNotFoundError(f"yfinance returned no price for '{symbol}'")
+    closes = [float(close) for close in history["Close"].tolist() if close is not None]
+    highs = [float(high) for high in history["High"].tolist() if high is not None]
+    if not closes:
+        raise TickerNotFoundError(f"yfinance returned no usable closes for '{symbol}'")
 
-    return (
-        float(raw_price),
-        info.get("fiftyDayAverage"),
-        info.get("twoHundredDayAverage"),
-        info.get("fiftyTwoWeekHigh"),
-    )
+    # fast_info gives a real-time current price (today's row in `history`
+    # can lag/be incomplete mid-session); fall back to the last close if
+    # fast_info is unavailable or raises, so a fast_info hiccup alone never
+    # fails the whole request when history already succeeded.
+    price = closes[-1]
+    high_52: float | None = None
+    try:
+        fast_info = fetch_with_retry(
+            lambda: ticker.fast_info,
+            description=f"yfinance fast_info fetch for '{symbol}'",
+            max_retries=PRIMARY_FETCH_MAX_RETRIES,
+            base_backoff_seconds=PRIMARY_FETCH_BASE_BACKOFF_SECONDS,
+        )
+        raw_price = getattr(fast_info, "last_price", None)
+        if raw_price is not None:
+            price = float(raw_price)
+        raw_year_high = getattr(fast_info, "year_high", None)
+        if raw_year_high is not None:
+            high_52 = float(raw_year_high)
+    except Exception as fast_info_error:  # noqa: BLE001 - best-effort; history's last close/high already cover us
+        print(f"[resilience] fast_info fetch failed for '{symbol}' ({fast_info_error}); using history instead.")
+
+    if high_52 is None and highs:
+        high_52 = max(highs)
+
+    sma50 = sum(closes[-SMA_50_WINDOW:]) / SMA_50_WINDOW if len(closes) >= SMA_50_WINDOW else None
+    sma200 = sum(closes[-SMA_200_WINDOW:]) / SMA_200_WINDOW if len(closes) >= SMA_200_WINDOW else None
+
+    return TickerSnapshot(price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes)
 
 
-def _fetch_raw_quote_via_chart_fallback(
-    symbol: str,
-) -> tuple[float, float | None, float | None, float | None]:
+def _fetch_ticker_snapshot_via_chart_fallback(symbol: str) -> TickerSnapshot:
     """Fallback data source: a direct request to Yahoo's chart endpoint,
-    bypassing yfinance's quoteSummary machinery entirely. SMA50/SMA200 are
-    computed from the returned daily close history since Yahoo doesn't
-    include those fields on this endpoint — but it does include
-    fiftyTwoWeekHigh directly in "meta" (same field, verified live), so
-    that one doesn't need to be recomputed.
+    bypassing yfinance entirely (not just .info) — used when
+    _fetch_ticker_snapshot_via_yfinance's history/fast_info calls fail
+    outright. SMA50/SMA200 are computed from the returned daily close
+    history the same way as the primary path; 52-week high prefers Yahoo's
+    own "fiftyTwoWeekHigh" meta field (accounts for intraday highs) and
+    falls back to the max of the returned daily highs.
 
     Routed through fetch_with_retry just like the primary path, so it gets
     the exact same anti-rate-limit treatment: up to 3 attempts with 2s/4s
@@ -439,13 +540,15 @@ def _fetch_raw_quote_via_chart_fallback(
         result = results[0]
         meta = result.get("meta", {})
         quote = (result.get("indicators", {}).get("quote") or [{}])[0]
-        closes = [close for close in quote.get("close", []) if close is not None]
+        closes = [float(close) for close in quote.get("close", []) if close is not None]
+        highs = [float(high) for high in quote.get("high", []) if high is not None]
 
         price = meta.get("regularMarketPrice")
         if price is None and closes:
             price = closes[-1]
         if price is None:
             raise TickerNotFoundError(f"chart API returned no usable price for '{symbol}'")
+        price = float(price)
     except TickerNotFoundError:
         raise
     except (KeyError, IndexError, TypeError, ValueError) as parse_error:
@@ -453,69 +556,72 @@ def _fetch_raw_quote_via_chart_fallback(
 
     sma50 = sum(closes[-SMA_50_WINDOW:]) / SMA_50_WINDOW if len(closes) >= SMA_50_WINDOW else None
     sma200 = sum(closes[-SMA_200_WINDOW:]) / SMA_200_WINDOW if len(closes) >= SMA_200_WINDOW else None
+
     high_52 = meta.get("fiftyTwoWeekHigh")
+    if high_52 is not None:
+        high_52 = float(high_52)
+    elif highs:
+        high_52 = max(highs)
 
-    return float(price), sma50, sma200, high_52
+    return TickerSnapshot(price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes)
 
 
-def fetch_anomaly_news(ticker_symbol: str, threshold: float = ANOMALY_THRESHOLD_DEFAULT) -> str | None:
+def fetch_anomaly_news(
+    ticker_symbol: str, closes: list[float], threshold: float = ANOMALY_THRESHOLD_DEFAULT
+) -> str | None:
     """Checks whether ticker_symbol moved >= threshold since the prior
     close and, if so, returns a formatted string naming the move plus its
     latest news headlines. Returns None when there's no notable move.
 
-    Adapted from a plain yfinance snippet to actually be safe to run
-    against Yahoo from a cloud host: uses the shared TLS-impersonating
-    session (a bare `yf.Ticker(ticker_symbol)` with no session would skip
-    that entirely and risk the exact 429 blocking this file's resilience
-    layer exists to prevent) and a small retry budget via fetch_with_retry
+    closes comes from the same cached TickerSnapshot get_stock already
+    fetched for the primary price/SMA response — day-over-day % change is
+    scale-invariant, so these can be used as-is even for TASE tickers
+    (still in raw Agorot, unconverted) without this function needing its
+    own separate history call any more. The news fetch itself (only made
+    when the move actually crosses the threshold) still uses the shared
+    TLS-impersonating session and a small retry budget via fetch_with_retry
     instead of an unthrottled direct call.
     """
+    if len(closes) < 2:
+        return None
+
+    prev_close = closes[-2]
+    current_price = closes[-1]
+    if prev_close == 0:
+        return None
+
+    pct_change = (current_price - prev_close) / prev_close
+    if abs(pct_change) < threshold:
+        return None
+
+    direction = "CRASH" if pct_change < 0 else "SURGE"
+
     try:
-        ticker = yf.Ticker(ticker_symbol, session=_yahoo_session)
-
-        hist = fetch_with_retry(
-            lambda: ticker.history(period="5d"),
-            description=f"anomaly history fetch for '{ticker_symbol}'",
-            max_retries=ANOMALY_FETCH_MAX_RETRIES,
-            base_backoff_seconds=ANOMALY_FETCH_BASE_BACKOFF_SECONDS,
-        )
-        if len(hist) < 2:
-            return None
-
-        prev_close = hist["Close"].iloc[-2]
-        current_price = hist["Close"].iloc[-1]
-        pct_change = (current_price - prev_close) / prev_close
-
-        if abs(pct_change) < threshold:
-            return None
-
-        direction = "CRASH" if pct_change < 0 else "SURGE"
-
         news_data = fetch_with_retry(
-            lambda: ticker.news,
+            lambda: yf.Ticker(ticker_symbol, session=_yahoo_session).news,
             description=f"anomaly news fetch for '{ticker_symbol}'",
             max_retries=ANOMALY_FETCH_MAX_RETRIES,
             base_backoff_seconds=ANOMALY_FETCH_BASE_BACKOFF_SECONDS,
         )
-        if not news_data:
-            return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] No recent news found."
-
-        # Verified against the live API: current Yahoo news items nest the
-        # headline under "content" (e.g. article["content"]["title"]), not
-        # as a flat article["title"] — falling back to the flat shape too
-        # in case Yahoo reverts it.
-        headlines = []
-        for article in news_data[:ANOMALY_NEWS_COUNT]:
-            content = article.get("content") or {}
-            title = content.get("title") or article.get("title") or "No Title"
-            headlines.append(title)
-
-        news_str = " | ".join(headlines)
-        return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] NEWS: {news_str}"
-
     except Exception as error:  # noqa: BLE001 - supplementary data; never let this break the main stock response
         print(f"[resilience] Anomaly news fetch failed for '{ticker_symbol}': {error}")
-        return None
+        return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] News fetch failed."
+
+    if not news_data:
+        return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] No recent news found."
+
+    # Verified against the live API: current Yahoo news items nest the
+    # headline under "content" (e.g. article["content"]["title"]), not
+    # as a flat article["title"] — falling back to the flat shape too
+    # in case Yahoo reverts it.
+    headlines = []
+    for article in news_data[:ANOMALY_NEWS_COUNT]:
+        content = article.get("content") or {}
+        title = content.get("title") or article.get("title") or "No Title"
+        headlines.append(title)
+
+    news_str = " | ".join(headlines)
+    return f"[ANOMALY: {direction} {abs(pct_change) * 100:.1f}%] NEWS: {news_str}"
 
 
 def _calculate_std_dev(closes: list[float], window: int = ANOMALY_STD_DEV_WINDOW) -> float | None:
@@ -542,6 +648,7 @@ def check_mean_reversion_anomaly(
     price: float,
     sma50: float | None,
     high_52: float | None,
+    closes: list[float],
     currency_converter: Callable[[float], float] | None = None,
 ) -> str | None:
     """Bifurcated Margin-of-Safety anomaly check for the Ambush Radar / Mean
@@ -550,11 +657,14 @@ def check_mean_reversion_anomaly(
 
     price/sma50/high_52 must already be in the same currency (e.g. already
     USD-converted for TASE tickers — see get_stock) since the structural
-    support trigger compares them directly. The 20-day close history used
-    for the std dev is fetched fresh here in the ticker's raw currency, so
-    currency_converter (get_stock's `to_usd`) is applied to the computed std
-    dev to bring it onto the same basis — valid because standard deviation
-    scales linearly under a zero-intercept conversion like Agorot -> USD.
+    support trigger compares them directly. closes comes from the same
+    cached TickerSnapshot get_stock already fetched (raw/native currency,
+    unconverted) — this function no longer makes its own separate history
+    call for the 20-day std dev the way it used to. currency_converter
+    (get_stock's `to_usd`) is applied to the computed std dev to bring it
+    onto the same basis as price/sma50/high_52 — valid because standard
+    deviation scales linearly under a zero-intercept conversion like
+    Agorot -> USD.
 
     Returns None (not an error) whenever a trigger can't be evaluated at all
     for lack of data (missing/zero 52-week high, missing SMA50, or fewer
@@ -579,17 +689,6 @@ def check_mean_reversion_anomaly(
             )
 
     # Trigger 2: structural support break, SMA50 - (multiplier * 20-day std dev).
-    try:
-        closes = fetch_with_retry(
-            lambda: ticker_history_closes(ticker_symbol),
-            description=f"{ANOMALY_STD_DEV_WINDOW}-day std dev history fetch for '{ticker_symbol}'",
-            max_retries=ANOMALY_FETCH_MAX_RETRIES,
-            base_backoff_seconds=ANOMALY_FETCH_BASE_BACKOFF_SECONDS,
-        )
-    except Exception as error:  # noqa: BLE001 - supplementary data; never let this break the main stock response
-        print(f"[resilience] Std dev history fetch failed for '{ticker_symbol}': {error}")
-        closes = []
-
     std_dev = _calculate_std_dev(closes)
     if std_dev is not None and currency_converter is not None:
         std_dev = currency_converter(std_dev)
@@ -608,18 +707,9 @@ def check_mean_reversion_anomaly(
     return f"[ANOMALY: {asset_type} MEAN REVERSION] " + "; ".join(triggers)
 
 
-def ticker_history_closes(ticker_symbol: str) -> list[float]:
-    """Fetches ANOMALY_HISTORY_PERIOD of daily closes for the 20-day std dev
-    trigger, via the same shared TLS-impersonating session used everywhere
-    else in this file (a bare yf.Ticker() with no session would skip that
-    and risk the 429s the resilience layer exists to prevent)."""
-    history = yf.Ticker(ticker_symbol, session=_yahoo_session).history(period=ANOMALY_HISTORY_PERIOD)
-    return [float(close) for close in history["Close"].tolist()]
-
-
 def _fetch_usd_ils_rate() -> float:
     """Fetch the current USD/ILS exchange rate (shekels per one US dollar),
-    using the 60s cache and the shared retry/throttle layer."""
+    using the shared cache and the shared retry/throttle layer."""
     cached_rate = fx_rate_cache.get(USD_ILS_FX_SYMBOL)
     if cached_rate is not None:
         return cached_rate
@@ -666,52 +756,61 @@ def get_stock(
     # compatible with callers that don't send it yet.
     normalized_asset_type = "ETF" if asset_type.strip().upper() == "ETF" else "Stock"
 
-    # The anomaly check costs extra Yahoo calls (news history, plus a
-    # separate 20-day close history for the std dev trigger below) on top
-    # of the price/SMA fetch, so it's opt-in rather than run on every
-    # request — this endpoint is called constantly (search-select,
-    # portfolio display, pull-to-refresh) and unconditionally adding those
-    # calls would work against the rate-limiting this file exists to
-    # enforce. The cache key includes both the flag and the asset type
-    # (since the bifurcated thresholds mean the same ticker can produce a
-    # different anomaly string per asset type) so response shapes never
-    # collide.
+    # The formatted-response cache covers the fully-assembled JSON
+    # (including the anomaly checks below, which is why the flag/asset type
+    # are part of the key — the bifurcated thresholds mean the same ticker
+    # can produce a different anomaly string per asset type).
     cache_key = f"{symbol}:anomaly:{normalized_asset_type}" if include_anomaly else symbol
     cached_result = stock_cache.get(cache_key)
     if cached_result is not None:
         return cached_result
 
-    try:
-        raw_price, raw_sma50, raw_sma200, raw_high_52 = _fetch_raw_quote_via_yfinance(symbol)
-    except TickerNotFoundError:
-        # A clean "not found" from yfinance itself is still worth
-        # double-checking against the fallback, since yfinance being
-        # blocked can sometimes surface as an empty/missing-price result
-        # rather than a raised network error.
-        raw_price = raw_sma50 = raw_sma200 = raw_high_52 = None
-    except Exception as primary_error:  # noqa: BLE001 - yfinance raises many different error types
-        print(f"[resilience] yfinance failed for '{symbol}' ({primary_error}); trying chart API fallback.")
-        raw_price = raw_sma50 = raw_sma200 = raw_high_52 = None
-
-    if raw_price is None:
+    # THE SPEED FIX: check TICKER_CACHE before making any outbound Yahoo
+    # call at all. A hit here means this request costs zero network calls,
+    # regardless of whether it's also a stock_cache miss (e.g. a first-time
+    # include_anomaly=True request for a ticker whose plain price was
+    # already fetched and cached moments ago by a different screen).
+    snapshot = _get_cached_ticker_snapshot(symbol)
+    if snapshot is None:
         try:
-            raw_price, raw_sma50, raw_sma200, raw_high_52 = _fetch_raw_quote_via_chart_fallback(symbol)
-        except TickerNotFoundError as not_found_error:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No market data found for ticker '{symbol}'.",
-            ) from not_found_error
-        except Exception as fallback_error:  # noqa: BLE001 - network/parse errors from the fallback request
-            # Both data sources failed: return a clean, formatted JSON
-            # error instead of letting an unhandled exception surface as
-            # an opaque 502 from the platform (Render) itself.
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Failed to fetch data for ticker '{symbol}' from both yfinance and "
-                    f"the direct chart API fallback: {fallback_error}"
-                ),
-            ) from fallback_error
+            snapshot = _fetch_ticker_snapshot_via_yfinance(symbol)
+        except TickerNotFoundError:
+            # A clean "not found" from yfinance itself is still worth
+            # double-checking against the fallback, since yfinance being
+            # blocked can sometimes surface as an empty/missing-price result
+            # rather than a raised network error.
+            snapshot = None
+        except Exception as primary_error:  # noqa: BLE001 - yfinance raises many different error types
+            print(f"[resilience] yfinance failed for '{symbol}' ({primary_error}); trying chart API fallback.")
+            snapshot = None
+
+        if snapshot is None:
+            try:
+                snapshot = _fetch_ticker_snapshot_via_chart_fallback(symbol)
+            except TickerNotFoundError as not_found_error:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No market data found for ticker '{symbol}'.",
+                ) from not_found_error
+            except Exception as fallback_error:  # noqa: BLE001 - network/parse errors from the fallback request
+                # Both data sources failed: return a clean, formatted JSON
+                # error instead of letting an unhandled exception surface as
+                # an opaque 502 from the platform (Render) itself.
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Failed to fetch data for ticker '{symbol}' from both yfinance and "
+                        f"the direct chart API fallback: {fallback_error}"
+                    ),
+                ) from fallback_error
+
+        _set_cached_ticker_snapshot(symbol, snapshot)
+
+    raw_price = snapshot.price
+    raw_sma50 = snapshot.sma50
+    raw_sma200 = snapshot.sma200
+    raw_high_52 = snapshot.high_52
+    closes = snapshot.closes
 
     if symbol.endswith(TASE_TICKER_SUFFIX):
         # Strict handling: if we can't get a trustworthy FX rate, refuse to
@@ -771,7 +870,7 @@ def get_stock(
     }
 
     if include_anomaly:
-        result["anomaly"] = fetch_anomaly_news(symbol)
+        result["anomaly"] = fetch_anomaly_news(symbol, closes=closes)
         # JSON EXPORT: the bifurcated Margin-of-Safety trigger is appended
         # under its own key, alongside (not replacing) the existing
         # day-over-day move detector above, so the frontend Intel modal can
@@ -782,6 +881,7 @@ def get_stock(
             price,
             sma50,
             high_52,
+            closes=closes,
             currency_converter=to_usd_strict,
         )
 
