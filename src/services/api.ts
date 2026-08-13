@@ -48,6 +48,39 @@ export type IntelBatchResponse = {
 // Production FastAPI backend (see /backend), deployed on Render.
 const API_BASE_URL = 'https://pipeline-app-1a68.onrender.com';
 
+// Concurrency ceiling for fetchInChunks below: a Promise.all()/allSettled()
+// over an entire watchlist fires every request at once — for a portfolio
+// of a dozen-plus tickers that's a dozen-plus simultaneous connections,
+// which overwhelms slower/cellular connections and trips request timeouts
+// long before any individual ticker fetch would time out on its own.
+const DEFAULT_CHUNK_SIZE = 4;
+
+// Processes `items` through `fetchItem` in fixed-size concurrent batches —
+// never more than `chunkSize` requests in flight at once — awaiting each
+// batch fully before starting the next. Returns one PromiseSettledResult
+// per item, in the same order as `items`, so this is a drop-in replacement
+// for `Promise.allSettled(items.map(fetchItem))`: existing
+// `results.forEach((result, index) => ...)` call sites work unchanged.
+// Callers that need the loading state to reflect "everything resolved"
+// (not just one batch) should simply await the whole call, same as they
+// already await Promise.allSettled — the returned promise doesn't settle
+// until every batch, not just the first, has completed.
+export async function fetchInChunks<TItem, TResult>(
+  items: TItem[],
+  fetchItem: (item: TItem) => Promise<TResult>,
+  chunkSize: number = DEFAULT_CHUNK_SIZE,
+): Promise<PromiseSettledResult<TResult>[]> {
+  const results: PromiseSettledResult<TResult>[] = [];
+
+  for (let start = 0; start < items.length; start += chunkSize) {
+    const chunk = items.slice(start, start + chunkSize);
+    const chunkResults = await Promise.allSettled(chunk.map(fetchItem));
+    results.push(...chunkResults);
+  }
+
+  return results;
+}
+
 export async function fetchStockData(ticker: string): Promise<StockQuote> {
   const normalizedTicker = ticker.trim().toUpperCase();
 

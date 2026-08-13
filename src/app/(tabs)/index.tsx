@@ -34,7 +34,13 @@ import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { SATELLITE_ETF_TS_PCT, SATELLITE_STOCK_TS_PCT } from '@/constants/thresholds';
 import { usePipelineTheme } from '@/contexts/theme-context';
-import { fetchIntel, fetchStockData, type IntelBatchResponse, type StockQuote } from '@/services/api';
+import {
+  fetchInChunks,
+  fetchIntel,
+  fetchStockData,
+  type IntelBatchResponse,
+  type StockQuote,
+} from '@/services/api';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
@@ -256,7 +262,12 @@ export default function PortfolioScreen() {
         return;
       }
 
-      const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
+      // CONCURRENCY LIMITING: fetched in small batches (not one giant
+      // Promise.allSettled over the whole portfolio at once) to avoid
+      // overwhelming the network with N simultaneous connections — this
+      // still awaits the full queue before moving on, so isInitializing
+      // below only flips to false once every batch has resolved.
+      const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
 
       const loadedStocks: PortfolioStock[] = [];
       results.forEach((result, index) => {
@@ -417,7 +428,9 @@ export default function PortfolioScreen() {
     setRefreshing(true);
     try {
       const tickersToRefresh = stocks.map((stock) => stock.ticker);
-      const results = await Promise.allSettled(tickersToRefresh.map((t) => fetchStockData(t)));
+      // CONCURRENCY LIMITING: see loadInitialStocks above — small batches,
+      // not one Promise.allSettled over the whole list.
+      const results = await fetchInChunks(tickersToRefresh, (t) => fetchStockData(t));
 
       const freshQuotes = new Map<string, StockQuote>();
       results.forEach((result, index) => {
@@ -466,9 +479,8 @@ export default function PortfolioScreen() {
     try {
       const ambushEntries = (await loadAmbushTickerEntries()) ?? [];
 
-      const ambushResults = await Promise.allSettled(
-        ambushEntries.map((entry) => fetchStockData(entry.ticker)),
-      );
+      // CONCURRENCY LIMITING: see loadInitialStocks above.
+      const ambushResults = await fetchInChunks(ambushEntries, (entry) => fetchStockData(entry.ticker));
 
       const ambushStocks: Stock[] = [];
       ambushResults.forEach((result, index) => {
@@ -535,9 +547,8 @@ export default function PortfolioScreen() {
       // Update this screen's own live state immediately (mirrors the
       // initial-load flow); Ambush Radar's separate mounted screen picks up
       // its half of the restore the next time its tab gains focus.
-      const results = await Promise.allSettled(
-        payload.portfolio.map((entry) => fetchStockData(entry.ticker)),
-      );
+      // CONCURRENCY LIMITING: see loadInitialStocks above.
+      const results = await fetchInChunks(payload.portfolio, (entry) => fetchStockData(entry.ticker));
 
       const hydratedStocks: PortfolioStock[] = [];
       results.forEach((result, index) => {
@@ -757,10 +768,12 @@ export default function PortfolioScreen() {
                 // Android's native SwipeRefreshLayout circle carries its own
                 // baked-in drop shadow/elevation that colors={['transparent']}
                 // + progressBackgroundColor="transparent" can't fully hide —
-                // it still shows as a faint smudge in Light Mode. Pushing the
-                // whole progress view off-screen is what actually eliminates
-                // it, leaving PullToRefreshLogo as the only visible indicator.
-                progressViewOffset={-50}
+                // it still shows as a faint smudge in Light Mode. -500 pushes
+                // it completely off the top of the screen; refreshing/
+                // onRefresh stay wired normally so the pull gesture itself
+                // still works exactly as before — only the native visual is
+                // banished, leaving PullToRefreshLogo as the sole indicator.
+                progressViewOffset={-500}
               />
             }
           />

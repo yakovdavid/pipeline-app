@@ -22,7 +22,7 @@ import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineTheme } from '@/contexts/theme-context';
-import { fetchStockData, type StockQuote } from '@/services/api';
+import { fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
@@ -96,7 +96,12 @@ export default function AmbushRadarScreen() {
           return;
         }
 
-        const results = await Promise.allSettled(entries.map((entry) => fetchStockData(entry.ticker)));
+        // CONCURRENCY LIMITING: fetched in small batches (not one giant
+        // Promise.allSettled over the whole watchlist at once) to avoid
+        // overwhelming the network with N simultaneous connections — this
+        // still awaits the full queue before moving on, so isInitializing
+        // below only flips to false once every batch has resolved.
+        const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
 
         const loadedStocks: Stock[] = [];
         results.forEach((result, index) => {
@@ -217,7 +222,9 @@ export default function AmbushRadarScreen() {
     setRefreshing(true);
     try {
       const tickersToRefresh = stocks.map((stock) => stock.ticker);
-      const results = await Promise.allSettled(tickersToRefresh.map((t) => fetchStockData(t)));
+      // CONCURRENCY LIMITING: see loadStocks above — small batches, not one
+      // Promise.allSettled over the whole list.
+      const results = await fetchInChunks(tickersToRefresh, (t) => fetchStockData(t));
 
       // Map successful results back by ticker (rather than by index) so a
       // concurrent add/delete during the fetch can't misalign the data.
@@ -333,10 +340,12 @@ export default function AmbushRadarScreen() {
                 // Android's native SwipeRefreshLayout circle carries its own
                 // baked-in drop shadow/elevation that colors={['transparent']}
                 // + progressBackgroundColor="transparent" can't fully hide —
-                // it still shows as a faint smudge in Light Mode. Pushing the
-                // whole progress view off-screen is what actually eliminates
-                // it, leaving PullToRefreshLogo as the only visible indicator.
-                progressViewOffset={-50}
+                // it still shows as a faint smudge in Light Mode. -500 pushes
+                // it completely off the top of the screen; refreshing/
+                // onRefresh stay wired normally so the pull gesture itself
+                // still works exactly as before — only the native visual is
+                // banished, leaving PullToRefreshLogo as the sole indicator.
+                progressViewOffset={-500}
               />
             }
           />
