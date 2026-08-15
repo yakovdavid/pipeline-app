@@ -1,5 +1,14 @@
 export type StockQuote = {
+  // Multi-Currency engine: normalized to USD by the backend — this is the
+  // ONLY field allocation math (portfolio totals, layer percentages,
+  // drawdowns, trailing stops) may ever use, so a Shekel-quoted TASE
+  // position and a Dollar-quoted US one can be summed together correctly.
   price: number;
+  // The instrument's own actual local-currency value (e.g. 13.48) and the
+  // symbol to display it with ('$' or '₪') — for on-screen display only,
+  // never for math. See StockCard/PortfolioStockRow.
+  localPrice: number;
+  currencySymbol: string;
   // Yahoo Finance doesn't always publish these for every instrument (e.g. a
   // very newly listed ticker), so the backend passes that absence through
   // as null rather than failing the whole request.
@@ -110,6 +119,8 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
     anomaly?: string | null;
     high_52?: number | null;
     drawdown_pct?: number | null;
+    local_price?: number | null;
+    currency_symbol?: string | null;
   };
 
   if (typeof data.price !== 'number') {
@@ -118,6 +129,11 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
 
   return {
     price: data.price,
+    // Fall back to the USD price / '$' if an older backend response
+    // doesn't include these yet, rather than throwing — display-only
+    // fields degrading gracefully is preferable to breaking the fetch.
+    localPrice: typeof data.local_price === 'number' ? data.local_price : data.price,
+    currencySymbol: typeof data.currency_symbol === 'string' ? data.currency_symbol : '$',
     sma50: typeof data.sma50 === 'number' ? data.sma50 : null,
     sma200: typeof data.sma200 === 'number' ? data.sma200 : null,
     anomalyReport: typeof data.anomaly === 'string' ? data.anomaly : null,

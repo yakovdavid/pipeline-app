@@ -1,6 +1,7 @@
 import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
+import { ASSET_TYPE_LABEL_HE } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineTheme } from '@/contexts/theme-context';
@@ -9,7 +10,14 @@ import type { AssetType } from '@/types/asset';
 export type Stock = {
   ticker: string;
   assetType: AssetType;
+  // Multi-Currency engine: normalized to USD by the backend — used for the
+  // Bullish/Bearish trend comparison against sma50/sma200 below (also
+  // USD-normalized), never mixed with localPrice.
   price: number;
+  // The instrument's own actual local-currency value and the symbol to
+  // display it with ('$' or '₪') — display-only.
+  localPrice: number;
+  currencySymbol: string;
   // Nullable: Yahoo Finance doesn't always publish these for every
   // instrument, so a missing value degrades the UI instead of failing it.
   sma50: number | null;
@@ -45,7 +53,7 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
   const { colors, isDarkMode } = usePipelineTheme();
   const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
 
-  const { ticker, assetType, price, sma50, sma200 } = stock;
+  const { ticker, assetType, price, localPrice, currencySymbol, sma50, sma200 } = stock;
 
   // ETFs are judged against the longer 200-day trend; individual stocks
   // keep the original 50-day mean-reversion rule.
@@ -61,24 +69,32 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
       {isNearStructuralStop && (
         <View style={styles.warningBanner}>
           <Text style={styles.warningBannerText}>
-            ⚠ Structural Stop Warning: within 2% of SMA200 support
+            ⚠ אזהרת עצירה מבנית: במרחק 2% מתמיכת ממוצע 200 יום
           </Text>
         </View>
       )}
 
       <View style={styles.row}>
         <View style={styles.tickerGroup}>
+          {/* Ticker symbol: always LTR, regardless of app language — it's
+              an identifier, not translatable text. */}
           <Text style={styles.ticker}>{ticker}</Text>
           <View style={styles.assetTypeBadge}>
-            <Text style={styles.assetTypeBadgeText}>{assetType}</Text>
+            <Text style={styles.assetTypeBadgeText}>{ASSET_TYPE_LABEL_HE[assetType]}</Text>
           </View>
         </View>
         <View style={styles.priceGroup}>
-          <Text style={styles.price}>${price.toFixed(2)}</Text>
+          {/* MULTI-CURRENCY DISPLAY: the instrument's own local-currency
+              value (e.g. ₪13.48), never the USD-normalized `price` used for
+              math — see the Stock type above. Numeric, so left as LTR. */}
+          <Text style={styles.price}>
+            {currencySymbol}
+            {localPrice.toFixed(2)}
+          </Text>
           <TouchableOpacity
             onPress={() => onDelete(ticker)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel={`Remove ${ticker} from watchlist`}>
+            accessibilityLabel={`הסר את ${ticker} מרשימת המעקב`}>
             <Text style={styles.deleteButtonText}>✕</Text>
           </TouchableOpacity>
         </View>
@@ -105,7 +121,7 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
             },
           ]}>
           <Text style={styles.badgeText}>
-            {!hasTrendData ? 'N/A' : isBullish ? 'Bullish' : 'Bearish'}
+            {!hasTrendData ? 'לא זמין' : isBullish ? 'עולה' : 'יורד'}
           </Text>
         </View>
       </View>
@@ -129,7 +145,7 @@ type MomentumBarProps = {
 // read rather than calling usePipelineTheme() again itself.
 function MomentumBar({ price, sma50, sma200, isBullish, colors, styles }: MomentumBarProps) {
   if (sma50 === null || sma200 === null) {
-    return <Text style={styles.momentumFallbackText}>Insufficient SMA data</Text>;
+    return <Text style={styles.momentumFallbackText}>אין מספיק נתוני ממוצע נע</Text>;
   }
 
   // The dot's position on the track is intentionally still dynamic — it
@@ -209,6 +225,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.warningText,
       fontSize: 12,
       fontWeight: '700',
+      // RTL LOCALIZATION: standard Hebrew label text reads right-to-left;
+      // numeric values/ticker symbols elsewhere are deliberately left at
+      // their default (LTR) alignment instead — see the ticker/price
+      // styles below.
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     row: {
       flexDirection: 'row',
@@ -225,9 +247,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       gap: 8,
     },
     ticker: {
+      // Ticker symbols stay LTR regardless of app language — they're
+      // identifiers, not translatable text (per the RTL localization spec).
       color: colors.textPrimary,
       fontSize: 18,
       fontWeight: '700',
+      writingDirection: 'ltr',
     },
     assetTypeBadge: {
       backgroundColor: colors.background,
@@ -239,6 +264,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textSecondary,
       fontSize: 10,
       fontWeight: '700',
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     priceGroup: {
       flexDirection: 'row',
@@ -246,9 +273,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       gap: 12,
     },
     price: {
+      // Numeric/currency value: kept LTR per the RTL localization spec,
+      // regardless of the '$'/'₪' currency symbol prefixing it.
       color: colors.textPrimary,
       fontSize: 18,
       fontWeight: '600',
+      writingDirection: 'ltr',
     },
     deleteButtonText: {
       color: colors.bearish,
@@ -265,6 +295,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textPrimary,
       fontSize: 12,
       fontWeight: '700',
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     momentumContainer: {
       flex: 1,
@@ -273,6 +305,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       flex: 1,
       color: colors.textSecondary,
       fontSize: 13,
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     momentumTrack: {
       height: 6,

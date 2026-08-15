@@ -19,7 +19,16 @@ export type PortfolioTickerEntry = {
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {
+  // Multi-Currency engine: normalized to USD by the backend. This is the
+  // ONLY field portfolio-total/layer-allocation math may use — mixing in
+  // localPrice (a Shekel value for TASE positions) would silently corrupt
+  // every sum it touches.
   price: number;
+  // The instrument's own actual local-currency value and the symbol to
+  // display it with ('$' or '₪') — display-only, live/ephemeral like price
+  // itself, never persisted.
+  localPrice: number;
+  currencySymbol: string;
   // Anomaly News Fetcher output: live/ephemeral, re-fetched every time —
   // never persisted, since a stale anomaly note from a prior day would be
   // actively misleading.

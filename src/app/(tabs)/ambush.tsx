@@ -35,9 +35,9 @@ const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
   { ticker: 'TSLA', assetType: 'Stock' },
 ];
 
-// "Ambush Radar" tracks stocks and ETFs against their trend to surface
-// mean-reversion opportunities: stocks are judged against SMA50, ETFs
-// against the longer SMA200 (see StockCard for the trend rule itself).
+// "Ambush Radar" (מכ"ם מארבים) tracks stocks and ETFs against their trend to
+// surface mean-reversion opportunities: stocks are judged against SMA50,
+// ETFs against the longer SMA200 (see StockCard for the trend rule itself).
 export default function AmbushRadarScreen() {
   const { colors, isDarkMode } = usePipelineTheme();
   const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
@@ -198,8 +198,8 @@ export default function AmbushRadarScreen() {
       setTicker('');
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : `Failed to fetch data for ${normalizedTicker}.`;
-      Alert.alert('Could Not Add Ticker', message);
+        error instanceof Error ? error.message : `שליפת הנתונים עבור ${normalizedTicker} נכשלה.`;
+      Alert.alert('לא ניתן להוסיף טיקר', message);
     } finally {
       setIsAdding(false);
     }
@@ -254,9 +254,9 @@ export default function AmbushRadarScreen() {
 
     try {
       await Clipboard.setStringAsync(report);
-      Alert.alert('Copied', 'Ambush Radar data copied to clipboard.');
+      Alert.alert('הועתק', 'נתוני מכ״ם המארבים הועתקו ללוח.');
     } catch {
-      Alert.alert('Copy Failed', 'Could not copy Ambush Radar data to the clipboard.');
+      Alert.alert('ההעתקה נכשלה', 'לא ניתן היה להעתיק את נתוני מכ״ם המארבים ללוח.');
     }
   };
 
@@ -265,12 +265,12 @@ export default function AmbushRadarScreen() {
       <StatusBar style={isDarkMode ? 'light' : 'dark'} />
 
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Ambush Radar</Text>
+        <Text style={styles.headerTitle}>מכ״ם מארבים</Text>
       </View>
 
       <View style={styles.exportRow}>
         <TouchableOpacity style={styles.exportButton} onPress={handleCopyAmbushData}>
-          <Text style={styles.exportButtonText}>Copy Ambush Data</Text>
+          <Text style={styles.exportButtonText}>העתק נתוני מארב</Text>
         </TouchableOpacity>
       </View>
 
@@ -292,7 +292,7 @@ export default function AmbushRadarScreen() {
             selectedAssetType === 'Stock' && { backgroundColor: colors.bullish },
           ]}
           onPress={() => setSelectedAssetType('Stock')}>
-          <Text style={styles.assetTypeButtonText}>Stock</Text>
+          <Text style={styles.assetTypeButtonText}>מניה</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[
@@ -301,7 +301,7 @@ export default function AmbushRadarScreen() {
             selectedAssetType === 'ETF' && { backgroundColor: colors.core },
           ]}
           onPress={() => setSelectedAssetType('ETF')}>
-          <Text style={styles.assetTypeButtonText}>ETF</Text>
+          <Text style={styles.assetTypeButtonText}>תעודת סל</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.addButton, isAdding && styles.addButtonDisabled]}
@@ -310,7 +310,7 @@ export default function AmbushRadarScreen() {
           {isAdding ? (
             <ActivityIndicator size="small" color={colors.textPrimary} />
           ) : (
-            <Text style={styles.addButtonText}>Add</Text>
+            <Text style={styles.addButtonText}>הוסף</Text>
           )}
         </TouchableOpacity>
       </View>
@@ -318,7 +318,7 @@ export default function AmbushRadarScreen() {
       {isInitializing ? (
         <View style={styles.initializingContainer}>
           <PullToRefreshLogo isRefreshing overlay={false} />
-          <Text style={styles.initializingText}>Loading your watchlist...</Text>
+          <Text style={styles.initializingText}>טוען את רשימת המעקב שלך...</Text>
         </View>
       ) : (
         <View style={styles.listWrapper}>
@@ -371,9 +371,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       paddingVertical: 12,
     },
     headerTitle: {
+      // RTL LOCALIZATION: standard Hebrew label text is right-aligned;
+      // numeric values/ticker symbols elsewhere are deliberately left at
+      // their default (LTR) alignment instead (see StockCard.tsx).
       color: colors.textPrimary,
       fontSize: 28,
       fontWeight: '700',
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     exportRow: {
       paddingHorizontal: 16,
@@ -398,6 +403,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textPrimary,
       fontSize: 14,
       fontWeight: '600',
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     inputRow: {
       flexDirection: 'row',
@@ -426,6 +433,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textPrimary,
       fontSize: 14,
       fontWeight: '600',
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     addButton: {
       backgroundColor: colors.bullish,
@@ -443,6 +452,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textPrimary,
       fontSize: 16,
       fontWeight: '700',
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
     listWrapper: {
       flex: 1,
@@ -459,6 +470,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     initializingText: {
       color: colors.textSecondary,
       fontSize: 14,
+      textAlign: 'right',
+      writingDirection: 'rtl',
     },
   });
 }

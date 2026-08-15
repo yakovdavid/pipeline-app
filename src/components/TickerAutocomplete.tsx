@@ -51,7 +51,7 @@ export function TickerAutocomplete({
         style={styles.input}
         value={value}
         onChangeText={onChangeText}
-        placeholder="Add ticker (e.g. MSFT)"
+        placeholder="הוסף טיקר (למשל MSFT)"
         placeholderTextColor={colors.textSecondary}
         autoCapitalize="characters"
         autoCorrect={false}
@@ -96,12 +96,15 @@ function createStyles(colors: PipelineColorScheme) {
       zIndex: 10,
     },
     input: {
+      // Ticker symbols are typed/displayed LTR regardless of app language
+      // — they're identifiers, not translatable text.
       backgroundColor: colors.cardBackground,
       color: colors.textPrimary,
       borderRadius: 8,
       paddingHorizontal: 12,
       paddingVertical: 10,
       fontSize: 16,
+      writingDirection: 'ltr',
     },
     dropdown: {
       position: 'absolute',

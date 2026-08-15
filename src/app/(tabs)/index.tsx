@@ -30,6 +30,7 @@ import { StatusBar } from 'expo-status-bar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
+import { ASSET_TYPE_LABEL_HE, CATEGORY_LABEL_HE, CATEGORY_TARGET_PCT } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { SATELLITE_ETF_TS_PCT, SATELLITE_STOCK_TS_PCT } from '@/constants/thresholds';
@@ -50,6 +51,9 @@ import { normalizeTickerInput } from '@/utils/ticker';
 
 type FilterOption = 'All' | PortfolioCategory;
 const FILTER_OPTIONS: FilterOption[] = ['All', 'Core', 'Satellite', 'Quality'];
+// Display-only Hebrew labels for the filter chips — FilterOption itself
+// (and the comparisons against activeFilter) stay in English.
+const FILTER_LABEL_HE: Record<FilterOption, string> = { All: 'הכל', ...CATEGORY_LABEL_HE };
 
 // Snap points for the Intel modal's draggable bottom sheet, expressed as
 // pixel heights (not percentages) so PanResponder math below can work with
@@ -100,6 +104,30 @@ function getSatelliteTrailingStopPct(assetType: AssetType): number {
   return assetType === 'ETF' ? SATELLITE_ETF_TS_PCT : SATELLITE_STOCK_TS_PCT;
 }
 
+// ALLOCATION STATUS: builds the "<layer> (יעד: X% | מצוי: Y%) - N נכסים"
+// section-header string — target (יעד) from the fixed Fortress 2.0 Model
+// (CATEGORY_TARGET_PCT), actual (מצוי) computed live from this layer's
+// share of the whole portfolio's value, and N the number of tickers in it.
+//
+// Both categoryStocks' contribution and totalPortfolioValue MUST be
+// computed from `stock.price` (USD-normalized by the backend's
+// Multi-Currency engine) — never `stock.localPrice`. Summing a Shekel
+// value and a Dollar value directly would silently corrupt every
+// percentage this produces; that's the exact "mathematical flaw" the
+// Multi-Currency engine exists to fix.
+function buildSectionTitle(
+  category: PortfolioCategory,
+  categoryStocks: PortfolioStock[],
+  totalPortfolioValue: number,
+): string {
+  const categoryValue = categoryStocks.reduce((sum, stock) => sum + stock.units * stock.price, 0);
+  const actualPct = totalPortfolioValue > 0 ? (categoryValue / totalPortfolioValue) * 100 : 0;
+  return (
+    `${CATEGORY_LABEL_HE[category]} (יעד: ${CATEGORY_TARGET_PCT[category]}% | ` +
+    `מצוי: ${actualPct.toFixed(1)}%) - ${categoryStocks.length} נכסים`
+  );
+}
+
 // The Fortress 2.0 Model: a 70/20/10 allocation across Core, Satellites, and
 // Quality positions.
 export default function PortfolioScreen() {
@@ -148,7 +176,7 @@ export default function PortfolioScreen() {
 
   const renderPortfolioSectionFooter = useCallback(
     ({ section }: { section: PortfolioListSection }) =>
-      section.data.length === 0 ? <Text style={styles.sectionEmptyText}>No positions yet.</Text> : null,
+      section.data.length === 0 ? <Text style={styles.sectionEmptyText}>אין עדיין פוזיציות.</Text> : null,
     [styles],
   );
 
@@ -276,6 +304,8 @@ export default function PortfolioScreen() {
           loadedStocks.push({
             ...entry,
             price: result.value.price,
+            localPrice: result.value.localPrice,
+            currencySymbol: result.value.currencySymbol,
             anomalyReport: result.value.anomalyReport,
             high52: result.value.high52,
             drawdownPct: result.value.drawdownPct,
@@ -342,7 +372,7 @@ export default function PortfolioScreen() {
 
     const parsedUnits = Number(units);
     if (!Number.isFinite(parsedUnits) || parsedUnits <= 0) {
-      Alert.alert('Invalid Units', 'Please enter a positive number of units.');
+      Alert.alert('יחידות לא תקינות', 'נא להזין מספר יחידות חיובי.');
       return;
     }
 
@@ -362,6 +392,8 @@ export default function PortfolioScreen() {
           assetType: selectedAssetType,
           units: parsedUnits,
           price: quote.price,
+          localPrice: quote.localPrice,
+          currencySymbol: quote.currencySymbol,
           anomalyReport: quote.anomalyReport,
           high52: quote.high52,
           drawdownPct: quote.drawdownPct,
@@ -373,8 +405,8 @@ export default function PortfolioScreen() {
       setIsAddModalVisible(false);
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : `Failed to fetch data for ${normalizedTicker}.`;
-      Alert.alert('Could Not Add Ticker', message);
+        error instanceof Error ? error.message : `שליפת הנתונים עבור ${normalizedTicker} נכשלה.`;
+      Alert.alert('לא ניתן להוסיף טיקר', message);
     } finally {
       setIsAdding(false);
     }
@@ -448,6 +480,8 @@ export default function PortfolioScreen() {
           return {
             ...stock,
             price: freshQuote.price,
+            localPrice: freshQuote.localPrice,
+            currencySymbol: freshQuote.currencySymbol,
             anomalyReport: freshQuote.anomalyReport,
             high52: freshQuote.high52,
             drawdownPct: freshQuote.drawdownPct,
@@ -468,9 +502,9 @@ export default function PortfolioScreen() {
 
     try {
       await Clipboard.setStringAsync(report);
-      Alert.alert('Copied', 'Portfolio data copied to clipboard.');
+      Alert.alert('הועתק', 'נתוני התיק הועתקו ללוח.');
     } catch {
-      Alert.alert('Copy Failed', 'Could not copy Portfolio data to the clipboard.');
+      Alert.alert('ההעתקה נכשלה', 'לא ניתן היה להעתיק את נתוני התיק ללוח.');
     }
   };
 
@@ -501,11 +535,11 @@ export default function PortfolioScreen() {
       ].join('\n');
 
       await Clipboard.setStringAsync(report);
-      Alert.alert('Copied', 'Combined Portfolio and Ambush Radar data copied to clipboard.');
+      Alert.alert('הועתק', 'נתוני התיק והמארב הועתקו יחד ללוח.');
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : 'Failed to build the combined data export.';
-      Alert.alert('Copy Failed', message);
+        error instanceof Error ? error.message : 'יצירת ייצוא הנתונים המשולב נכשלה.';
+      Alert.alert('ההעתקה נכשלה', message);
     } finally {
       setIsExportingAll(false);
     }
@@ -517,12 +551,12 @@ export default function PortfolioScreen() {
       const payload = await createBackupPayload();
       await Clipboard.setStringAsync(JSON.stringify(payload));
       Alert.alert(
-        'Backup Exported',
-        'Your Portfolio and Ambush Radar data has been copied to the clipboard as JSON. Paste it somewhere safe.',
+        'הגיבוי יוצא',
+        'נתוני התיק והמארב הועתקו ללוח כ-JSON. הדבק אותם במקום בטוח.',
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to export backup.';
-      Alert.alert('Export Failed', message);
+      const message = error instanceof Error ? error.message : 'ייצוא הגיבוי נכשל.';
+      Alert.alert('הייצוא נכשל', message);
     } finally {
       setIsExportingBackup(false);
     }
@@ -535,8 +569,8 @@ export default function PortfolioScreen() {
     } catch (error) {
       // Strict, on purpose: abort entirely rather than attempt a partial
       // restore from a backup we can't fully trust.
-      const message = error instanceof Error ? error.message : 'The pasted text is not a valid backup.';
-      Alert.alert('Invalid Backup', message);
+      const message = error instanceof Error ? error.message : 'הטקסט שהודבק אינו גיבוי תקין.';
+      Alert.alert('גיבוי לא תקין', message);
       return;
     }
 
@@ -557,6 +591,8 @@ export default function PortfolioScreen() {
           hydratedStocks.push({
             ...entry,
             price: result.value.price,
+            localPrice: result.value.localPrice,
+            currencySymbol: result.value.currencySymbol,
             anomalyReport: result.value.anomalyReport,
             high52: result.value.high52,
             drawdownPct: result.value.drawdownPct,
@@ -580,17 +616,17 @@ export default function PortfolioScreen() {
             'live price fetch(es) failed; retaining the previously displayed portfolio.',
         );
         Alert.alert(
-          'Backup Restored',
-          'Your data was saved, but live prices could not be fetched right now. Pull to refresh shortly.',
+          'הגיבוי שוחזר',
+          'הנתונים נשמרו, אך לא ניתן היה לטעון מחירים חיים כרגע. משוך לרענון בעוד רגע.',
         );
         return;
       }
 
       setStocks(hydratedStocks);
-      Alert.alert('Backup Restored', 'Your Portfolio and Ambush Radar data has been restored.');
+      Alert.alert('הגיבוי שוחזר', 'נתוני התיק והמארב שוחזרו.');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to restore the backup.';
-      Alert.alert('Restore Failed', message);
+      const message = error instanceof Error ? error.message : 'שחזור הגיבוי נכשל.';
+      Alert.alert('השחזור נכשל', message);
     } finally {
       setIsRestoring(false);
     }
@@ -598,7 +634,7 @@ export default function PortfolioScreen() {
 
   const handleFetchIntel = async () => {
     if (!intelInput.trim()) {
-      Alert.alert('Ticker Required', 'Please enter at least one ticker symbol.');
+      Alert.alert('נדרש טיקר', 'נא להזין לפחות סימול טיקר אחד.');
       return;
     }
 
@@ -610,11 +646,11 @@ export default function PortfolioScreen() {
 
       const hasAnyNews = result.results.some((entry) => entry.news.length > 0);
       if (!hasAnyNews) {
-        Alert.alert('No News Found', 'No recent news was found for the requested ticker(s).');
+        Alert.alert('לא נמצאו חדשות', 'לא נמצאו חדשות אחרונות עבור הטיקרים המבוקשים.');
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to fetch intel.';
-      Alert.alert('Intel Fetch Failed', message);
+      const message = error instanceof Error ? error.message : 'שליפת המודיעין נכשלה.';
+      Alert.alert('שליפת המודיעין נכשלה', message);
     } finally {
       setIsFetchingIntel(false);
     }
@@ -622,7 +658,7 @@ export default function PortfolioScreen() {
 
   const handleOpenArticleLink = (url: string) => {
     Linking.openURL(url).catch(() => {
-      Alert.alert('Could Not Open Link', 'This article link could not be opened.');
+      Alert.alert('לא ניתן לפתוח את הקישור', 'לא ניתן היה לפתוח את קישור הכתבה.');
     });
   };
 
@@ -663,30 +699,39 @@ export default function PortfolioScreen() {
 
     try {
       await Clipboard.setStringAsync(text);
-      Alert.alert('Copied', 'Intel headlines copied to clipboard.');
+      Alert.alert('הועתק', 'כותרות המודיעין הועתקו ללוח.');
     } catch {
-      Alert.alert('Copy Failed', 'Could not copy intel to the clipboard.');
+      Alert.alert('ההעתקה נכשלה', 'לא ניתן היה להעתיק את המודיעין ללוח.');
     }
   };
 
+  // ALLOCATION STATUS: both the per-layer contribution and this grand
+  // total are `units * price` (USD) — never `localPrice` — so a Shekel
+  // TASE position and a Dollar US position sum together correctly. See
+  // buildSectionTitle above for how this feeds the section headers.
+  const coreStocks = stocks.filter((stock) => stock.category === 'Core');
+  const satelliteStocks = stocks.filter((stock) => stock.category === 'Satellite');
+  const qualityStocks = stocks.filter((stock) => stock.category === 'Quality');
+  const totalPortfolioValue = stocks.reduce((sum, stock) => sum + stock.units * stock.price, 0);
+
   const allSections: PortfolioListSection[] = [
     {
-      title: 'Core (70%)',
+      title: buildSectionTitle('Core', coreStocks, totalPortfolioValue),
       category: 'Core',
       accentColor: colors.core,
-      data: stocks.filter((stock) => stock.category === 'Core'),
+      data: coreStocks,
     },
     {
-      title: 'Satellite (20%)',
+      title: buildSectionTitle('Satellite', satelliteStocks, totalPortfolioValue),
       category: 'Satellite',
       accentColor: colors.satellite,
-      data: stocks.filter((stock) => stock.category === 'Satellite'),
+      data: satelliteStocks,
     },
     {
-      title: 'Quality (10%)',
+      title: buildSectionTitle('Quality', qualityStocks, totalPortfolioValue),
       category: 'Quality',
       accentColor: colors.quality,
-      data: stocks.filter((stock) => stock.category === 'Quality'),
+      data: qualityStocks,
     },
   ];
   const visibleSections = allSections.filter(
@@ -698,7 +743,7 @@ export default function PortfolioScreen() {
       <StatusBar style={isDarkMode ? 'light' : 'dark'} />
 
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Portfolio</Text>
+        <Text style={styles.headerTitle}>תיק השקעות</Text>
         <View style={styles.headerActions}>
           {/* Standalone theme toggle, separate from the "More options"
               dropdown — a single-tap action belongs in the header itself,
@@ -707,13 +752,13 @@ export default function PortfolioScreen() {
           <TouchableOpacity
             onPress={toggleTheme}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+            accessibilityLabel={isDarkMode ? 'עבור למצב בהיר' : 'עבור למצב כהה'}>
             <Ionicons name={isDarkMode ? 'moon' : 'sunny'} size={22} color={colors.textPrimary} />
           </TouchableOpacity>
           <TouchableOpacity
             onPress={() => setIsMenuVisible(true)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel="More options">
+            accessibilityLabel="אפשרויות נוספות">
             <Ionicons name="ellipsis-horizontal" size={24} color={colors.textPrimary} />
           </TouchableOpacity>
         </View>
@@ -734,7 +779,7 @@ export default function PortfolioScreen() {
                 styles.filterButtonText,
                 activeFilter === filterOption && styles.filterButtonTextActive,
               ]}>
-              {filterOption}
+              {FILTER_LABEL_HE[filterOption]}
             </Text>
           </TouchableOpacity>
         ))}
@@ -743,7 +788,7 @@ export default function PortfolioScreen() {
       {isInitializing ? (
         <View style={styles.initializingContainer}>
           <PullToRefreshLogo isRefreshing overlay={false} />
-          <Text style={styles.initializingText}>Loading your portfolio...</Text>
+          <Text style={styles.initializingText}>טוען את התיק שלך...</Text>
         </View>
       ) : (
         <View style={styles.listWrapper}>
@@ -783,7 +828,7 @@ export default function PortfolioScreen() {
       <TouchableOpacity
         style={styles.fab}
         onPress={() => setIsAddModalVisible(true)}
-        accessibilityLabel="Add asset to portfolio">
+        accessibilityLabel="הוסף נכס לתיק">
         <Ionicons name="add" size={28} color={colors.textPrimary} />
       </TouchableOpacity>
 
@@ -802,7 +847,7 @@ export default function PortfolioScreen() {
                 setIsMenuVisible(false);
                 handleCopyPortfolioData();
               }}>
-              <Text style={styles.menuItemText}>Copy Portfolio Data</Text>
+              <Text style={styles.menuItemText}>העתק נתוני תיק</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.menuItem}
@@ -814,7 +859,7 @@ export default function PortfolioScreen() {
               {isExportingAll ? (
                 <ActivityIndicator size="small" color={colors.textPrimary} />
               ) : (
-                <Text style={styles.menuItemText}>Copy ALL Data</Text>
+                <Text style={styles.menuItemText}>העתק את כל הנתונים</Text>
               )}
             </TouchableOpacity>
             <View style={styles.menuDivider} />
@@ -829,7 +874,7 @@ export default function PortfolioScreen() {
               {isExportingBackup ? (
                 <ActivityIndicator size="small" color={colors.textPrimary} />
               ) : (
-                <Text style={styles.menuItemText}>Export Backup (JSON)</Text>
+                <Text style={styles.menuItemText}>ייצוא גיבוי (JSON)</Text>
               )}
             </TouchableOpacity>
             <TouchableOpacity
@@ -838,7 +883,7 @@ export default function PortfolioScreen() {
                 setIsMenuVisible(false);
                 setIsImportModalVisible(true);
               }}>
-              <Text style={styles.menuItemText}>Import Backup (JSON)</Text>
+              <Text style={styles.menuItemText}>ייבוא גיבוי (JSON)</Text>
             </TouchableOpacity>
             <View style={styles.menuDivider} />
             {/* Group 3: On-Demand Intel. Theme toggle used to live here as a
@@ -851,7 +896,7 @@ export default function PortfolioScreen() {
                 setIsMenuVisible(false);
                 setIsIntelModalVisible(true);
               }}>
-              <Text style={styles.menuItemText}>On-Demand Intel</Text>
+              <Text style={styles.menuItemText}>מודיעין לפי דרישה</Text>
             </TouchableOpacity>
           </View>
         </Pressable>
@@ -894,11 +939,11 @@ export default function PortfolioScreen() {
             <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
               <View style={styles.addAssetModalCard}>
                 <View style={styles.addModalHeader}>
-                  <Text style={styles.addModalTitle}>Add Asset</Text>
+                  <Text style={styles.addModalTitle}>הוסף נכס</Text>
                   <TouchableOpacity
                     onPress={() => setIsAddModalVisible(false)}
                     hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                    accessibilityLabel="Close">
+                    accessibilityLabel="סגור">
                     <Ionicons name="close" size={22} color={colors.textSecondary} />
                   </TouchableOpacity>
                 </View>
@@ -926,14 +971,14 @@ export default function PortfolioScreen() {
                       style={styles.unitsInput}
                       value={units}
                       onChangeText={setUnits}
-                      placeholder="Units"
+                      placeholder="יחידות"
                       placeholderTextColor={colors.textSecondary}
                       keyboardType="numeric"
                       editable={!isAdding}
                     />
                   </View>
 
-                  <Text style={styles.modalSectionLabel}>Category</Text>
+                  <Text style={styles.modalSectionLabel}>קטגוריה</Text>
                   <View style={styles.categoryRow}>
                     <TouchableOpacity
                       style={[
@@ -942,7 +987,7 @@ export default function PortfolioScreen() {
                         selectedCategory === 'Core' && { backgroundColor: colors.core },
                       ]}
                       onPress={() => setSelectedCategory('Core')}>
-                      <Text style={styles.categoryButtonText}>Core</Text>
+                      <Text style={styles.categoryButtonText}>{CATEGORY_LABEL_HE.Core}</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={[
@@ -951,7 +996,7 @@ export default function PortfolioScreen() {
                         selectedCategory === 'Satellite' && { backgroundColor: colors.satellite },
                       ]}
                       onPress={() => setSelectedCategory('Satellite')}>
-                      <Text style={styles.categoryButtonText}>Satellite</Text>
+                      <Text style={styles.categoryButtonText}>{CATEGORY_LABEL_HE.Satellite}</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={[
@@ -960,11 +1005,11 @@ export default function PortfolioScreen() {
                         selectedCategory === 'Quality' && { backgroundColor: colors.quality },
                       ]}
                       onPress={() => setSelectedCategory('Quality')}>
-                      <Text style={styles.categoryButtonText}>Quality</Text>
+                      <Text style={styles.categoryButtonText}>{CATEGORY_LABEL_HE.Quality}</Text>
                     </TouchableOpacity>
                   </View>
 
-                  <Text style={styles.modalSectionLabel}>Asset Type</Text>
+                  <Text style={styles.modalSectionLabel}>סוג נכס</Text>
                   <View style={styles.assetTypeRow}>
                     <TouchableOpacity
                       style={[
@@ -973,7 +1018,7 @@ export default function PortfolioScreen() {
                         selectedAssetType === 'Stock' && { backgroundColor: colors.bullish },
                       ]}
                       onPress={() => setSelectedAssetType('Stock')}>
-                      <Text style={styles.assetTypeButtonText}>Stock</Text>
+                      <Text style={styles.assetTypeButtonText}>{ASSET_TYPE_LABEL_HE.Stock}</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={[
@@ -982,7 +1027,7 @@ export default function PortfolioScreen() {
                         selectedAssetType === 'ETF' && { backgroundColor: colors.core },
                       ]}
                       onPress={() => setSelectedAssetType('ETF')}>
-                      <Text style={styles.assetTypeButtonText}>ETF</Text>
+                      <Text style={styles.assetTypeButtonText}>{ASSET_TYPE_LABEL_HE.ETF}</Text>
                     </TouchableOpacity>
                   </View>
 
@@ -994,7 +1039,7 @@ export default function PortfolioScreen() {
                       {isAdding ? (
                         <ActivityIndicator size="small" color={colors.textPrimary} />
                       ) : (
-                        <Text style={styles.addButtonText}>Add to Portfolio</Text>
+                        <Text style={styles.addButtonText}>הוסף לתיק</Text>
                       )}
                     </TouchableOpacity>
                   </View>
@@ -1018,22 +1063,22 @@ export default function PortfolioScreen() {
             style={styles.addModalKeyboardAvoider}>
             <View style={styles.addModalSheet}>
               <View style={styles.addModalHeader}>
-                <Text style={styles.addModalTitle}>Import Backup</Text>
+                <Text style={styles.addModalTitle}>ייבוא גיבוי</Text>
                 <TouchableOpacity
                   onPress={() => setIsImportModalVisible(false)}
                   disabled={isRestoring}
                   hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  accessibilityLabel="Close">
+                  accessibilityLabel="סגור">
                   <Ionicons name="close" size={22} color={colors.textSecondary} />
                 </TouchableOpacity>
               </View>
 
-              <Text style={styles.modalSectionLabel}>Paste Backup JSON</Text>
+              <Text style={styles.modalSectionLabel}>הדבק JSON של גיבוי</Text>
               <TextInput
                 style={styles.importTextArea}
                 value={importText}
                 onChangeText={setImportText}
-                placeholder="Paste the JSON copied from Export Backup..."
+                placeholder="הדבק כאן את ה-JSON שהועתק מייצוא הגיבוי..."
                 placeholderTextColor={colors.textSecondary}
                 multiline
                 textAlignVertical="top"
@@ -1051,7 +1096,7 @@ export default function PortfolioScreen() {
                   {isRestoring ? (
                     <ActivityIndicator size="small" color={colors.textPrimary} />
                   ) : (
-                    <Text style={styles.addButtonText}>Restore</Text>
+                    <Text style={styles.addButtonText}>שחזר</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1086,19 +1131,19 @@ export default function PortfolioScreen() {
                 onPress={() => setIsIntelModalVisible(false)}
                 disabled={isFetchingIntel}
                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                accessibilityLabel="Close">
+                accessibilityLabel="סגור">
                 <Ionicons name="close" size={22} color={colors.textSecondary} />
               </TouchableOpacity>
 
-              <Text style={[styles.addModalTitle, styles.intelModalTitle]}>On-Demand Intel</Text>
+              <Text style={[styles.addModalTitle, styles.intelModalTitle]}>מודיעין לפי דרישה</Text>
 
-              <Text style={styles.modalSectionLabel}>Tickers (comma-separated)</Text>
+              <Text style={styles.modalSectionLabel}>טיקרים (מופרדים בפסיקים)</Text>
               <View style={styles.inputRow}>
                 <TextInput
                   style={styles.intelTextInput}
                   value={intelInput}
                   onChangeText={setIntelInput}
-                  placeholder="e.g. PLD, UNH, AMT"
+                  placeholder="לדוגמה: PLD, UNH, AMT"
                   placeholderTextColor={colors.textSecondary}
                   autoCapitalize="characters"
                   autoCorrect={false}
@@ -1113,7 +1158,7 @@ export default function PortfolioScreen() {
                   {isFetchingIntel ? (
                     <ActivityIndicator size="small" color={colors.textPrimary} />
                   ) : (
-                    <Text style={styles.addButtonText}>Fetch Intel</Text>
+                    <Text style={styles.addButtonText}>שלוף מודיעין</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1130,10 +1175,14 @@ export default function PortfolioScreen() {
                       <Text style={styles.intelTickerSectionHeader}>=== {entry.ticker} ===</Text>
 
                       {entry.error ? (
-                        <Text style={styles.intelErrorText}>Error: {entry.error}</Text>
+                        <Text style={styles.intelErrorText}>שגיאה: {entry.error}</Text>
                       ) : entry.news.length === 0 ? (
-                        <Text style={styles.intelEmptyText}>No news found for {entry.ticker}.</Text>
+                        <Text style={styles.intelEmptyText}>לא נמצאו חדשות עבור {entry.ticker}.</Text>
                       ) : (
+                        // Article title/publisher/timestamp are Yahoo's own
+                        // news content (in whatever language the source
+                        // publishes in) — not app UI chrome, so left
+                        // untranslated/at default (LTR) alignment.
                         entry.news.map((article, index) => (
                           <View key={`${entry.ticker}-${index}`} style={styles.intelArticleCard}>
                             <View style={styles.intelArticleHeaderRow}>
@@ -1143,7 +1192,7 @@ export default function PortfolioScreen() {
                             <Text style={styles.intelArticleTitle}>
                               {article.isCritical && (
                                 <Text style={styles.intelCriticalInlineTag}>
-                                  {(article.tag || '[CRITICAL ALERT]') + '  '}
+                                  {(article.tag || '[התראה קריטית]') + '  '}
                                 </Text>
                               )}
                               {article.title}
@@ -1152,7 +1201,7 @@ export default function PortfolioScreen() {
                               <TouchableOpacity
                                 onPress={() => handleOpenArticleLink(article.link)}
                                 hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
-                                <Text style={styles.intelLinkButtonText}>Read Full Article →</Text>
+                                <Text style={styles.intelLinkButtonText}>קרא כתבה מלאה ←</Text>
                               </TouchableOpacity>
                             ) : null}
                           </View>
@@ -1166,7 +1215,7 @@ export default function PortfolioScreen() {
               {intelResult && intelResult.results.length > 0 && (
                 <View style={styles.addRow}>
                   <TouchableOpacity style={styles.addButton} onPress={handleCopyIntel}>
-                    <Text style={styles.addButtonText}>Copy Intel</Text>
+                    <Text style={styles.addButtonText}>העתק מודיעין</Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -1212,7 +1261,13 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const [unitsText, setUnitsText] = useState(String(stock.units));
   const [editedAssetType, setEditedAssetType] = useState<AssetType>(stock.assetType);
 
-  const totalValue = stock.units * stock.price;
+  // MULTI-CURRENCY DISPLAY: this row's own total, shown in the
+  // instrument's own local currency (self-consistent — it's all one
+  // instrument, so there's no cross-currency mixing risk here). This is
+  // NEVER used for portfolio-wide totals/allocation math — that's computed
+  // independently in PortfolioScreen from `stock.price` (USD) alone; see
+  // the IMPORTANT note above allSections there.
+  const localTotalValue = stock.units * stock.localPrice;
   // Trailing stops are a Satellite-only mechanic: Core positions are meant
   // to be held through drawdowns, and Quality positions are risk-reviewed
   // manually (see the drawdown-review styling below) rather than
@@ -1246,7 +1301,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const handleSaveEdit = () => {
     const parsedUnits = Number(unitsText);
     if (!Number.isFinite(parsedUnits) || parsedUnits <= 0) {
-      Alert.alert('Invalid Units', 'Please enter a positive number of units.');
+      Alert.alert('יחידות לא תקינות', 'נא להזין מספר יחידות חיובי.');
       return;
     }
     onSaveEdit(stock.ticker, parsedUnits, editedAssetType);
@@ -1259,15 +1314,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
         <Text style={styles.stockTicker}>{stock.ticker}</Text>
         <View style={styles.stockTopRight}>
           <View style={styles.assetTypeBadge}>
-            <Text style={styles.assetTypeBadgeText}>{stock.assetType}</Text>
+            <Text style={styles.assetTypeBadgeText}>{ASSET_TYPE_LABEL_HE[stock.assetType]}</Text>
           </View>
           <View style={[styles.categoryBadge, { backgroundColor: accentColor }]}>
-            <Text style={styles.categoryBadgeText}>{stock.category}</Text>
+            <Text style={styles.categoryBadgeText}>{CATEGORY_LABEL_HE[stock.category]}</Text>
           </View>
           <TouchableOpacity
             onPress={() => onDelete(stock.ticker)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel={`Remove ${stock.ticker} from portfolio`}>
+            accessibilityLabel={`הסר את ${stock.ticker} מהתיק`}>
             <Text style={styles.deleteButtonText}>✕</Text>
           </TouchableOpacity>
         </View>
@@ -1288,7 +1343,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             <TouchableOpacity
               onPress={handleSaveEdit}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-              accessibilityLabel={`Save changes for ${stock.ticker}`}>
+              accessibilityLabel={`שמור שינויים עבור ${stock.ticker}`}>
               <Ionicons name="checkmark" size={20} color={colors.bullish} />
             </TouchableOpacity>
           </View>
@@ -1300,7 +1355,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 editedAssetType === 'Stock' && { backgroundColor: colors.bullish },
               ]}
               onPress={() => setEditedAssetType('Stock')}>
-              <Text style={styles.editAssetTypeButtonText}>Stock</Text>
+              <Text style={styles.editAssetTypeButtonText}>{ASSET_TYPE_LABEL_HE.Stock}</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[
@@ -1309,45 +1364,60 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 editedAssetType === 'ETF' && { backgroundColor: colors.core },
               ]}
               onPress={() => setEditedAssetType('ETF')}>
-              <Text style={styles.editAssetTypeButtonText}>ETF</Text>
+              <Text style={styles.editAssetTypeButtonText}>{ASSET_TYPE_LABEL_HE.ETF}</Text>
             </TouchableOpacity>
           </View>
         </View>
       ) : (
         <View style={styles.stockBottomRow}>
           <View style={styles.unitsDisplayRow}>
+            {/* MULTI-CURRENCY DISPLAY: the instrument's own local-currency
+                value (e.g. ₪13.48), never the USD-normalized stock.price
+                used for portfolio-wide math — see localTotalValue above. */}
             <Text style={styles.stockDetailText}>
-              {stock.units} unit{stock.units === 1 ? '' : 's'} @ ${stock.price.toFixed(2)}
+              {stock.units} יח&apos; ב-{stock.currencySymbol}
+              {stock.localPrice.toFixed(2)}
             </Text>
             <TouchableOpacity
               onPress={handleStartEditing}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-              accessibilityLabel={`Edit ${stock.ticker}`}>
+              accessibilityLabel={`ערוך את ${stock.ticker}`}>
               <Ionicons name="pencil" size={14} color={colors.textSecondary} />
             </TouchableOpacity>
           </View>
-          <Text style={styles.stockTotalValue}>${totalValue.toFixed(2)}</Text>
+          <Text style={styles.stockTotalValue}>
+            {stock.currencySymbol}
+            {localTotalValue.toFixed(2)}
+          </Text>
         </View>
       )}
 
       {!isEditing && trailingStopPrice !== null && (
+        // Trailing Stop is a computed USD threshold (highestWatermark is
+        // tracked in USD — see computeHighestWatermark above), not a raw
+        // quoted price, so it stays displayed in USD ('$') regardless of
+        // the instrument's own trading currency — converting a derived
+        // threshold back to local currency isn't something the frontend
+        // can do without re-deriving the FX rate itself.
         <Text
           style={[
             styles.trailingStopText,
             isTrailingStopTriggered && styles.trailingStopTriggeredText,
           ]}>
-          {isTrailingStopTriggered ? '⚠ ' : ''}TS Triggered at: ${trailingStopPrice.toFixed(2)}
+          {isTrailingStopTriggered ? '⚠ ' : ''}עצירה נגררת מופעלת ב: ${trailingStopPrice.toFixed(2)}
         </Text>
       )}
 
       {!isEditing && stock.high52 !== null && stock.drawdownPct !== null && (
+        // high52/drawdownPct are already USD-normalized by the backend, so
+        // '$' here too — same reasoning as the trailing stop above.
         <View style={styles.drawdownRow}>
           <Text
             style={[styles.drawdownText, isQualityDrawdownReview && styles.drawdownTextReview]}>
-            52W High: ${stock.high52.toFixed(2)} (DD: {stock.drawdownPct.toFixed(2)}%)
+            שיא 52 שבועות: ${stock.high52.toFixed(2)} (ירידה: {stock.drawdownPct.toFixed(2)}%)
           </Text>
           {isQualityDrawdownReview && (
-            <Text style={styles.drawdownReviewTag}>[REVIEW]</Text>
+            <Text style={styles.drawdownReviewTag}>[לבדיקה]</Text>
           )}
         </View>
       )}
@@ -1376,9 +1446,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     paddingVertical: 12,
   },
   headerTitle: {
+    // RTL LOCALIZATION: standard Hebrew label text is right-aligned;
+    // numeric values/ticker symbols elsewhere are deliberately left at
+    // their default (LTR) alignment instead (see StockCard.tsx).
     color: colors.textPrimary,
     fontSize: 28,
     fontWeight: '700',
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   headerActions: {
     flexDirection: 'row',
@@ -1408,6 +1483,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 8,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   importTextArea: {
     backgroundColor: colors.background,
@@ -1476,16 +1553,22 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.core,
     fontSize: 13,
     fontWeight: '600',
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   intelErrorText: {
     color: colors.warning,
     fontSize: 13,
     marginBottom: 12,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   intelEmptyText: {
     color: colors.textSecondary,
     fontSize: 13,
     marginBottom: 12,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   categoryRow: {
     flexDirection: 'row',
@@ -1505,6 +1588,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
+    writingDirection: 'rtl',
   },
   assetTypeRow: {
     flexDirection: 'row',
@@ -1524,6 +1608,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
+    writingDirection: 'rtl',
   },
   addRow: {
     marginBottom: 4,
@@ -1543,6 +1628,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 16,
     fontWeight: '700',
+    writingDirection: 'rtl',
   },
   filterScroll: {
     flexGrow: 0,
@@ -1565,6 +1651,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textSecondary,
     fontSize: 13,
     fontWeight: '600',
+    writingDirection: 'rtl',
   },
   filterButtonTextActive: {
     color: colors.background,
@@ -1582,15 +1669,23 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
   // spacing/background instead of inheriting it from a parent "section"
   // container.
   sectionTitle: {
+    // RTL: the full "<layer> (יעד: X% | מצוי: Y%) - N נכסים" string is
+    // Hebrew-first with embedded LTR numeric runs (percentages, the
+    // count) — the Unicode bidi algorithm places those correctly within
+    // an RTL-aligned paragraph on its own, no special handling needed.
     fontSize: 16,
     fontWeight: '700',
     marginTop: 16,
     marginBottom: 10,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   sectionEmptyText: {
     color: colors.textSecondary,
     fontSize: 14,
     marginBottom: 4,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   stockCard: {
     backgroundColor: colors.cardBackground,
@@ -1622,10 +1717,13 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     gap: 10,
   },
   stockTicker: {
+    // Ticker symbols stay LTR regardless of app language — they're
+    // identifiers, not translatable text (per the RTL localization spec).
     flex: 1,
     color: colors.textPrimary,
     fontSize: 16,
     fontWeight: '700',
+    writingDirection: 'ltr',
   },
   assetTypeBadge: {
     backgroundColor: colors.background,
@@ -1637,6 +1735,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textSecondary,
     fontSize: 10,
     fontWeight: '700',
+    writingDirection: 'rtl',
   },
   categoryBadge: {
     paddingHorizontal: 10,
@@ -1647,6 +1746,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '700',
+    writingDirection: 'rtl',
   },
   deleteButtonText: {
     color: colors.bearish,
@@ -1660,13 +1760,19 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     marginTop: 6,
   },
   stockDetailText: {
+    // "{units} יח' ב-{currencySymbol}{localPrice}" — Hebrew-first with an
+    // embedded LTR currency run; bidi places the numeric part correctly.
     color: colors.textSecondary,
     fontSize: 13,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   stockTotalValue: {
+    // Pure currency value (symbol + number), no Hebrew words — stays LTR.
     color: colors.textPrimary,
     fontSize: 15,
     fontWeight: '600',
+    writingDirection: 'ltr',
   },
   unitsDisplayRow: {
     flexDirection: 'row',
@@ -1705,11 +1811,16 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '600',
+    writingDirection: 'rtl',
   },
   trailingStopText: {
+    // Hebrew label + LTR '$' threshold value — RTL paragraph, bidi handles
+    // the embedded number.
     color: colors.textSecondary,
     fontSize: 12,
     marginTop: 6,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   trailingStopTriggeredText: {
     color: colors.warning,
@@ -1724,6 +1835,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
   drawdownText: {
     color: colors.textSecondary,
     fontSize: 12,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   drawdownTextReview: {
     color: colors.reviewAlert,
@@ -1743,6 +1856,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
   initializingText: {
     color: colors.textSecondary,
     fontSize: 14,
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   fab: {
     position: 'absolute',
@@ -1786,6 +1901,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 15,
     fontWeight: '600',
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   menuDivider: {
     height: StyleSheet.hairlineWidth,
@@ -1818,6 +1935,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     color: colors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
+    textAlign: 'right',
+    writingDirection: 'rtl',
   },
   // Add Asset modal only (not shared with addModalSheet, used by Import
   // Backup) — a centered card, not a bottom sheet: full-screen dim layer.
