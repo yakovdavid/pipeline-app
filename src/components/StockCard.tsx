@@ -1,11 +1,13 @@
 import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
-import { ASSET_TYPE_LABEL_HE } from '@/constants/labels';
+import { ASSET_TYPE_LABEL_HE, SMA_LABEL } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
+import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { AssetType } from '@/types/asset';
+import { deriveLocalValue, formatUnitPrice } from '@/utils/currency';
 
 export type Stock = {
   ticker: string;
@@ -52,6 +54,10 @@ type StockCardStyles = ReturnType<typeof createStyles>;
 export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
+  // DYNAMIC LANGUAGE TOGGLE: a plain context read (like usePipelineTheme()
+  // above), unaffected by this component's own memo() — a language switch
+  // re-renders this card immediately, no app restart required.
+  const { language } = usePipelineLanguage();
 
   const { ticker, assetType, price, localPrice, currencySymbol, sma50, sma200 } = stock;
 
@@ -63,6 +69,21 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
 
   const isNearStructuralStop =
     assetType === 'ETF' && sma200 !== null && price <= sma200 * STRUCTURAL_STOP_THRESHOLD;
+
+  // TASE AGOROT DISPLAY: the current UNIT price. sma50/sma200 are USD-
+  // normalized by the backend's Multi-Currency engine (same as `price`), so
+  // they're first scaled onto localPrice's basis (see deriveLocalValue) —
+  // exact, not an approximation, since the backend applies one identical
+  // linear conversion to every price-like field for a given ticker — and
+  // only then formatted, so a ".TA" ticker's moving averages show in
+  // Agorot right alongside its current price, not mixed USD/Agorot.
+  const priceDisplay = formatUnitPrice(ticker, localPrice, currencySymbol, language);
+  const localSma50 = sma50 !== null ? deriveLocalValue(sma50, localPrice, price) : null;
+  const localSma200 = sma200 !== null ? deriveLocalValue(sma200, localPrice, price) : null;
+  const sma50Display =
+    localSma50 !== null ? formatUnitPrice(ticker, localSma50, currencySymbol, language) : null;
+  const sma200Display =
+    localSma200 !== null ? formatUnitPrice(ticker, localSma200, currencySymbol, language) : null;
 
   return (
     <View style={styles.card}>
@@ -86,11 +107,10 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
         <View style={styles.priceGroup}>
           {/* MULTI-CURRENCY DISPLAY: the instrument's own local-currency
               value (e.g. ₪13.48), never the USD-normalized `price` used for
-              math — see the Stock type above. Numeric, so left as LTR. */}
-          <Text style={styles.price}>
-            {currencySymbol}
-            {localPrice.toFixed(2)}
-          </Text>
+              math — see the Stock type above. TASE AGOROT DISPLAY: for a
+              ".TA" ticker this instead reads e.g. "3985 אג'" — see
+              formatUnitPrice. Numeric, so left as LTR either way. */}
+          <Text style={styles.price}>{priceDisplay}</Text>
           <TouchableOpacity
             onPress={() => onDelete(ticker)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -105,9 +125,12 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
           price={price}
           sma50={sma50}
           sma200={sma200}
+          sma50Display={sma50Display}
+          sma200Display={sma200Display}
           isBullish={isBullish}
           colors={colors}
           styles={styles}
+          language={language}
         />
         <View
           style={[
@@ -133,9 +156,17 @@ type MomentumBarProps = {
   price: number;
   sma50: number | null;
   sma200: number | null;
+  // Pre-formatted display strings (local-currency/Agorot-aware — see
+  // formatUnitPrice/deriveLocalValue in StockCard above), rendered as the
+  // labels below. The raw numeric sma50/sma200 (always USD-normalized) are
+  // kept separately since the marker-position math must stay in one
+  // consistent currency basis regardless of what's on screen.
+  sma50Display: string | null;
+  sma200Display: string | null;
   isBullish: boolean;
   colors: PipelineColorScheme;
   styles: StockCardStyles;
+  language: Language;
 };
 
 // Minimalist visual showing where the current price sits relative to the
@@ -143,8 +174,18 @@ type MomentumBarProps = {
 // A private sub-component of StockCard (not exported/reused elsewhere), so
 // it takes colors/styles as props from its parent's already-memoized theme
 // read rather than calling usePipelineTheme() again itself.
-function MomentumBar({ price, sma50, sma200, isBullish, colors, styles }: MomentumBarProps) {
-  if (sma50 === null || sma200 === null) {
+function MomentumBar({
+  price,
+  sma50,
+  sma200,
+  sma50Display,
+  sma200Display,
+  isBullish,
+  colors,
+  styles,
+  language,
+}: MomentumBarProps) {
+  if (sma50 === null || sma200 === null || sma50Display === null || sma200Display === null) {
     return <Text style={styles.momentumFallbackText}>אין מספיק נתוני ממוצע נע</Text>;
   }
 
@@ -174,8 +215,12 @@ function MomentumBar({ price, sma50, sma200, isBullish, colors, styles }: Moment
           positions out from under a user scanning the list — a text swap
           that tracked the dot used to make quick visual scanning unreliable. */}
       <View style={styles.momentumLabelRow}>
-        <Text style={styles.momentumLabelText}>SMA50 ${sma50.toFixed(2)}</Text>
-        <Text style={styles.momentumLabelText}>SMA200 ${sma200.toFixed(2)}</Text>
+        <Text style={styles.momentumLabelText}>
+          {SMA_LABEL[language].sma50} {sma50Display}
+        </Text>
+        <Text style={styles.momentumLabelText}>
+          {SMA_LABEL[language].sma200} {sma200Display}
+        </Text>
       </View>
     </View>
   );

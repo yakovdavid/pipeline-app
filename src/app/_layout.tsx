@@ -2,6 +2,7 @@ import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
+import { LanguageProvider } from '@/contexts/language-context';
 import { ThemeProvider, usePipelineTheme } from '@/contexts/theme-context';
 
 SplashScreen.preventAutoHideAsync();
@@ -26,8 +27,10 @@ function RootLayoutContent() {
 
 export default function RootLayout() {
   return (
-    <ThemeProvider>
-      <RootLayoutContent />
-    </ThemeProvider>
+    <LanguageProvider>
+      <ThemeProvider>
+        <RootLayoutContent />
+      </ThemeProvider>
+    </LanguageProvider>
   );
 }
