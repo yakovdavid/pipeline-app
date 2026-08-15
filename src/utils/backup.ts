@@ -65,6 +65,17 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
     assetType: normalizeAssetType(entry.assetType),
     units: typeof entry.units === 'number' && entry.units >= 0 ? entry.units : 0,
     highestWatermark: typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
+    // AUTO-CALIBRATION FOR BROKEN PRICES: must round-trip through backup
+    // export/import same as every other persisted field — dropping it here
+    // would silently un-calibrate a position (back to raw, possibly wildly
+    // wrong Yahoo prices) the moment a user restores their own backup.
+    // Missing/invalid/non-positive is left undefined rather than coerced to
+    // 1.0 so calibrateQuote's DEFAULT_CALIBRATION_FACTOR fast path (skip
+    // the math entirely) still applies for every entry that never had one.
+    calibrationFactor:
+      typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
+        ? entry.calibrationFactor
+        : undefined,
   };
 }
 

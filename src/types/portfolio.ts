@@ -16,6 +16,17 @@ export type PortfolioTickerEntry = {
   // SATELLITE_ETF_TS_PCT in thresholds.ts). Null until the first live price
   // is fetched.
   highestWatermark: number | null;
+  // AUTO-CALIBRATION FOR BROKEN PRICES: for a handful of funds (observed:
+  // HRL-F95.TA) Yahoo Finance returns a raw index value instead of a real
+  // per-unit price, so the price/units this app fetches don't line up with
+  // what a user's own brokerage/bank statement shows. When set, every
+  // price-like field fetched from the API for this position (price,
+  // localPrice, high52 — see @/utils/calibration's calibrateQuote) is
+  // multiplied by this factor before being used for display OR math — so
+  // the rest of the app never has to know this correction exists.
+  // Undefined/missing (older, pre-feature entries) and exactly 1.0 both
+  // mean "no correction" — see DEFAULT_CALIBRATION_FACTOR.
+  calibrationFactor?: number;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {

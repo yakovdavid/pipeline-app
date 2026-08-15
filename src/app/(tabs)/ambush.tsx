@@ -203,9 +203,8 @@ export default function AmbushRadarScreen() {
       ]);
       setTicker('');
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : `שליפת הנתונים עבור ${normalizedTicker} נכשלה.`;
-      Alert.alert('לא ניתן להוסיף טיקר', message);
+      const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: normalizedTicker });
+      Alert.alert(t('cannotAddTickerTitle'), message);
     } finally {
       setIsAdding(false);
     }
@@ -229,8 +228,10 @@ export default function AmbushRadarScreen() {
     try {
       const tickersToRefresh = stocks.map((stock) => stock.ticker);
       // CONCURRENCY LIMITING: see loadStocks above — small batches, not one
-      // Promise.allSettled over the whole list.
-      const results = await fetchInChunks(tickersToRefresh, (t) => fetchStockData(t));
+      // Promise.allSettled over the whole list. Parameter deliberately not
+      // named `t` here (unlike elsewhere in this file) to avoid shadowing
+      // the translation function from usePipelineLanguage.
+      const results = await fetchInChunks(tickersToRefresh, (tickerSymbol) => fetchStockData(tickerSymbol));
 
       // Map successful results back by ticker (rather than by index) so a
       // concurrent add/delete during the fetch can't misalign the data.
@@ -260,9 +261,9 @@ export default function AmbushRadarScreen() {
 
     try {
       await Clipboard.setStringAsync(report);
-      Alert.alert('הועתק', 'נתוני מכ״ם המארבים הועתקו ללוח.');
+      Alert.alert(t('copiedTitle'), t('ambushDataCopiedMessage'));
     } catch {
-      Alert.alert('ההעתקה נכשלה', 'לא ניתן היה להעתיק את נתוני מכ״ם המארבים ללוח.');
+      Alert.alert(t('copyFailedTitle'), t('ambushCopyFailedMessage'));
     }
   };
 
@@ -276,7 +277,7 @@ export default function AmbushRadarScreen() {
 
       <View style={styles.exportRow}>
         <TouchableOpacity style={styles.exportButton} onPress={handleCopyAmbushData}>
-          <Text style={styles.exportButtonText}>העתק נתוני מארב</Text>
+          <Text style={styles.exportButtonText}>{t('copyAmbushData')}</Text>
         </TouchableOpacity>
       </View>
 
@@ -316,7 +317,7 @@ export default function AmbushRadarScreen() {
           {isAdding ? (
             <ActivityIndicator size="small" color={colors.textPrimary} />
           ) : (
-            <Text style={styles.addButtonText}>הוסף</Text>
+            <Text style={styles.addButtonText}>{t('add')}</Text>
           )}
         </TouchableOpacity>
       </View>
@@ -324,7 +325,7 @@ export default function AmbushRadarScreen() {
       {isInitializing ? (
         <View style={styles.initializingContainer}>
           <PullToRefreshLogo isRefreshing overlay={false} />
-          <Text style={styles.initializingText}>טוען את רשימת המעקב שלך...</Text>
+          <Text style={styles.initializingText}>{t('loadingAmbush')}</Text>
         </View>
       ) : (
         <View style={styles.listWrapper}>
@@ -367,12 +368,9 @@ export default function AmbushRadarScreen() {
 // isDarkMode), [colors, isDarkMode]) above, so it only actually re-runs on
 // a real theme change, not on every render.
 function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language: Language) {
-  // ROBUST LANGUAGE CONTEXT: only the elements that now render translated
-  // (t()) text switch alignment/writingDirection with the language —
-  // everything else on this screen (export/add buttons, alerts, the
-  // initializing message) is still Hebrew-only regardless of the toggle,
-  // out of this pass's translation scope, and keeps its literal 'right'/
-  // 'rtl'.
+  // RUTHLESS LOCALIZATION AUDIT: every visible string on this screen now
+  // renders translated (t()) text, so every text style below switches
+  // alignment/writingDirection with the language too.
   const isHebrew = language === 'he';
 
   return StyleSheet.create({
@@ -418,8 +416,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.textPrimary,
       fontSize: 14,
       fontWeight: '600',
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     inputRow: {
       flexDirection: 'row',
@@ -467,8 +465,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.textPrimary,
       fontSize: 16,
       fontWeight: '700',
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     listWrapper: {
       flex: 1,
@@ -485,8 +483,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     initializingText: {
       color: colors.textSecondary,
       fontSize: 14,
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
   });
 }

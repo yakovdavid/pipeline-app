@@ -48,6 +48,13 @@ import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
 import { createBackupPayload, parseBackupPayload, restoreBackupPayload, type BackupPayload } from '@/utils/backup';
 import {
+  applyCalibration,
+  calibrateQuote,
+  computeCalibrationFactor,
+  DEFAULT_CALIBRATION_FACTOR,
+  stripCalibration,
+} from '@/utils/calibration';
+import {
   deriveLocalValue,
   formatTotalValue,
   formatUnitPrice,
@@ -164,6 +171,11 @@ export default function PortfolioScreen() {
   const [stocks, setStocks] = useState<PortfolioStock[]>([]);
   const [ticker, setTicker] = useState('');
   const [units, setUnits] = useState('1');
+  // AUTO-CALIBRATION FOR BROKEN PRICES: optional — see handleAddTicker for
+  // how this becomes a calibrationFactor. Left blank, the position is
+  // added with no correction at all (factor 1.0, i.e. trust the API price
+  // as-is).
+  const [totalValueInput, setTotalValueInput] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<PortfolioCategory>('Core');
   const [selectedAssetType, setSelectedAssetType] = useState<AssetType>('Stock');
   const [activeFilter, setActiveFilter] = useState<FilterOption>('All');
@@ -211,8 +223,10 @@ export default function PortfolioScreen() {
 
   const renderPortfolioSectionFooter = useCallback(
     ({ section }: { section: PortfolioListSection }) =>
-      section.data.length === 0 ? <Text style={styles.sectionEmptyText}>אין עדיין פוזיציות.</Text> : null,
-    [styles],
+      section.data.length === 0 ? (
+        <Text style={styles.sectionEmptyText}>{t('noPositionsYet')}</Text>
+      ) : null,
+    [styles, t],
   );
 
   // Drives the Intel modal's draggable bottom sheet height. Lazily
@@ -292,9 +306,12 @@ export default function PortfolioScreen() {
         if (!Array.isArray(parsed)) {
           throw new Error('Stored portfolio data is not an array.');
         }
-        // Entries saved before "units", "assetType", or "highestWatermark"
-        // existed won't have valid values; backfill them rather than
-        // letting totals/trailing-stop math break on undefined/NaN.
+        // Entries saved before "units", "assetType", "highestWatermark", or
+        // "calibrationFactor" existed won't have valid values; backfill
+        // them rather than letting totals/trailing-stop math break on
+        // undefined/NaN. calibrationFactor is left undefined (not coerced
+        // to 1.0) for old entries so calibrateQuote's DEFAULT_CALIBRATION_
+        // FACTOR fast path still applies.
         entries = parsed.map((entry) => ({
           ticker: entry.ticker ?? '',
           category: entry.category ?? 'Core',
@@ -302,6 +319,10 @@ export default function PortfolioScreen() {
           assetType: entry.assetType === 'ETF' ? 'ETF' : 'Stock',
           highestWatermark:
             typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
+          calibrationFactor:
+            typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
+              ? entry.calibrationFactor
+              : undefined,
         }));
       } catch (error) {
         console.error(
@@ -336,15 +357,26 @@ export default function PortfolioScreen() {
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
           const entry = entries[index];
+          // AUTO-CALIBRATION FOR BROKEN PRICES: apply this position's
+          // persisted correction (see @/utils/calibration) to the freshly
+          // fetched raw quote before it ever reaches state — every
+          // downstream consumer (this row, layer/portfolio totals,
+          // trailing stop, drawdown review) then just uses stock.price/
+          // localPrice/high52 normally, with no calibration awareness of
+          // its own needed.
+          const calibratedQuote = calibrateQuote(
+            result.value,
+            entry.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
+          );
           loadedStocks.push({
             ...entry,
-            price: result.value.price,
-            localPrice: result.value.localPrice,
-            currencySymbol: result.value.currencySymbol,
-            anomalyReport: result.value.anomalyReport,
-            high52: result.value.high52,
-            drawdownPct: result.value.drawdownPct,
-            highestWatermark: computeHighestWatermark(entry.highestWatermark, result.value.price),
+            price: calibratedQuote.price,
+            localPrice: calibratedQuote.localPrice,
+            currencySymbol: calibratedQuote.currencySymbol,
+            anomalyReport: calibratedQuote.anomalyReport,
+            high52: calibratedQuote.high52,
+            drawdownPct: calibratedQuote.drawdownPct,
+            highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
           });
         }
       });
@@ -386,12 +418,17 @@ export default function PortfolioScreen() {
     }
 
     const entries: PortfolioTickerEntry[] = stocks.map(
-      ({ ticker: symbol, category, assetType, units: unitCount, highestWatermark }) => ({
+      ({ ticker: symbol, category, assetType, units: unitCount, highestWatermark, calibrationFactor }) => ({
         ticker: symbol,
         category,
         assetType,
         units: unitCount,
         highestWatermark,
+        // AUTO-CALIBRATION FOR BROKEN PRICES: must be persisted like every
+        // other per-position field — dropping it here would silently
+        // un-calibrate a position (back to Yahoo's raw, possibly wildly
+        // wrong price) the next time the app restarts.
+        calibrationFactor,
       }),
     );
     AsyncStorage.setItem(PORTFOLIO_TICKERS_STORAGE_KEY, JSON.stringify(entries)).catch((error) => {
@@ -407,7 +444,7 @@ export default function PortfolioScreen() {
 
     const parsedUnits = Number(units);
     if (!Number.isFinite(parsedUnits) || parsedUnits <= 0) {
-      Alert.alert('יחידות לא תקינות', 'נא להזין מספר יחידות חיובי.');
+      Alert.alert(t('invalidUnitsTitle'), t('invalidUnitsMessage'));
       return;
     }
 
@@ -419,6 +456,17 @@ export default function PortfolioScreen() {
     setIsAdding(true);
     try {
       const quote = await fetchStockData(normalizedTicker);
+
+      // AUTO-CALIBRATION FOR BROKEN PRICES: quote.localPrice here is the
+      // RAW, freshly-fetched API value — nothing has calibrated it yet, so
+      // it's exactly what computeCalibrationFactor needs as its reference
+      // price. An empty/invalid Total Value input degrades to
+      // DEFAULT_CALIBRATION_FACTOR (1.0, a no-op) rather than blocking the
+      // add — this field is explicitly optional.
+      const parsedTotalValue = totalValueInput.trim() === '' ? null : Number(totalValueInput);
+      const calibrationFactor = computeCalibrationFactor(parsedTotalValue, parsedUnits, quote.localPrice);
+      const calibratedQuote = calibrateQuote(quote, calibrationFactor);
+
       setStocks((prevStocks) => [
         ...prevStocks,
         {
@@ -426,22 +474,23 @@ export default function PortfolioScreen() {
           category: selectedCategory,
           assetType: selectedAssetType,
           units: parsedUnits,
-          price: quote.price,
-          localPrice: quote.localPrice,
-          currencySymbol: quote.currencySymbol,
-          anomalyReport: quote.anomalyReport,
-          high52: quote.high52,
-          drawdownPct: quote.drawdownPct,
-          highestWatermark: computeHighestWatermark(null, quote.price),
+          price: calibratedQuote.price,
+          localPrice: calibratedQuote.localPrice,
+          currencySymbol: calibratedQuote.currencySymbol,
+          anomalyReport: calibratedQuote.anomalyReport,
+          high52: calibratedQuote.high52,
+          drawdownPct: calibratedQuote.drawdownPct,
+          highestWatermark: computeHighestWatermark(null, calibratedQuote.price),
+          calibrationFactor,
         },
       ]);
       setTicker('');
       setUnits('1');
+      setTotalValueInput('');
       setIsAddModalVisible(false);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : `שליפת הנתונים עבור ${normalizedTicker} נכשלה.`;
-      Alert.alert('לא ניתן להוסיף טיקר', message);
+      const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: normalizedTicker });
+      Alert.alert(t('cannotAddTickerTitle'), message);
     } finally {
       setIsAdding(false);
     }
@@ -456,7 +505,7 @@ export default function PortfolioScreen() {
   }, []);
 
   const handleSaveEdit = useCallback(
-    (tickerToUpdate: string, newUnits: number, newAssetType: AssetType) => {
+    (tickerToUpdate: string, newUnits: number, newAssetType: AssetType, newTotalValueInput: string) => {
       setStocks((prevStocks) =>
         prevStocks.map((stock) => {
           if (stock.ticker !== tickerToUpdate) {
@@ -470,7 +519,52 @@ export default function PortfolioScreen() {
           // seed it from the current price if this position never had one.
           const highestWatermark = stock.highestWatermark ?? stock.price;
 
-          return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark };
+          // AUTO-CALIBRATION FOR BROKEN PRICES: a BLANK Total Value field
+          // here deliberately PRESERVES this position's existing
+          // calibrationFactor unchanged, rather than resetting it to 1.0 —
+          // unlike the Add Asset flow (where blank truly means "no
+          // correction was ever entered"), on Edit the user is very often
+          // here only to bump the unit count, and silently un-calibrating
+          // an already-corrected position just because they left this
+          // unrelated field blank would quietly wipe out a correction they
+          // made earlier. A calibrationFactor is only ever REPLACED when
+          // the user explicitly enters a new Total Value.
+          const parsedTotalValue = newTotalValueInput.trim() === '' ? null : Number(newTotalValueInput);
+          if (
+            parsedTotalValue === null ||
+            !Number.isFinite(parsedTotalValue) ||
+            parsedTotalValue <= 0
+          ) {
+            return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark };
+          }
+
+          // Recalibrating: stock.price/localPrice/high52 are already
+          // calibrated (see calibrateQuote) — strip the OLD factor back off
+          // to recover the raw Yahoo figures, then compute and apply a NEW
+          // factor from the fresh Total Value against those same raw
+          // figures. The old highestWatermark's basis is no longer valid
+          // once the scale changes, so it's reseeded from the newly
+          // corrected price instead of carried forward stale.
+          const existingFactor = stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR;
+          const rawLocalPrice = stripCalibration(stock.localPrice, existingFactor);
+          const rawUsdPrice = stripCalibration(stock.price, existingFactor);
+          const rawHigh52 = stock.high52 !== null ? stripCalibration(stock.high52, existingFactor) : null;
+
+          const calibrationFactor = computeCalibrationFactor(parsedTotalValue, newUnits, rawLocalPrice);
+          const newLocalPrice = applyCalibration(rawLocalPrice, calibrationFactor);
+          const newUsdPrice = applyCalibration(rawUsdPrice, calibrationFactor);
+          const newHigh52 = rawHigh52 !== null ? applyCalibration(rawHigh52, calibrationFactor) : null;
+
+          return {
+            ...stock,
+            units: newUnits,
+            assetType: newAssetType,
+            price: newUsdPrice,
+            localPrice: newLocalPrice,
+            high52: newHigh52,
+            calibrationFactor,
+            highestWatermark: newUsdPrice,
+          };
         }),
       );
     },
@@ -498,8 +592,10 @@ export default function PortfolioScreen() {
     try {
       const tickersToRefresh = stocks.map((stock) => stock.ticker);
       // CONCURRENCY LIMITING: see loadInitialStocks above — small batches,
-      // not one Promise.allSettled over the whole list.
-      const results = await fetchInChunks(tickersToRefresh, (t) => fetchStockData(t));
+      // not one Promise.allSettled over the whole list. Parameter
+      // deliberately not named `t` here (unlike elsewhere in this file) to
+      // avoid shadowing the translation function from usePipelineLanguage.
+      const results = await fetchInChunks(tickersToRefresh, (tickerSymbol) => fetchStockData(tickerSymbol));
 
       const freshQuotes = new Map<string, StockQuote>();
       results.forEach((result, index) => {
@@ -514,15 +610,23 @@ export default function PortfolioScreen() {
           if (!freshQuote) {
             return stock;
           }
+          // AUTO-CALIBRATION FOR BROKEN PRICES: re-apply this position's
+          // persisted correction to the fresh raw quote — same as
+          // loadInitialStocks above, so a pull-to-refresh can never
+          // silently un-calibrate a position back to Yahoo's raw price.
+          const calibratedQuote = calibrateQuote(
+            freshQuote,
+            stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
+          );
           return {
             ...stock,
-            price: freshQuote.price,
-            localPrice: freshQuote.localPrice,
-            currencySymbol: freshQuote.currencySymbol,
-            anomalyReport: freshQuote.anomalyReport,
-            high52: freshQuote.high52,
-            drawdownPct: freshQuote.drawdownPct,
-            highestWatermark: computeHighestWatermark(stock.highestWatermark, freshQuote.price),
+            price: calibratedQuote.price,
+            localPrice: calibratedQuote.localPrice,
+            currencySymbol: calibratedQuote.currencySymbol,
+            anomalyReport: calibratedQuote.anomalyReport,
+            high52: calibratedQuote.high52,
+            drawdownPct: calibratedQuote.drawdownPct,
+            highestWatermark: computeHighestWatermark(stock.highestWatermark, calibratedQuote.price),
           };
         }),
       );
@@ -539,9 +643,9 @@ export default function PortfolioScreen() {
 
     try {
       await Clipboard.setStringAsync(report);
-      Alert.alert('הועתק', 'נתוני התיק הועתקו ללוח.');
+      Alert.alert(t('copiedTitle'), t('portfolioDataCopiedMessage'));
     } catch {
-      Alert.alert('ההעתקה נכשלה', 'לא ניתן היה להעתיק את נתוני התיק ללוח.');
+      Alert.alert(t('copyFailedTitle'), t('copyPortfolioFailedMessage'));
     }
   };
 
@@ -572,11 +676,10 @@ export default function PortfolioScreen() {
       ].join('\n');
 
       await Clipboard.setStringAsync(report);
-      Alert.alert('הועתק', 'נתוני התיק והמארב הועתקו יחד ללוח.');
+      Alert.alert(t('copiedTitle'), t('allDataCopiedMessage'));
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'יצירת ייצוא הנתונים המשולב נכשלה.';
-      Alert.alert('ההעתקה נכשלה', message);
+      const message = error instanceof Error ? error.message : t('combinedExportFailedMessage');
+      Alert.alert(t('copyFailedTitle'), message);
     } finally {
       setIsExportingAll(false);
     }
@@ -587,13 +690,10 @@ export default function PortfolioScreen() {
     try {
       const payload = await createBackupPayload();
       await Clipboard.setStringAsync(JSON.stringify(payload));
-      Alert.alert(
-        'הגיבוי יוצא',
-        'נתוני התיק והמארב הועתקו ללוח כ-JSON. הדבק אותם במקום בטוח.',
-      );
+      Alert.alert(t('backupExportedTitle'), t('backupExportedMessage'));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'ייצוא הגיבוי נכשל.';
-      Alert.alert('הייצוא נכשל', message);
+      const message = error instanceof Error ? error.message : t('backupExportFailedMessage');
+      Alert.alert(t('exportFailedTitle'), message);
     } finally {
       setIsExportingBackup(false);
     }
@@ -606,8 +706,8 @@ export default function PortfolioScreen() {
     } catch (error) {
       // Strict, on purpose: abort entirely rather than attempt a partial
       // restore from a backup we can't fully trust.
-      const message = error instanceof Error ? error.message : 'הטקסט שהודבק אינו גיבוי תקין.';
-      Alert.alert('גיבוי לא תקין', message);
+      const message = error instanceof Error ? error.message : t('invalidBackupMessage');
+      Alert.alert(t('invalidBackupTitle'), message);
       return;
     }
 
@@ -625,15 +725,23 @@ export default function PortfolioScreen() {
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
           const entry = payload.portfolio[index];
+          // AUTO-CALIBRATION FOR BROKEN PRICES: apply this entry's
+          // calibrationFactor (round-tripped through the backup JSON by
+          // coercePortfolioEntry — see @/utils/backup) to the freshly
+          // fetched raw quote, same as loadInitialStocks above.
+          const calibratedQuote = calibrateQuote(
+            result.value,
+            entry.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
+          );
           hydratedStocks.push({
             ...entry,
-            price: result.value.price,
-            localPrice: result.value.localPrice,
-            currencySymbol: result.value.currencySymbol,
-            anomalyReport: result.value.anomalyReport,
-            high52: result.value.high52,
-            drawdownPct: result.value.drawdownPct,
-            highestWatermark: computeHighestWatermark(entry.highestWatermark, result.value.price),
+            price: calibratedQuote.price,
+            localPrice: calibratedQuote.localPrice,
+            currencySymbol: calibratedQuote.currencySymbol,
+            anomalyReport: calibratedQuote.anomalyReport,
+            high52: calibratedQuote.high52,
+            drawdownPct: calibratedQuote.drawdownPct,
+            highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
           });
         }
       });
@@ -652,18 +760,15 @@ export default function PortfolioScreen() {
           `[hydration] Backup restored to storage, but all ${payload.portfolio.length} ` +
             'live price fetch(es) failed; retaining the previously displayed portfolio.',
         );
-        Alert.alert(
-          'הגיבוי שוחזר',
-          'הנתונים נשמרו, אך לא ניתן היה לטעון מחירים חיים כרגע. משוך לרענון בעוד רגע.',
-        );
+        Alert.alert(t('backupRestoredTitle'), t('backupRestoredPricesFailedMessage'));
         return;
       }
 
       setStocks(hydratedStocks);
-      Alert.alert('הגיבוי שוחזר', 'נתוני התיק והמארב שוחזרו.');
+      Alert.alert(t('backupRestoredTitle'), t('backupRestoredMessage'));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'שחזור הגיבוי נכשל.';
-      Alert.alert('השחזור נכשל', message);
+      const message = error instanceof Error ? error.message : t('backupRestoreFailedMessage');
+      Alert.alert(t('restoreFailedTitle'), message);
     } finally {
       setIsRestoring(false);
     }
@@ -671,7 +776,7 @@ export default function PortfolioScreen() {
 
   const handleFetchIntel = async () => {
     if (!intelInput.trim()) {
-      Alert.alert('נדרש טיקר', 'נא להזין לפחות סימול טיקר אחד.');
+      Alert.alert(t('tickerRequiredTitle'), t('tickerRequiredMessage'));
       return;
     }
 
@@ -683,11 +788,11 @@ export default function PortfolioScreen() {
 
       const hasAnyNews = result.results.some((entry) => entry.news.length > 0);
       if (!hasAnyNews) {
-        Alert.alert('לא נמצאו חדשות', 'לא נמצאו חדשות אחרונות עבור הטיקרים המבוקשים.');
+        Alert.alert(t('noNewsFoundTitle'), t('noNewsFoundMessage'));
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'שליפת המודיעין נכשלה.';
-      Alert.alert('שליפת המודיעין נכשלה', message);
+      const message = error instanceof Error ? error.message : t('intelFetchFailedMessage');
+      Alert.alert(t('intelFetchFailedTitle'), message);
     } finally {
       setIsFetchingIntel(false);
     }
@@ -695,7 +800,7 @@ export default function PortfolioScreen() {
 
   const handleOpenArticleLink = (url: string) => {
     Linking.openURL(url).catch(() => {
-      Alert.alert('לא ניתן לפתוח את הקישור', 'לא ניתן היה לפתוח את קישור הכתבה.');
+      Alert.alert(t('cannotOpenLinkTitle'), t('cannotOpenLinkMessage'));
     });
   };
 
@@ -736,9 +841,9 @@ export default function PortfolioScreen() {
 
     try {
       await Clipboard.setStringAsync(text);
-      Alert.alert('הועתק', 'כותרות המודיעין הועתקו ללוח.');
+      Alert.alert(t('copiedTitle'), t('intelCopiedMessage'));
     } catch {
-      Alert.alert('ההעתקה נכשלה', 'לא ניתן היה להעתיק את המודיעין ללוח.');
+      Alert.alert(t('copyFailedTitle'), t('intelCopyFailedMessage'));
     }
   };
 
@@ -848,7 +953,7 @@ export default function PortfolioScreen() {
       {isInitializing ? (
         <View style={styles.initializingContainer}>
           <PullToRefreshLogo isRefreshing overlay={false} />
-          <Text style={styles.initializingText}>טוען את התיק שלך...</Text>
+          <Text style={styles.initializingText}>{t('loadingPortfolio')}</Text>
         </View>
       ) : (
         <View style={styles.listWrapper}>
@@ -907,7 +1012,7 @@ export default function PortfolioScreen() {
                 setIsMenuVisible(false);
                 handleCopyPortfolioData();
               }}>
-              <Text style={styles.menuItemText}>העתק נתוני תיק</Text>
+              <Text style={styles.menuItemText}>{t('copyPortfolioData')}</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.menuItem}
@@ -919,7 +1024,7 @@ export default function PortfolioScreen() {
               {isExportingAll ? (
                 <ActivityIndicator size="small" color={colors.textPrimary} />
               ) : (
-                <Text style={styles.menuItemText}>העתק את כל הנתונים</Text>
+                <Text style={styles.menuItemText}>{t('copyAllData')}</Text>
               )}
             </TouchableOpacity>
             <View style={styles.menuDivider} />
@@ -934,7 +1039,7 @@ export default function PortfolioScreen() {
               {isExportingBackup ? (
                 <ActivityIndicator size="small" color={colors.textPrimary} />
               ) : (
-                <Text style={styles.menuItemText}>ייצוא גיבוי (JSON)</Text>
+                <Text style={styles.menuItemText}>{t('exportBackupJson')}</Text>
               )}
             </TouchableOpacity>
             <TouchableOpacity
@@ -943,7 +1048,7 @@ export default function PortfolioScreen() {
                 setIsMenuVisible(false);
                 setIsImportModalVisible(true);
               }}>
-              <Text style={styles.menuItemText}>ייבוא גיבוי (JSON)</Text>
+              <Text style={styles.menuItemText}>{t('importBackupJson')}</Text>
             </TouchableOpacity>
             <View style={styles.menuDivider} />
             {/* Group 3: On-Demand Intel. Theme toggle used to live here as a
@@ -956,7 +1061,7 @@ export default function PortfolioScreen() {
                 setIsMenuVisible(false);
                 setIsIntelModalVisible(true);
               }}>
-              <Text style={styles.menuItemText}>מודיעין לפי דרישה</Text>
+              <Text style={styles.menuItemText}>{t('intelOnDemand')}</Text>
             </TouchableOpacity>
           </View>
         </Pressable>
@@ -1062,18 +1167,39 @@ export default function PortfolioScreen() {
                       onSubmit={handleAddTicker}
                       editable={!isAdding}
                     />
+                    {/* TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (see
+                        unitsInput's style) so a large unit count like
+                        11347 is never truncated by a fixed pixel width —
+                        maxLength=15 is a generous ceiling, not a practical
+                        limit for any real position size. */}
                     <TextInput
                       style={styles.unitsInput}
                       value={units}
                       onChangeText={setUnits}
-                      placeholder="יחידות"
+                      placeholder={t('unitsPlaceholder')}
                       placeholderTextColor={colors.textSecondary}
                       keyboardType="numeric"
+                      maxLength={15}
                       editable={!isAdding}
                     />
                   </View>
 
-                  <Text style={styles.modalSectionLabel}>קטגוריה</Text>
+                  {/* AUTO-CALIBRATION FOR BROKEN PRICES: optional — see
+                      handleAddTicker for how a value here becomes a
+                      calibrationFactor. Same width fix as the units field
+                      above, for the same reason (large ILS totals). */}
+                  <TextInput
+                    style={[styles.unitsInput, styles.totalValueInput]}
+                    value={totalValueInput}
+                    onChangeText={setTotalValueInput}
+                    placeholder={t('totalValueInBank')}
+                    placeholderTextColor={colors.textSecondary}
+                    keyboardType="numeric"
+                    maxLength={15}
+                    editable={!isAdding}
+                  />
+
+                  <Text style={styles.modalSectionLabel}>{t('category')}</Text>
                   <View style={styles.categoryRow}>
                     <TouchableOpacity
                       style={[
@@ -1104,7 +1230,7 @@ export default function PortfolioScreen() {
                     </TouchableOpacity>
                   </View>
 
-                  <Text style={styles.modalSectionLabel}>סוג נכס</Text>
+                  <Text style={styles.modalSectionLabel}>{t('assetType')}</Text>
                   <View style={styles.assetTypeRow}>
                     <TouchableOpacity
                       style={[
@@ -1134,7 +1260,7 @@ export default function PortfolioScreen() {
                       {isAdding ? (
                         <ActivityIndicator size="small" color={colors.textPrimary} />
                       ) : (
-                        <Text style={styles.addButtonText}>הוסף לתיק</Text>
+                        <Text style={styles.addButtonText}>{t('addToPortfolio')}</Text>
                       )}
                     </TouchableOpacity>
                   </View>
@@ -1158,7 +1284,7 @@ export default function PortfolioScreen() {
             style={styles.addModalKeyboardAvoider}>
             <View style={styles.addModalSheet}>
               <View style={styles.addModalHeader}>
-                <Text style={styles.addModalTitle}>ייבוא גיבוי</Text>
+                <Text style={styles.addModalTitle}>{t('importBackupTitle')}</Text>
                 <TouchableOpacity
                   onPress={() => setIsImportModalVisible(false)}
                   disabled={isRestoring}
@@ -1168,12 +1294,12 @@ export default function PortfolioScreen() {
                 </TouchableOpacity>
               </View>
 
-              <Text style={styles.modalSectionLabel}>הדבק JSON של גיבוי</Text>
+              <Text style={styles.modalSectionLabel}>{t('pasteBackupJsonLabel')}</Text>
               <TextInput
                 style={styles.importTextArea}
                 value={importText}
                 onChangeText={setImportText}
-                placeholder="הדבק כאן את ה-JSON שהועתק מייצוא הגיבוי..."
+                placeholder={t('pasteBackupPlaceholder')}
                 placeholderTextColor={colors.textSecondary}
                 multiline
                 textAlignVertical="top"
@@ -1191,7 +1317,7 @@ export default function PortfolioScreen() {
                   {isRestoring ? (
                     <ActivityIndicator size="small" color={colors.textPrimary} />
                   ) : (
-                    <Text style={styles.addButtonText}>שחזר</Text>
+                    <Text style={styles.addButtonText}>{t('restore')}</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1230,15 +1356,15 @@ export default function PortfolioScreen() {
                 <Ionicons name="close" size={22} color={colors.textSecondary} />
               </TouchableOpacity>
 
-              <Text style={[styles.addModalTitle, styles.intelModalTitle]}>מודיעין לפי דרישה</Text>
+              <Text style={[styles.addModalTitle, styles.intelModalTitle]}>{t('intelOnDemand')}</Text>
 
-              <Text style={styles.modalSectionLabel}>טיקרים (מופרדים בפסיקים)</Text>
+              <Text style={styles.modalSectionLabel}>{t('tickersCommaSeparatedLabel')}</Text>
               <View style={styles.inputRow}>
                 <TextInput
                   style={styles.intelTextInput}
                   value={intelInput}
                   onChangeText={setIntelInput}
-                  placeholder="לדוגמה: PLD, UNH, AMT"
+                  placeholder={t('tickersPlaceholderExample')}
                   placeholderTextColor={colors.textSecondary}
                   autoCapitalize="characters"
                   autoCorrect={false}
@@ -1253,7 +1379,7 @@ export default function PortfolioScreen() {
                   {isFetchingIntel ? (
                     <ActivityIndicator size="small" color={colors.textPrimary} />
                   ) : (
-                    <Text style={styles.addButtonText}>שלוף מודיעין</Text>
+                    <Text style={styles.addButtonText}>{t('fetchIntel')}</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1270,9 +1396,13 @@ export default function PortfolioScreen() {
                       <Text style={styles.intelTickerSectionHeader}>=== {entry.ticker} ===</Text>
 
                       {entry.error ? (
-                        <Text style={styles.intelErrorText}>שגיאה: {entry.error}</Text>
+                        <Text style={styles.intelErrorText}>
+                          {t('errorPrefix')}: {entry.error}
+                        </Text>
                       ) : entry.news.length === 0 ? (
-                        <Text style={styles.intelEmptyText}>לא נמצאו חדשות עבור {entry.ticker}.</Text>
+                        <Text style={styles.intelEmptyText}>
+                          {t('noNewsForTicker', { ticker: entry.ticker })}
+                        </Text>
                       ) : (
                         // Article title/publisher/timestamp are Yahoo's own
                         // news content (in whatever language the source
@@ -1287,7 +1417,7 @@ export default function PortfolioScreen() {
                             <Text style={styles.intelArticleTitle}>
                               {article.isCritical && (
                                 <Text style={styles.intelCriticalInlineTag}>
-                                  {(article.tag || '[התראה קריטית]') + '  '}
+                                  {(article.tag || t('criticalAlertTag')) + '  '}
                                 </Text>
                               )}
                               {article.title}
@@ -1296,7 +1426,7 @@ export default function PortfolioScreen() {
                               <TouchableOpacity
                                 onPress={() => handleOpenArticleLink(article.link)}
                                 hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
-                                <Text style={styles.intelLinkButtonText}>קרא כתבה מלאה ←</Text>
+                                <Text style={styles.intelLinkButtonText}>{t('readFullArticle')}</Text>
                               </TouchableOpacity>
                             ) : null}
                           </View>
@@ -1310,7 +1440,7 @@ export default function PortfolioScreen() {
               {intelResult && intelResult.results.length > 0 && (
                 <View style={styles.addRow}>
                   <TouchableOpacity style={styles.addButton} onPress={handleCopyIntel}>
-                    <Text style={styles.addButtonText}>העתק מודיעין</Text>
+                    <Text style={styles.addButtonText}>{t('copyIntel')}</Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -1326,7 +1456,7 @@ type PortfolioStockRowProps = {
   stock: PortfolioStock;
   accentColor: string;
   onDelete: (ticker: string) => void;
-  onSaveEdit: (ticker: string, units: number, assetType: AssetType) => void;
+  onSaveEdit: (ticker: string, units: number, assetType: AssetType, totalValueInput: string) => void;
   colors: PipelineColorScheme;
   styles: PortfolioStyles;
   language: Language;
@@ -1361,6 +1491,14 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const [isEditing, setIsEditing] = useState(false);
   const [unitsText, setUnitsText] = useState(String(stock.units));
   const [editedAssetType, setEditedAssetType] = useState<AssetType>(stock.assetType);
+  // AUTO-CALIBRATION FOR BROKEN PRICES: deliberately starts (and resets on
+  // every re-entry into edit mode, see handleStartEditing) BLANK rather
+  // than pre-filled with today's computed total — see onSaveEdit in
+  // PortfolioScreen for why: a blank field here means "leave this
+  // position's existing calibration alone," which would break if it were
+  // pre-filled with a value that then got silently resubmitted alongside
+  // an unrelated units change.
+  const [totalValueText, setTotalValueText] = useState('');
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
   // `units` is a Nominal Value quantity — 100 nominal units = 1 real
@@ -1421,16 +1559,17 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const handleStartEditing = () => {
     setUnitsText(String(stock.units));
     setEditedAssetType(stock.assetType);
+    setTotalValueText('');
     setIsEditing(true);
   };
 
   const handleSaveEdit = () => {
     const parsedUnits = Number(unitsText);
     if (!Number.isFinite(parsedUnits) || parsedUnits <= 0) {
-      Alert.alert('יחידות לא תקינות', 'נא להזין מספר יחידות חיובי.');
+      Alert.alert(t('invalidUnitsTitle'), t('invalidUnitsMessage'));
       return;
     }
-    onSaveEdit(stock.ticker, parsedUnits, editedAssetType);
+    onSaveEdit(stock.ticker, parsedUnits, editedAssetType, totalValueText);
     setIsEditing(false);
   };
 
@@ -1457,11 +1596,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       {isEditing ? (
         <View style={styles.editContainer}>
           <View style={styles.unitsEditRow}>
+            {/* TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (see
+                unitsEditInput's style) so a large unit count like 11347 is
+                never truncated by a fixed pixel width. */}
             <TextInput
               style={styles.unitsEditInput}
               value={unitsText}
               onChangeText={setUnitsText}
               keyboardType="numeric"
+              maxLength={15}
               autoFocus
               selectTextOnFocus
               onSubmitEditing={handleSaveEdit}
@@ -1473,6 +1616,21 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               <Ionicons name="checkmark" size={20} color={colors.bullish} />
             </TouchableOpacity>
           </View>
+          {/* AUTO-CALIBRATION FOR BROKEN PRICES: optional — see onSaveEdit
+              in PortfolioScreen for how a value here recalibrates this
+              position. Left blank (the default every time editing starts —
+              see handleStartEditing), the existing calibration (if any) is
+              preserved unchanged. Same width fix as the units field above. */}
+          <TextInput
+            style={[styles.unitsEditInput, styles.totalValueEditInput]}
+            value={totalValueText}
+            onChangeText={setTotalValueText}
+            placeholder={t('totalValueInBank')}
+            placeholderTextColor={colors.textSecondary}
+            keyboardType="numeric"
+            maxLength={15}
+            onSubmitEditing={handleSaveEdit}
+          />
           <View style={styles.editAssetTypeRow}>
             <TouchableOpacity
               style={[
@@ -1546,7 +1704,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             styles.trailingStopText,
             isTrailingStopTriggered && styles.trailingStopTriggeredText,
           ]}>
-          {isTrailingStopTriggered ? '⚠ ' : ''}עצירה נגררת מופעלת ב: ${trailingStopPrice.toFixed(2)}
+          {isTrailingStopTriggered ? '⚠ ' : ''}
+          {t('trailingStopActivatedAt')}: ${trailingStopPrice.toFixed(2)}
         </Text>
       )}
 
@@ -1640,8 +1799,15 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     gap: 8,
     zIndex: 10,
   },
+  // TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (not a fixed pixel
+  // width, which was the actual bug — 70px truncates/can't fit a large
+  // unit count like 11347) so this grows to a genuinely usable width
+  // whether it's sharing inputRow with TickerAutocomplete (both flex: 1,
+  // splitting the row) or standalone (totalValueInput below, alone in its
+  // own row — flex: 1 there just fills the full row width).
   unitsInput: {
-    width: 70,
+    flex: 1,
+    minWidth: '45%',
     backgroundColor: colors.background,
     color: colors.textPrimary,
     borderRadius: 8,
@@ -1650,14 +1816,21 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fontSize: 16,
     textAlign: 'center',
   },
+  // AUTO-CALIBRATION FOR BROKEN PRICES: the new "Total Value in Bank"
+  // field in the Add Asset modal — same base look as unitsInput (shared
+  // via a style array at the call site), standalone in its own row below
+  // the ticker/units row.
+  totalValueInput: {
+    marginBottom: 16,
+  },
   modalSectionLabel: {
     color: colors.textSecondary,
     fontSize: 12,
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 8,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   importTextArea: {
     backgroundColor: colors.background,
@@ -1726,22 +1899,22 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.core,
     fontSize: 13,
     fontWeight: '600',
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   intelErrorText: {
     color: colors.warning,
     fontSize: 13,
     marginBottom: 12,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   intelEmptyText: {
     color: colors.textSecondary,
     fontSize: 13,
     marginBottom: 12,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   categoryRow: {
     flexDirection: 'row',
@@ -1798,10 +1971,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     opacity: 0.6,
   },
   addButtonText: {
+    // Shared by every "primary action" button in this file (Add to
+    // Portfolio, Restore, Fetch Intel, Copy Intel) — all four now render
+    // translated t() text, so it's safe for this one shared style to be
+    // direction-aware.
     color: colors.textPrimary,
     fontSize: 16,
     fontWeight: '700',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   filterScroll: {
     flexGrow: 0,
@@ -1980,14 +2157,24 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     alignItems: 'center',
     gap: 8,
   },
+  // TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (was a fixed width: 56,
+  // the same truncation bug as unitsInput above — a large unit count like
+  // 11347 couldn't be typed/read at that width).
   unitsEditInput: {
+    flex: 1,
+    minWidth: '45%',
     backgroundColor: colors.background,
     color: colors.textPrimary,
     borderRadius: 6,
     paddingHorizontal: 8,
     paddingVertical: 4,
     fontSize: 13,
-    width: 56,
+  },
+  // AUTO-CALIBRATION FOR BROKEN PRICES: the inline edit form's "Total
+  // Value in Bank" field — alone in its own row (see the JSX), so flex: 1
+  // just fills the row's width; marginTop matches editContainer's own gap.
+  totalValueEditInput: {
+    marginTop: 0,
   },
   editAssetTypeRow: {
     flexDirection: 'row',
@@ -2006,13 +2193,13 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   trailingStopText: {
-    // Hebrew label + LTR '$' threshold value — RTL paragraph, bidi handles
-    // the embedded number.
+    // Translated-word-first label + LTR '$' threshold value — an aligned
+    // paragraph, bidi handles the embedded number regardless of direction.
     color: colors.textSecondary,
     fontSize: 12,
     marginTop: 6,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   trailingStopTriggeredText: {
     color: colors.warning,
@@ -2050,8 +2237,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   initializingText: {
     color: colors.textSecondary,
     fontSize: 14,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   fab: {
     position: 'absolute',
@@ -2092,11 +2279,18 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     paddingVertical: 14,
   },
   menuItemText: {
+    // Shared by the "More options" menu (fully translated) AND the
+    // language dropdown's "English"/"עברית" rows — the latter are
+    // deliberately shown in their OWN language's native script regardless
+    // of the active app language (a standard language-picker convention;
+    // see the LanguageContext/dropdown comments), so this direction switch
+    // only actually changes alignment for that one short word, never its
+    // script.
     color: colors.textPrimary,
     fontSize: 15,
     fontWeight: '600',
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   menuDivider: {
     height: StyleSheet.hairlineWidth,
@@ -2151,11 +2345,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     marginBottom: 20,
   },
   addModalTitle: {
+    // Shared by the Add Asset, Import Backup, and On-Demand Intel modal
+    // titles — all three now render translated t() text, so it's safe for
+    // this one shared style to be direction-aware.
     color: colors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   // Add Asset modal only (not shared with addModalSheet, used by Import
   // Backup) — a centered card, not a bottom sheet: full-screen dim layer.
