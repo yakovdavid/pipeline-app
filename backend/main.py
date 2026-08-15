@@ -18,6 +18,13 @@ quoteSummary endpoint yfinance exposes — in favor of the much lighter
 yf.Ticker(t).fast_info plus one history(period="1y") call, from which price,
 52-week high, SMA50/SMA200, and the daily closes both anomaly checks need
 are all derived.
+
+Also includes a Multi-Currency engine (see _resolve_currency_converters):
+every price-like field is normalized into USD based on the instrument's
+ACTUAL currency, as reported by Yahoo (fast_info.currency / the chart API's
+meta.currency) — not inferred from the ticker suffix, which used to assume
+every ".TA" (Tel Aviv Stock Exchange) security was Agorot-quoted and
+silently mixed ILS and USD math whenever that assumption didn't hold.
 """
 
 import random
@@ -50,13 +57,30 @@ except ImportError:  # pragma: no cover - depends on host platform
 
 MAX_SEARCH_RESULTS = 6
 
-# Tel Aviv Stock Exchange tickers (symbol suffix ".TA") are quoted by Yahoo
-# in Agorot (1/100 of a New Israeli Shekel), not USD. To get a comparable
-# USD value we convert: shekels = agorot / 100, then divide by the USD/ILS
-# rate (how many shekels one dollar buys) to get USD.
+# Tel Aviv Stock Exchange tickers (symbol suffix ".TA") aren't necessarily
+# priced in Agorot — Yahoo reports the ACTUAL currency per-instrument (see
+# the Multi-Currency engine: _normalize_currency, TickerSnapshot.currency),
+# so the suffix only drives which symbol gets queried (_normalize_ticker_
+# symbol), never how its price is interpreted. This is what most TASE
+# securities turn out to be quoted in, though: Agorot, 1/100 of a New
+# Israeli Shekel.
 TASE_TICKER_SUFFIX = ".TA"
 USD_ILS_FX_SYMBOL = "ILS=X"
 AGOROT_PER_SHEKEL = 100
+
+# --- Multi-Currency engine -----------------------------------------------
+# Every price-like field this file returns (price, sma50, sma200, high_52)
+# gets normalized into USD based on Yahoo's own reported currency for the
+# instrument, not inferred from the ticker suffix — the old suffix-only
+# heuristic assumed every TASE security is Agorot-quoted, which silently
+# mixed ILS and USD math (and broke portfolio-allocation totals) whenever
+# an instrument didn't actually match that assumption.
+DEFAULT_CURRENCY = "USD"
+# Israeli Agorot: both codes have been observed live from Yahoo for
+# different TASE instruments.
+AGOROT_CURRENCY_CODES = {"ILA", "ILX"}
+CURRENCY_SYMBOL_USD = "$"
+CURRENCY_SYMBOL_ILS = "₪"
 
 # Fallback data source: Yahoo's lighter /v8/finance/chart endpoint, used
 # when yfinance's own history()/fast_info calls fail outright (observed:
@@ -89,9 +113,12 @@ def _normalize_ticker_symbol(raw_ticker: str) -> str:
     Called once, centrally, from every endpoint that accepts a raw ticker
     (get_stock, which backs both Portfolio and Ambush Radar fetching, and
     get_intel) rather than requiring each to special-case it — from that
-    point on the rest of the pipeline, including get_stock's existing
-    Agorot -> USD conversion (already keyed off this same '.TA' suffix),
-    treats it as a standard Yahoo Finance symbol.
+    point on the rest of the pipeline treats it as a standard Yahoo Finance
+    symbol. Note this only decides which SYMBOL gets queried; it's
+    independent of currency — get_stock's Multi-Currency engine
+    (_resolve_currency_converters) decides how to interpret the PRICE
+    Yahoo returns for that symbol based on the currency Yahoo itself
+    reports, not this suffix.
     """
     symbol = raw_ticker.strip().upper()
     if symbol.isdigit():
@@ -368,6 +395,12 @@ class TickerSnapshot:
     # dev, currency-converted by the caller when needed) — neither makes
     # its own separate Yahoo history call any more.
     closes: list[float]
+    # Yahoo's own currency code for this instrument (e.g. 'USD', 'ILS',
+    # 'ILA') — read from fast_info.currency on the primary path, or the
+    # chart API's meta.currency on the fallback path. None if neither
+    # source reported one; get_stock's Multi-Currency engine
+    # (_resolve_currency_converters) then falls back to USD.
+    currency: str | None
 
 
 # --- In-memory ticker snapshot cache (THE SPEED FIX) ---------------------
@@ -467,11 +500,14 @@ def _fetch_ticker_snapshot_via_yfinance(symbol: str) -> TickerSnapshot:
         raise TickerNotFoundError(f"yfinance returned no usable closes for '{symbol}'")
 
     # fast_info gives a real-time current price (today's row in `history`
-    # can lag/be incomplete mid-session); fall back to the last close if
-    # fast_info is unavailable or raises, so a fast_info hiccup alone never
-    # fails the whole request when history already succeeded.
+    # can lag/be incomplete mid-session) AND this instrument's currency
+    # code (see the Multi-Currency engine, _resolve_currency_converters);
+    # fall back to the last close / no currency if fast_info is unavailable
+    # or raises, so a fast_info hiccup alone never fails the whole request
+    # when history already succeeded.
     price = closes[-1]
     high_52: float | None = None
+    currency: str | None = None
     try:
         fast_info = fetch_with_retry(
             lambda: ticker.fast_info,
@@ -485,6 +521,7 @@ def _fetch_ticker_snapshot_via_yfinance(symbol: str) -> TickerSnapshot:
         raw_year_high = getattr(fast_info, "year_high", None)
         if raw_year_high is not None:
             high_52 = float(raw_year_high)
+        currency = getattr(fast_info, "currency", None)
     except Exception as fast_info_error:  # noqa: BLE001 - best-effort; history's last close/high already cover us
         print(f"[resilience] fast_info fetch failed for '{symbol}' ({fast_info_error}); using history instead.")
 
@@ -494,7 +531,9 @@ def _fetch_ticker_snapshot_via_yfinance(symbol: str) -> TickerSnapshot:
     sma50 = sum(closes[-SMA_50_WINDOW:]) / SMA_50_WINDOW if len(closes) >= SMA_50_WINDOW else None
     sma200 = sum(closes[-SMA_200_WINDOW:]) / SMA_200_WINDOW if len(closes) >= SMA_200_WINDOW else None
 
-    return TickerSnapshot(price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes)
+    return TickerSnapshot(
+        price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes, currency=currency
+    )
 
 
 def _fetch_ticker_snapshot_via_chart_fallback(symbol: str) -> TickerSnapshot:
@@ -563,7 +602,15 @@ def _fetch_ticker_snapshot_via_chart_fallback(symbol: str) -> TickerSnapshot:
     elif highs:
         high_52 = max(highs)
 
-    return TickerSnapshot(price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes)
+    # This endpoint's meta object reports the instrument's currency
+    # directly (e.g. "USD", "ILA") — same field the Multi-Currency engine
+    # (_resolve_currency_converters) reads from fast_info.currency on the
+    # primary path.
+    currency = meta.get("currency")
+
+    return TickerSnapshot(
+        price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes, currency=currency
+    )
 
 
 def fetch_anomaly_news(
@@ -656,15 +703,15 @@ def check_mean_reversion_anomaly(
     thresholds this reads).
 
     price/sma50/high_52 must already be in the same currency (e.g. already
-    USD-converted for TASE tickers — see get_stock) since the structural
-    support trigger compares them directly. closes comes from the same
-    cached TickerSnapshot get_stock already fetched (raw/native currency,
-    unconverted) — this function no longer makes its own separate history
-    call for the 20-day std dev the way it used to. currency_converter
-    (get_stock's `to_usd`) is applied to the computed std dev to bring it
-    onto the same basis as price/sma50/high_52 — valid because standard
-    deviation scales linearly under a zero-intercept conversion like
-    Agorot -> USD.
+    USD-converted for ILS/Agorot-quoted instruments — see get_stock's
+    Multi-Currency engine) since the structural support trigger compares
+    them directly. closes comes from the same cached TickerSnapshot
+    get_stock already fetched (raw/native currency, unconverted) — this
+    function no longer makes its own separate history call for the 20-day
+    std dev the way it used to. currency_converter (get_stock's `to_usd`)
+    is applied to the computed std dev to bring it onto the same basis as
+    price/sma50/high_52 — valid because standard deviation scales linearly
+    under a zero-intercept conversion like Agorot -> USD or ILS -> USD.
 
     Returns None (not an error) whenever a trigger can't be evaluated at all
     for lack of data (missing/zero 52-week high, missing SMA50, or fewer
@@ -709,14 +756,23 @@ def check_mean_reversion_anomaly(
 
 def _fetch_usd_ils_rate() -> float:
     """Fetch the current USD/ILS exchange rate (shekels per one US dollar),
-    using the shared cache and the shared retry/throttle layer."""
+    using the shared cache (15-minute TTL — see CACHE_TTL_SECONDS/
+    fx_rate_cache) and the shared retry/throttle layer.
+
+    Uses fast_info, not .info, for the same reason every other fetch in
+    this file does: .info pulls the full quoteSummary payload and is by far
+    the most rate-limit-prone endpoint yfinance exposes, whereas fast_info
+    is much lighter. Only ever called for ILS/Agorot-quoted instruments
+    (see _resolve_currency_converters) — a USD-quoted ticker, the
+    overwhelming majority, never triggers this fetch at all, cached or not.
+    """
     cached_rate = fx_rate_cache.get(USD_ILS_FX_SYMBOL)
     if cached_rate is not None:
         return cached_rate
 
     try:
-        fx_info = fetch_with_retry(
-            lambda: yf.Ticker(USD_ILS_FX_SYMBOL, session=_yahoo_session).info,
+        fast_info = fetch_with_retry(
+            lambda: yf.Ticker(USD_ILS_FX_SYMBOL, session=_yahoo_session).fast_info,
             description="USD/ILS FX rate fetch",
         )
     except Exception as error:
@@ -725,16 +781,73 @@ def _fetch_usd_ils_rate() -> float:
             detail=f"Failed to fetch the USD/ILS exchange rate: {error}",
         ) from error
 
-    fx_rate = fx_info.get("regularMarketPrice") or fx_info.get("currentPrice")
-    if not fx_rate or fx_rate <= 0:
+    raw_rate = getattr(fast_info, "last_price", None)
+    if not raw_rate or raw_rate <= 0:
         raise HTTPException(
             status_code=502,
             detail="Failed to fetch a valid USD/ILS exchange rate.",
         )
 
-    fx_rate = float(fx_rate)
+    fx_rate = float(raw_rate)
     fx_rate_cache.set(USD_ILS_FX_SYMBOL, fx_rate)
     return fx_rate
+
+
+def _resolve_currency_converters(
+    currency: str | None,
+) -> tuple[str, Callable[[float | None], float | None], Callable[[float | None], float | None]]:
+    """Multi-Currency engine: given Yahoo's reported currency code for an
+    instrument (TickerSnapshot.currency), returns
+    (currency_symbol, to_usd, to_local_display) — the two converter
+    functions get_stock applies identically to each raw price-like field
+    (price, sma50, sma200, high_52; local_price only needs to_local_display,
+    applied to price alone).
+
+    - 'USD' (or missing/unrecognized — Fallback: default to USD): both
+      converters are the identity function.
+    - 'ILS': to_local_display is the identity function (already whole
+      Shekels); to_usd divides by the cached USD/ILS rate.
+    - 'ILA'/'ILX' (Israeli Agorot, 1/100 of a New Israeli Shekel — how most
+      TASE securities are actually quoted): to_local_display divides by
+      100 to get whole Shekels; to_usd does that AND divides by the
+      USD/ILS rate.
+
+    The USD/ILS rate is only fetched for the ILS/Agorot branches (and only
+    once per call here, reused via closure by both converters) — a
+    USD-quoted instrument, the overwhelming majority, never triggers an FX
+    lookup at all.
+    """
+    normalized_currency = (currency or DEFAULT_CURRENCY).strip().upper()
+
+    if normalized_currency in AGOROT_CURRENCY_CODES:
+        fx_rate = _fetch_usd_ils_rate()
+
+        def to_local_display(agorot_value: float | None) -> float | None:
+            return agorot_value / AGOROT_PER_SHEKEL if agorot_value is not None else None
+
+        def to_usd(agorot_value: float | None) -> float | None:
+            local_value = to_local_display(agorot_value)
+            return local_value / fx_rate if local_value is not None else None
+
+        return CURRENCY_SYMBOL_ILS, to_usd, to_local_display
+
+    if normalized_currency == "ILS":
+        fx_rate = _fetch_usd_ils_rate()
+
+        def to_local_display(shekel_value: float | None) -> float | None:
+            return shekel_value
+
+        def to_usd(shekel_value: float | None) -> float | None:
+            return shekel_value / fx_rate if shekel_value is not None else None
+
+        return CURRENCY_SYMBOL_ILS, to_usd, to_local_display
+
+    # 'USD', or any missing/unrecognized code — Fallback: default to USD
+    # rather than guessing at a conversion that may not apply.
+    def identity(value: float | None) -> float | None:
+        return value
+
+    return CURRENCY_SYMBOL_USD, identity, identity
 
 
 @app.get("/api/stock/{ticker}")
@@ -744,8 +857,10 @@ def get_stock(
     # TASE TICKER INTERCEPTOR: a bare numeric security number (e.g.
     # "1081124") is auto-suffixed to "1081124.TA" here, before anything
     # else touches it, so the rest of this function — and every helper it
-    # calls, including the Agorot -> USD conversion below — processes it as
-    # an ordinary Yahoo Finance symbol without any special-casing of its own.
+    # calls — processes it as an ordinary Yahoo Finance symbol without any
+    # special-casing of its own. This only decides which symbol gets
+    # queried; the Multi-Currency engine below decides how to interpret the
+    # price Yahoo returns for it, based on Yahoo's own reported currency.
     symbol = _normalize_ticker_symbol(ticker)
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker symbol is required.")
@@ -812,29 +927,26 @@ def get_stock(
     raw_high_52 = snapshot.high_52
     closes = snapshot.closes
 
-    if symbol.endswith(TASE_TICKER_SUFFIX):
-        # Strict handling: if we can't get a trustworthy FX rate, refuse to
-        # guess — returning an unconverted Agorot value as if it were USD
-        # would silently mislead the user by roughly two orders of magnitude.
-        fx_rate = _fetch_usd_ils_rate()
+    # MULTI-CURRENCY ENGINE: normalize every price-like field into USD
+    # based on Yahoo's own reported currency for this instrument (not the
+    # '.TA' ticker suffix — see the comment above TASE_TICKER_SUFFIX). If
+    # this instrument needs an FX rate (ILS/Agorot) and we can't get a
+    # trustworthy one, _fetch_usd_ils_rate raises a clean 502 rather than
+    # letting a silent guess mislead the user by roughly two orders of
+    # magnitude (Agorot) or the day's FX move (ILS).
+    currency_symbol, to_usd, to_local_display = _resolve_currency_converters(snapshot.currency)
 
-        def to_usd(agorot_value: float | None) -> float | None:
-            if agorot_value is None:
-                return None
-            return (agorot_value / AGOROT_PER_SHEKEL) / fx_rate
+    price = to_usd(raw_price)
+    local_price = to_local_display(raw_price)
+    sma50 = to_usd(raw_sma50)
+    sma200 = to_usd(raw_sma200)
+    high_52 = to_usd(raw_high_52)
 
-        price = to_usd(raw_price)
-        sma50 = to_usd(raw_sma50)
-        sma200 = to_usd(raw_sma200)
-        high_52 = to_usd(raw_high_52)
-    else:
-        price = raw_price
-        sma50 = raw_sma50
-        sma200 = raw_sma200
-        high_52 = raw_high_52
-
-        def to_usd(value: float | None) -> float | None:
-            return value
+    # Both are non-None here: raw_price is always a real float (never None
+    # on TickerSnapshot), and every branch of _resolve_currency_converters'
+    # to_usd/to_local_display maps a non-None input to a non-None output.
+    assert price is not None
+    assert local_price is not None
 
     # Kept bound to a plain (non-Optional) callable for
     # check_mean_reversion_anomaly's currency_converter param below, which
@@ -855,14 +967,29 @@ def get_stock(
 
     high_52_rounded = round(float(high_52), 2) if high_52 is not None else None
 
-    print(
-        f"[intel] {symbol}: price=${price:.2f} | 52W High="
-        f"{'$' + format(high_52_rounded, '.2f') if high_52_rounded is not None else 'N/A'} | "
-        f"Drawdown={drawdown_pct if drawdown_pct is not None else 'N/A'}%"
-    )
+    try:
+        print(
+            f"[intel] {symbol}: price={currency_symbol}{local_price:.2f} (${price:.2f} USD) | 52W High="
+            f"{'$' + format(high_52_rounded, '.2f') if high_52_rounded is not None else 'N/A'} | "
+            f"Drawdown={drawdown_pct if drawdown_pct is not None else 'N/A'}%"
+        )
+    except UnicodeEncodeError:
+        # This is a diagnostic log line only — some host stdout encodings
+        # (observed: Windows cp1252 consoles during local development)
+        # can't represent the '₪' currency symbol, and a console encoding
+        # quirk must never be allowed to break the actual response.
+        print(f"[intel] {symbol}: price={price:.2f} USD | drawdown={drawdown_pct if drawdown_pct is not None else 'N/A'}%")
 
     result: dict[str, float | str | None] = {
+        # JSON EXPORT: normalized USD price — this MUST stay the portfolio-
+        # math value (allocation totals, drawdown, trailing stops, ...), so
+        # the frontend never has to know or care what currency a given
+        # instrument actually trades in.
         "price": round(float(price), 2),
+        # The instrument's own actual local-currency value (e.g. 13.48),
+        # for display alongside currency_symbol — never used in math.
+        "local_price": round(float(local_price), 2),
+        "currency_symbol": currency_symbol,
         "sma50": round(float(sma50), 2) if sma50 is not None else None,
         "sma200": round(float(sma200), 2) if sma200 is not None else None,
         "high_52": high_52_rounded,
