@@ -20,11 +20,15 @@ yf.Ticker(t).fast_info plus one history(period="1y") call, from which price,
 are all derived.
 
 Also includes a Multi-Currency engine (see _resolve_currency_converters):
-every price-like field is normalized into USD based on the instrument's
-ACTUAL currency, as reported by Yahoo (fast_info.currency / the chart API's
-meta.currency) — not inferred from the ticker suffix, which used to assume
-every ".TA" (Tel Aviv Stock Exchange) security was Agorot-quoted and
-silently mixed ILS and USD math whenever that assumption didn't hold.
+every price-like field is normalized into USD. For every OTHER exchange
+this is based on the instrument's actual currency as reported by Yahoo
+(fast_info.currency / the chart API's meta.currency). For Tel Aviv Stock
+Exchange (".TA") tickers specifically, Yahoo's reported currency has been
+observed to be unreliable — some ".TA" instruments come back as 'ILS',
+others as 'ILA'/'ILX', with no consistent signal — so those are instead
+keyed unconditionally off the ".TA" suffix itself: any ".TA" ticker is
+always treated as Agorot-quoted (divide by 100 for ILS, then again by the
+USD/ILS rate for USD), regardless of what currency Yahoo reports for it.
 """
 
 import random
@@ -57,24 +61,27 @@ except ImportError:  # pragma: no cover - depends on host platform
 
 MAX_SEARCH_RESULTS = 6
 
-# Tel Aviv Stock Exchange tickers (symbol suffix ".TA") aren't necessarily
-# priced in Agorot — Yahoo reports the ACTUAL currency per-instrument (see
-# the Multi-Currency engine: _normalize_currency, TickerSnapshot.currency),
-# so the suffix only drives which symbol gets queried (_normalize_ticker_
-# symbol), never how its price is interpreted. This is what most TASE
-# securities turn out to be quoted in, though: Agorot, 1/100 of a New
-# Israeli Shekel.
+# Tel Aviv Stock Exchange tickers (symbol suffix ".TA") drive BOTH which
+# symbol gets queried (_normalize_ticker_symbol) AND, unconditionally, how
+# its price is interpreted (_resolve_currency_converters): Israeli
+# brokerages base their unit quantities on Nominal Value (Erech Nakuv) in
+# Agorot, but Yahoo Finance inconsistently self-reports the currency for
+# ".TA" instruments — sometimes already-divided 'ILS', sometimes raw
+# 'ILA'/'ILX' Agorot, with no reliable pattern. Trusting that reported
+# currency string therefore under-converts a meaningful fraction of TASE
+# tickers, inflating their USD-normalized price (and portfolio totals) by
+# roughly 100x. The fix: ANY symbol ending in TASE_TICKER_SUFFIX is always
+# treated as Agorot-quoted, regardless of what Yahoo's currency field says.
 TASE_TICKER_SUFFIX = ".TA"
 USD_ILS_FX_SYMBOL = "ILS=X"
 AGOROT_PER_SHEKEL = 100
 
 # --- Multi-Currency engine -----------------------------------------------
 # Every price-like field this file returns (price, sma50, sma200, high_52)
-# gets normalized into USD based on Yahoo's own reported currency for the
-# instrument, not inferred from the ticker suffix — the old suffix-only
-# heuristic assumed every TASE security is Agorot-quoted, which silently
-# mixed ILS and USD math (and broke portfolio-allocation totals) whenever
-# an instrument didn't actually match that assumption.
+# gets normalized into USD. ".TA"-suffixed symbols are always treated as
+# Agorot-quoted (see the TASE_TICKER_SUFFIX comment above for why this is
+# keyed off the symbol, not Yahoo's self-reported currency); every other
+# symbol still uses Yahoo's own reported currency for the instrument.
 DEFAULT_CURRENCY = "USD"
 # Israeli Agorot: both codes have been observed live from Yahoo for
 # different TASE instruments.
@@ -114,11 +121,12 @@ def _normalize_ticker_symbol(raw_ticker: str) -> str:
     (get_stock, which backs both Portfolio and Ambush Radar fetching, and
     get_intel) rather than requiring each to special-case it — from that
     point on the rest of the pipeline treats it as a standard Yahoo Finance
-    symbol. Note this only decides which SYMBOL gets queried; it's
-    independent of currency — get_stock's Multi-Currency engine
-    (_resolve_currency_converters) decides how to interpret the PRICE
-    Yahoo returns for that symbol based on the currency Yahoo itself
-    reports, not this suffix.
+    symbol. This decides which SYMBOL gets queried; get_stock's
+    Multi-Currency engine (_resolve_currency_converters) separately decides
+    how to interpret the PRICE Yahoo returns for that symbol — and, for any
+    symbol ending in TASE_TICKER_SUFFIX, that decision is now ALSO keyed off
+    this same suffix (unconditionally Agorot-quoted), not Yahoo's reported
+    currency.
     """
     symbol = raw_ticker.strip().upper()
     if symbol.isdigit():
@@ -399,7 +407,11 @@ class TickerSnapshot:
     # 'ILA') — read from fast_info.currency on the primary path, or the
     # chart API's meta.currency on the fallback path. None if neither
     # source reported one; get_stock's Multi-Currency engine
-    # (_resolve_currency_converters) then falls back to USD.
+    # (_resolve_currency_converters) then falls back to USD. NOTE: for
+    # ".TA" symbols this field is effectively advisory only — it's still
+    # recorded here, but _resolve_currency_converters ignores it in favor
+    # of the ".TA" suffix itself (see TASE_TICKER_SUFFIX), since Yahoo's
+    # reported currency has been observed to be unreliable for TASE.
     currency: str | None
 
 
@@ -794,23 +806,37 @@ def _fetch_usd_ils_rate() -> float:
 
 
 def _resolve_currency_converters(
+    symbol: str,
     currency: str | None,
 ) -> tuple[str, Callable[[float | None], float | None], Callable[[float | None], float | None]]:
-    """Multi-Currency engine: given Yahoo's reported currency code for an
-    instrument (TickerSnapshot.currency), returns
-    (currency_symbol, to_usd, to_local_display) — the two converter
-    functions get_stock applies identically to each raw price-like field
-    (price, sma50, sma200, high_52; local_price only needs to_local_display,
-    applied to price alone).
+    """Multi-Currency engine: returns (currency_symbol, to_usd,
+    to_local_display) — the two converter functions get_stock applies
+    identically to each raw price-like field (price, sma50, sma200,
+    high_52; local_price only needs to_local_display, applied to price
+    alone).
 
+    TASE PRICE NORMALIZATION (Agorot -> ILS): any `symbol` ending in
+    TASE_TICKER_SUFFIX (".TA") is ALWAYS treated as Agorot-quoted — 1/100
+    of a New Israeli Shekel, matching how Israeli brokerages base their
+    unit quantities (Nominal Value / Erech Nakuv) — regardless of what
+    `currency` (Yahoo's self-reported code) says. This is deliberately a
+    symbol check, not a `currency` check: Yahoo has been observed to report
+    ".TA" instruments inconsistently as already-divided 'ILS' for some and
+    raw 'ILA'/'ILX' Agorot for others, and trusting that string under-
+    converts a meaningful fraction of TASE tickers, inflating their
+    USD-normalized price by roughly 100x. So to_local_display always
+    divides by 100 to get whole Shekels, and to_usd does that AND divides
+    by the cached USD/ILS rate — for every ".TA" symbol, unconditionally.
+
+    For any other symbol, the pre-existing currency-string-based behavior
+    is unchanged:
     - 'USD' (or missing/unrecognized — Fallback: default to USD): both
       converters are the identity function.
     - 'ILS': to_local_display is the identity function (already whole
       Shekels); to_usd divides by the cached USD/ILS rate.
-    - 'ILA'/'ILX' (Israeli Agorot, 1/100 of a New Israeli Shekel — how most
-      TASE securities are actually quoted): to_local_display divides by
-      100 to get whole Shekels; to_usd does that AND divides by the
-      USD/ILS rate.
+    - 'ILA'/'ILX' (Israeli Agorot reported outside TASE, or just as a
+      belt-and-suspenders match): same Agorot treatment as the ".TA" branch
+      above.
 
     The USD/ILS rate is only fetched for the ILS/Agorot branches (and only
     once per call here, reused via closure by both converters) — a
@@ -818,8 +844,9 @@ def _resolve_currency_converters(
     lookup at all.
     """
     normalized_currency = (currency or DEFAULT_CURRENCY).strip().upper()
+    is_tase_ticker = symbol.strip().upper().endswith(TASE_TICKER_SUFFIX)
 
-    if normalized_currency in AGOROT_CURRENCY_CODES:
+    if is_tase_ticker or normalized_currency in AGOROT_CURRENCY_CODES:
         fx_rate = _fetch_usd_ils_rate()
 
         def to_local_display(agorot_value: float | None) -> float | None:
@@ -858,9 +885,11 @@ def get_stock(
     # "1081124") is auto-suffixed to "1081124.TA" here, before anything
     # else touches it, so the rest of this function — and every helper it
     # calls — processes it as an ordinary Yahoo Finance symbol without any
-    # special-casing of its own. This only decides which symbol gets
-    # queried; the Multi-Currency engine below decides how to interpret the
-    # price Yahoo returns for it, based on Yahoo's own reported currency.
+    # special-casing of its own. This decides which symbol gets queried;
+    # the Multi-Currency engine below decides how to interpret the price
+    # Yahoo returns for it — and now also reuses this same normalized
+    # `symbol` (specifically its ".TA" suffix, if any) as part of that
+    # decision, not just Yahoo's own reported currency.
     symbol = _normalize_ticker_symbol(ticker)
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker symbol is required.")
@@ -927,14 +956,18 @@ def get_stock(
     raw_high_52 = snapshot.high_52
     closes = snapshot.closes
 
-    # MULTI-CURRENCY ENGINE: normalize every price-like field into USD
-    # based on Yahoo's own reported currency for this instrument (not the
-    # '.TA' ticker suffix — see the comment above TASE_TICKER_SUFFIX). If
-    # this instrument needs an FX rate (ILS/Agorot) and we can't get a
-    # trustworthy one, _fetch_usd_ils_rate raises a clean 502 rather than
-    # letting a silent guess mislead the user by roughly two orders of
-    # magnitude (Agorot) or the day's FX move (ILS).
-    currency_symbol, to_usd, to_local_display = _resolve_currency_converters(snapshot.currency)
+    # MULTI-CURRENCY ENGINE: normalize every price-like field into USD.
+    # Any ".TA" (TASE) symbol is ALWAYS treated as Agorot-quoted — see the
+    # comment above TASE_TICKER_SUFFIX and inside _resolve_currency_
+    # converters for why this is keyed off the symbol itself rather than
+    # Yahoo's self-reported currency, which has been observed to be
+    # unreliable for this exchange specifically. Every other symbol still
+    # uses Yahoo's own reported currency. If this instrument needs an FX
+    # rate (ILS/Agorot) and we can't get a trustworthy one,
+    # _fetch_usd_ils_rate raises a clean 502 rather than letting a silent
+    # guess mislead the user by roughly two orders of magnitude (Agorot) or
+    # the day's FX move (ILS).
+    currency_symbol, to_usd, to_local_display = _resolve_currency_converters(symbol, snapshot.currency)
 
     price = to_usd(raw_price)
     local_price = to_local_display(raw_price)
