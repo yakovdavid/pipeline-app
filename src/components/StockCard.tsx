@@ -1,10 +1,10 @@
 import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
-import { ASSET_TYPE_LABEL_HE, SMA_LABEL } from '@/constants/labels';
+import { assetTypeLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
-import { usePipelineLanguage, type Language } from '@/contexts/language-context';
+import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { AssetType } from '@/types/asset';
 import { deriveLocalValue, formatUnitPrice } from '@/utils/currency';
@@ -53,11 +53,12 @@ type StockCardStyles = ReturnType<typeof createStyles>;
 // (usePipelineTheme() below is a context read, unaffected by memo).
 export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
-  const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
-  // DYNAMIC LANGUAGE TOGGLE: a plain context read (like usePipelineTheme()
+  // ROBUST LANGUAGE CONTEXT: a plain context read (like usePipelineTheme()
   // above), unaffected by this component's own memo() — a language switch
-  // re-renders this card immediately, no app restart required.
-  const { language } = usePipelineLanguage();
+  // re-renders this card, and its translated text via t(), immediately, no
+  // app restart required.
+  const { language, t } = usePipelineLanguage();
+  const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
   const { ticker, assetType, price, localPrice, currencySymbol, sma50, sma200 } = stock;
 
@@ -77,21 +78,20 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
   // linear conversion to every price-like field for a given ticker — and
   // only then formatted, so a ".TA" ticker's moving averages show in
   // Agorot right alongside its current price, not mixed USD/Agorot.
-  const priceDisplay = formatUnitPrice(ticker, localPrice, currencySymbol, language);
+  const agorotSuffix = t('ag');
+  const priceDisplay = formatUnitPrice(ticker, localPrice, currencySymbol, agorotSuffix);
   const localSma50 = sma50 !== null ? deriveLocalValue(sma50, localPrice, price) : null;
   const localSma200 = sma200 !== null ? deriveLocalValue(sma200, localPrice, price) : null;
   const sma50Display =
-    localSma50 !== null ? formatUnitPrice(ticker, localSma50, currencySymbol, language) : null;
+    localSma50 !== null ? formatUnitPrice(ticker, localSma50, currencySymbol, agorotSuffix) : null;
   const sma200Display =
-    localSma200 !== null ? formatUnitPrice(ticker, localSma200, currencySymbol, language) : null;
+    localSma200 !== null ? formatUnitPrice(ticker, localSma200, currencySymbol, agorotSuffix) : null;
 
   return (
     <View style={styles.card}>
       {isNearStructuralStop && (
         <View style={styles.warningBanner}>
-          <Text style={styles.warningBannerText}>
-            ⚠ אזהרת עצירה מבנית: במרחק 2% מתמיכת ממוצע 200 יום
-          </Text>
+          <Text style={styles.warningBannerText}>{t('structuralStopWarning')}</Text>
         </View>
       )}
 
@@ -101,7 +101,7 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
               an identifier, not translatable text. */}
           <Text style={styles.ticker}>{ticker}</Text>
           <View style={styles.assetTypeBadge}>
-            <Text style={styles.assetTypeBadgeText}>{ASSET_TYPE_LABEL_HE[assetType]}</Text>
+            <Text style={styles.assetTypeBadgeText}>{assetTypeLabel(t, assetType)}</Text>
           </View>
         </View>
         <View style={styles.priceGroup}>
@@ -130,7 +130,7 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
           isBullish={isBullish}
           colors={colors}
           styles={styles}
-          language={language}
+          t={t}
         />
         <View
           style={[
@@ -144,7 +144,7 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
             },
           ]}>
           <Text style={styles.badgeText}>
-            {!hasTrendData ? 'לא זמין' : isBullish ? 'עולה' : 'יורד'}
+            {!hasTrendData ? t('notAvailable') : isBullish ? t('bullish') : t('bearish')}
           </Text>
         </View>
       </View>
@@ -166,7 +166,7 @@ type MomentumBarProps = {
   isBullish: boolean;
   colors: PipelineColorScheme;
   styles: StockCardStyles;
-  language: Language;
+  t: TFunction;
 };
 
 // Minimalist visual showing where the current price sits relative to the
@@ -183,10 +183,10 @@ function MomentumBar({
   isBullish,
   colors,
   styles,
-  language,
+  t,
 }: MomentumBarProps) {
   if (sma50 === null || sma200 === null || sma50Display === null || sma200Display === null) {
-    return <Text style={styles.momentumFallbackText}>אין מספיק נתוני ממוצע נע</Text>;
+    return <Text style={styles.momentumFallbackText}>{t('insufficientMomentumData')}</Text>;
   }
 
   // The dot's position on the track is intentionally still dynamic — it
@@ -213,13 +213,19 @@ function MomentumBar({
           numerically higher (unlike the dot above): SMA50 always reads on
           the left and SMA200 always on the right, so the row doesn't swap
           positions out from under a user scanning the list — a text swap
-          that tracked the dot used to make quick visual scanning unreliable. */}
+          that tracked the dot used to make quick visual scanning unreliable.
+          Each label is still ONE Text node combining a translated word with
+          a number, but — unlike the units/price row in PortfolioStockRow
+          (index.tsx) — this is safe as a single string: it always starts
+          with the translated word (SMA50/SMA200 or their Hebrew equivalent),
+          never a bare leading numeral, which is what actually confuses the
+          bidi text engine (see the RTL MIXED TEXT RENDERING FIX note there). */}
       <View style={styles.momentumLabelRow}>
         <Text style={styles.momentumLabelText}>
-          {SMA_LABEL[language].sma50} {sma50Display}
+          {t('sma50')} {sma50Display}
         </Text>
         <Text style={styles.momentumLabelText}>
-          {SMA_LABEL[language].sma200} {sma200Display}
+          {t('sma200')} {sma200Display}
         </Text>
       </View>
     </View>
@@ -227,13 +233,16 @@ function MomentumBar({
 }
 
 // A factory (not a module-level StyleSheet.create) so it can be re-derived
-// whenever the active theme changes — StyleSheet.create bakes in whatever
-// color values it's given at the moment it's called, so a module-level call
-// would freeze in whichever theme happened to be active on first import and
-// never update. Called from a useMemo(() => createStyles(colors, isDarkMode),
-// [colors, isDarkMode]) above, so it only actually re-runs on a real
-// theme change, not on every render.
-function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
+// whenever the active theme OR language changes — StyleSheet.create bakes
+// in whatever values it's given at the moment it's called, so a
+// module-level call would freeze in whichever theme/language happened to be
+// active on first import and never update. Called from a
+// useMemo(() => createStyles(colors, isDarkMode, language), [colors,
+// isDarkMode, language]) above, so it only actually re-runs on a real theme
+// or language change, not on every render.
+function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language: Language) {
+  const isHebrew = language === 'he';
+
   return StyleSheet.create({
     card: {
       backgroundColor: colors.cardBackground,
@@ -270,12 +279,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.warningText,
       fontSize: 12,
       fontWeight: '700',
-      // RTL LOCALIZATION: standard Hebrew label text reads right-to-left;
-      // numeric values/ticker symbols elsewhere are deliberately left at
-      // their default (LTR) alignment instead — see the ticker/price
-      // styles below.
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      // RTL/LTR LOCALIZATION: standard label text is right-aligned in
+      // Hebrew, left-aligned in English; numeric values/ticker symbols
+      // elsewhere are deliberately left at LTR regardless — see the
+      // ticker/price styles below.
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     row: {
       flexDirection: 'row',
@@ -293,7 +302,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     },
     ticker: {
       // Ticker symbols stay LTR regardless of app language — they're
-      // identifiers, not translatable text (per the RTL localization spec).
+      // identifiers, not translatable text.
       color: colors.textPrimary,
       fontSize: 18,
       fontWeight: '700',
@@ -309,8 +318,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textSecondary,
       fontSize: 10,
       fontWeight: '700',
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     priceGroup: {
       flexDirection: 'row',
@@ -318,8 +327,9 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       gap: 12,
     },
     price: {
-      // Numeric/currency value: kept LTR per the RTL localization spec,
-      // regardless of the '$'/'₪' currency symbol prefixing it.
+      // Numeric/currency value: kept LTR regardless of app language, same
+      // as the ticker above — a currency symbol/Agorot suffix prefixing or
+      // trailing a number doesn't change that.
       color: colors.textPrimary,
       fontSize: 18,
       fontWeight: '600',
@@ -340,8 +350,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textPrimary,
       fontSize: 12,
       fontWeight: '700',
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     momentumContainer: {
       flex: 1,
@@ -350,8 +360,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       flex: 1,
       color: colors.textSecondary,
       fontSize: 13,
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     momentumTrack: {
       height: 6,

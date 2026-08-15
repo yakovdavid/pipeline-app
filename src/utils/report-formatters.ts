@@ -1,6 +1,7 @@
 import type { Stock } from '@/components/StockCard';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import type { PortfolioStock } from '@/types/portfolio';
+import { getEffectiveUnits } from '@/utils/currency';
 
 // Shared by the Ambush Radar screen's own export and the Portfolio screen's
 // combined export, so the two reports describe Ambush data identically.
@@ -47,7 +48,15 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
       lines.push('  (none)');
     } else {
       sectionStocks.forEach((stock) => {
-        const totalValue = stock.units * stock.price;
+        // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): see
+        // getEffectiveUnits — a TASE ETF's raw `units` is a Nominal Value
+        // quantity (100 nominal units = 1 real pricing unit), so it's
+        // converted before being multiplied by price, same as the on-screen
+        // total in PortfolioStockRow (index.tsx). The report still displays
+        // the RAW units held (what the user actually entered), only the
+        // computed total value uses the effective (real) unit count.
+        const effectiveUnits = getEffectiveUnits(stock.ticker, stock.assetType, stock.units);
+        const totalValue = effectiveUnits * stock.price;
         lines.push(
           `  ${stock.ticker}: ${stock.units} units @ $${stock.price.toFixed(2)} = $${totalValue.toFixed(2)}`,
         );

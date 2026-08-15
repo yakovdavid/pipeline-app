@@ -2,7 +2,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { Tabs } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { TAB_LABEL } from '@/constants/labels';
 import { usePipelineLanguage } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 
@@ -13,7 +12,7 @@ export default function TabsLayout() {
   // to) is read fresh on every render, so switching languages elsewhere in
   // the app relabels the always-visible tab bar immediately — no navigation
   // stack reset or app restart needed.
-  const { language } = usePipelineLanguage();
+  const { t } = usePipelineLanguage();
 
   return (
     <Tabs
@@ -49,7 +48,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="ambush"
         options={{
-          title: TAB_LABEL[language].ambush,
+          title: t('ambushRadar'),
           tabBarIcon: ({ focused, color, size }) => (
             <Ionicons name={focused ? 'locate' : 'locate-outline'} size={size} color={color} />
           ),
@@ -58,7 +57,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="index"
         options={{
-          title: TAB_LABEL[language].portfolio,
+          title: t('portfolio'),
           tabBarIcon: ({ focused, color, size }) => (
             <Ionicons
               name={focused ? 'briefcase' : 'briefcase-outline'}

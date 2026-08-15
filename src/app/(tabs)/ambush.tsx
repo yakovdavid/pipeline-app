@@ -18,9 +18,11 @@ import { StatusBar } from 'expo-status-bar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { StockCard, type Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
+import { assetTypeLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
+import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
 import type { AmbushTickerEntry } from '@/types/ambush';
@@ -40,7 +42,11 @@ const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
 // ETFs against the longer SMA200 (see StockCard for the trend rule itself).
 export default function AmbushRadarScreen() {
   const { colors, isDarkMode } = usePipelineTheme();
-  const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
+  // ROBUST LANGUAGE CONTEXT: a plain context read, same as usePipelineTheme
+  // above — switching languages re-renders this screen, and every child
+  // that reads it (StockCard included), immediately, no app restart.
+  const { language, t } = usePipelineLanguage();
+  const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [ticker, setTicker] = useState('');
@@ -265,7 +271,7 @@ export default function AmbushRadarScreen() {
       <StatusBar style={isDarkMode ? 'light' : 'dark'} />
 
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>מכ״ם מארבים</Text>
+        <Text style={styles.headerTitle}>{t('ambushRadar')}</Text>
       </View>
 
       <View style={styles.exportRow}>
@@ -292,7 +298,7 @@ export default function AmbushRadarScreen() {
             selectedAssetType === 'Stock' && { backgroundColor: colors.bullish },
           ]}
           onPress={() => setSelectedAssetType('Stock')}>
-          <Text style={styles.assetTypeButtonText}>מניה</Text>
+          <Text style={styles.assetTypeButtonText}>{assetTypeLabel(t, 'Stock')}</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[
@@ -301,7 +307,7 @@ export default function AmbushRadarScreen() {
             selectedAssetType === 'ETF' && { backgroundColor: colors.core },
           ]}
           onPress={() => setSelectedAssetType('ETF')}>
-          <Text style={styles.assetTypeButtonText}>תעודת סל</Text>
+          <Text style={styles.assetTypeButtonText}>{assetTypeLabel(t, 'ETF')}</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.addButton, isAdding && styles.addButtonDisabled]}
@@ -360,7 +366,15 @@ export default function AmbushRadarScreen() {
 // StockCard.tsx. Called from a useMemo(() => createStyles(colors,
 // isDarkMode), [colors, isDarkMode]) above, so it only actually re-runs on
 // a real theme change, not on every render.
-function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
+function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language: Language) {
+  // ROBUST LANGUAGE CONTEXT: only the elements that now render translated
+  // (t()) text switch alignment/writingDirection with the language —
+  // everything else on this screen (export/add buttons, alerts, the
+  // initializing message) is still Hebrew-only regardless of the toggle,
+  // out of this pass's translation scope, and keeps its literal 'right'/
+  // 'rtl'.
+  const isHebrew = language === 'he';
+
   return StyleSheet.create({
     safeArea: {
       flex: 1,
@@ -371,14 +385,15 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       paddingVertical: 12,
     },
     headerTitle: {
-      // RTL LOCALIZATION: standard Hebrew label text is right-aligned;
-      // numeric values/ticker symbols elsewhere are deliberately left at
-      // their default (LTR) alignment instead (see StockCard.tsx).
+      // RTL/LTR LOCALIZATION: right-aligned in Hebrew, left-aligned in
+      // English; numeric values/ticker symbols elsewhere are deliberately
+      // left at their default (LTR) alignment regardless (see
+      // StockCard.tsx).
       color: colors.textPrimary,
       fontSize: 28,
       fontWeight: '700',
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     exportRow: {
       paddingHorizontal: 16,
@@ -433,8 +448,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       color: colors.textPrimary,
       fontSize: 14,
       fontWeight: '600',
-      textAlign: 'right',
-      writingDirection: 'rtl',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     addButton: {
       backgroundColor: colors.bullish,

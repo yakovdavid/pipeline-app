@@ -30,17 +30,11 @@ import { StatusBar } from 'expo-status-bar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
-import {
-  AT_PRICE_LABEL,
-  ASSET_TYPE_LABEL_HE,
-  CATEGORY_LABEL_HE,
-  CATEGORY_TARGET_PCT,
-  formatUnitsLabel,
-} from '@/constants/labels';
+import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT, formatUnitsLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { SATELLITE_ETF_TS_PCT, SATELLITE_STOCK_TS_PCT } from '@/constants/thresholds';
-import { usePipelineLanguage, type Language } from '@/contexts/language-context';
+import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import {
   fetchInChunks,
@@ -53,15 +47,25 @@ import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
 import { createBackupPayload, parseBackupPayload, restoreBackupPayload, type BackupPayload } from '@/utils/backup';
-import { deriveLocalValue, formatTotalValue, formatUnitPrice } from '@/utils/currency';
+import {
+  deriveLocalValue,
+  formatTotalValue,
+  formatUnitPrice,
+  getEffectiveUnits,
+} from '@/utils/currency';
 import { formatAmbushLines, formatPortfolioLines } from '@/utils/report-formatters';
 import { normalizeTickerInput } from '@/utils/ticker';
 
 type FilterOption = 'All' | PortfolioCategory;
 const FILTER_OPTIONS: FilterOption[] = ['All', 'Core', 'Satellite', 'Quality'];
-// Display-only Hebrew labels for the filter chips — FilterOption itself
-// (and the comparisons against activeFilter) stay in English.
-const FILTER_LABEL_HE: Record<FilterOption, string> = { All: 'הכל', ...CATEGORY_LABEL_HE };
+
+// ROBUST LANGUAGE CONTEXT: the filter chip's label — 'All' has its own
+// dictionary key, the three categories reuse categoryLabel (same helper the
+// SectionList headers and Add Asset modal's category picker use), so all
+// three places agree on exactly the same translated text.
+function filterOptionLabel(t: TFunction, filterOption: FilterOption): string {
+  return filterOption === 'All' ? t('all') : categoryLabel(t, filterOption);
+}
 
 // Snap points for the Intel modal's draggable bottom sheet, expressed as
 // pixel heights (not percentages) so PanResponder math below can work with
@@ -112,10 +116,10 @@ function getSatelliteTrailingStopPct(assetType: AssetType): number {
   return assetType === 'ETF' ? SATELLITE_ETF_TS_PCT : SATELLITE_STOCK_TS_PCT;
 }
 
-// ALLOCATION STATUS: builds the "<layer> (יעד: X% | מצוי: Y%) - N נכסים"
-// section-header string — target (יעד) from the fixed Fortress 2.0 Model
-// (CATEGORY_TARGET_PCT), actual (מצוי) computed live from this layer's
-// share of the whole portfolio's value, and N the number of tickers in it.
+// ALLOCATION STATUS: builds the "<layer> (Target: X% | Actual: Y%) - N
+// Assets" section-header string — target from the fixed Fortress 2.0 Model
+// (CATEGORY_TARGET_PCT), actual computed live from this layer's share of
+// the whole portfolio's value, and N the number of tickers in it.
 //
 // Both categoryStocks' contribution and totalPortfolioValue MUST be
 // computed from `stock.price` (USD-normalized by the backend's
@@ -123,16 +127,34 @@ function getSatelliteTrailingStopPct(assetType: AssetType): number {
 // value and a Dollar value directly would silently corrupt every
 // percentage this produces; that's the exact "mathematical flaw" the
 // Multi-Currency engine exists to fix.
+//
+// TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE-listed ETF's
+// `units` is a Nominal Value quantity, not a real share count — 100
+// nominal units = 1 real pricing unit — so it's converted via
+// getEffectiveUnits before being multiplied by price, exactly like
+// PortfolioStockRow's own position-total math below. Left unconverted, a
+// held quantity like 1433 would be multiplied straight through instead of
+// the ~14.33 real units it actually represents, inflating this layer's
+// (and the whole portfolio's) computed value ~100x.
+//
+// This is a single translated-word-first string (categoryLabel(...) always
+// comes first), which is bidi-safe as one <Text> node — unlike the
+// number-first units/price row in PortfolioStockRow, see the RTL MIXED
+// TEXT RENDERING FIX note there.
 function buildSectionTitle(
+  t: TFunction,
   category: PortfolioCategory,
   categoryStocks: PortfolioStock[],
   totalPortfolioValue: number,
 ): string {
-  const categoryValue = categoryStocks.reduce((sum, stock) => sum + stock.units * stock.price, 0);
+  const categoryValue = categoryStocks.reduce(
+    (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
+    0,
+  );
   const actualPct = totalPortfolioValue > 0 ? (categoryValue / totalPortfolioValue) * 100 : 0;
   return (
-    `${CATEGORY_LABEL_HE[category]} (יעד: ${CATEGORY_TARGET_PCT[category]}% | ` +
-    `מצוי: ${actualPct.toFixed(1)}%) - ${categoryStocks.length} נכסים`
+    `${categoryLabel(t, category)} (${t('target')}: ${CATEGORY_TARGET_PCT[category]}% | ` +
+    `${t('actual')}: ${actualPct.toFixed(1)}%) - ${categoryStocks.length} ${t('assets')}`
   );
 }
 
@@ -167,7 +189,7 @@ export default function PortfolioScreen() {
   // DYNAMIC LANGUAGE TOGGLE: a plain context read, same as usePipelineTheme
   // above — switching languages re-renders this screen (and every child
   // that reads it, directly or via props) immediately, no app restart.
-  const { language, setLanguage } = usePipelineLanguage();
+  const { language, setLanguage, t } = usePipelineLanguage();
   // Re-derived only when the active theme actually changes (StyleSheet.create
   // bakes in whatever colors it's given at call time, so this can't be a
   // module-level constant the way it used to be — see createStyles below).
@@ -465,9 +487,10 @@ export default function PortfolioScreen() {
         colors={colors}
         styles={styles}
         language={language}
+        t={t}
       />
     ),
-    [handleDeleteTicker, handleSaveEdit, colors, styles, language],
+    [handleDeleteTicker, handleSaveEdit, colors, styles, language, t],
   );
 
   const onRefresh = async () => {
@@ -720,29 +743,37 @@ export default function PortfolioScreen() {
   };
 
   // ALLOCATION STATUS: both the per-layer contribution and this grand
-  // total are `units * price` (USD) — never `localPrice` — so a Shekel
-  // TASE position and a Dollar US position sum together correctly. See
-  // buildSectionTitle above for how this feeds the section headers.
+  // total are `effectiveUnits * price` (USD) — never `localPrice` — so a
+  // Shekel TASE position and a Dollar US position sum together correctly.
+  // TASE ETF MATH FIX: getEffectiveUnits applies the Nominal Value / Erech
+  // Nakuv ÷100 conversion for TASE ETFs (see its own comment in
+  // @/utils/currency) — without it, a TASE ETF's raw nominal `units` would
+  // be multiplied straight through, inflating this total ~100x for any
+  // portfolio holding one. See buildSectionTitle above for how this feeds
+  // the section headers.
   const coreStocks = stocks.filter((stock) => stock.category === 'Core');
   const satelliteStocks = stocks.filter((stock) => stock.category === 'Satellite');
   const qualityStocks = stocks.filter((stock) => stock.category === 'Quality');
-  const totalPortfolioValue = stocks.reduce((sum, stock) => sum + stock.units * stock.price, 0);
+  const totalPortfolioValue = stocks.reduce(
+    (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
+    0,
+  );
 
   const allSections: PortfolioListSection[] = [
     {
-      title: buildSectionTitle('Core', coreStocks, totalPortfolioValue),
+      title: buildSectionTitle(t, 'Core', coreStocks, totalPortfolioValue),
       category: 'Core',
       accentColor: colors.core,
       data: coreStocks,
     },
     {
-      title: buildSectionTitle('Satellite', satelliteStocks, totalPortfolioValue),
+      title: buildSectionTitle(t, 'Satellite', satelliteStocks, totalPortfolioValue),
       category: 'Satellite',
       accentColor: colors.satellite,
       data: satelliteStocks,
     },
     {
-      title: buildSectionTitle('Quality', qualityStocks, totalPortfolioValue),
+      title: buildSectionTitle(t, 'Quality', qualityStocks, totalPortfolioValue),
       category: 'Quality',
       accentColor: colors.quality,
       data: qualityStocks,
@@ -757,7 +788,7 @@ export default function PortfolioScreen() {
       <StatusBar style={isDarkMode ? 'light' : 'dark'} />
 
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>תיק השקעות</Text>
+        <Text style={styles.headerTitle}>{t('portfolio')}</Text>
         <View style={styles.headerActions}>
           {/* Standalone theme toggle, separate from the "More options"
               dropdown — a single-tap action belongs in the header itself,
@@ -769,16 +800,20 @@ export default function PortfolioScreen() {
             accessibilityLabel={isDarkMode ? 'עבור למצב בהיר' : 'עבור למצב כהה'}>
             <Ionicons name={isDarkMode ? 'moon' : 'sunny'} size={22} color={colors.textPrimary} />
           </TouchableOpacity>
-          {/* DYNAMIC LANGUAGE TOGGLE: opens a small dropdown to pick English
-              or עברית — the language itself lives in LanguageContext, shared
-              app-wide, so this takes effect on both tabs immediately, with
-              no navigation/refocus or app restart needed (unlike RN's own
-              I18nManager RTL flip, which requires a reload). */}
+          {/* LANGUAGE TOGGLE BUTTON UI: a text-based button showing the
+              CURRENT active language ("HEB"/"EN"), replacing the earlier
+              Globe icon — pressing it opens the same dropdown as before to
+              pick the other one. The language itself lives in
+              LanguageContext, shared app-wide, so this takes effect on both
+              tabs immediately, with no navigation/refocus or app restart
+              needed (unlike RN's own I18nManager RTL flip, which requires a
+              reload). */}
           <TouchableOpacity
+            style={styles.languageToggleButton}
             onPress={() => setIsLanguageMenuVisible(true)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             accessibilityLabel={language === 'he' ? 'שנה שפה' : 'Change language'}>
-            <Ionicons name="globe-outline" size={22} color={colors.textPrimary} />
+            <Text style={styles.languageToggleButtonText}>{language === 'he' ? 'HEB' : 'EN'}</Text>
           </TouchableOpacity>
           <TouchableOpacity
             onPress={() => setIsMenuVisible(true)}
@@ -804,7 +839,7 @@ export default function PortfolioScreen() {
                 styles.filterButtonText,
                 activeFilter === filterOption && styles.filterButtonTextActive,
               ]}>
-              {FILTER_LABEL_HE[filterOption]}
+              {filterOptionLabel(t, filterOption)}
             </Text>
           </TouchableOpacity>
         ))}
@@ -999,7 +1034,7 @@ export default function PortfolioScreen() {
             <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
               <View style={styles.addAssetModalCard}>
                 <View style={styles.addModalHeader}>
-                  <Text style={styles.addModalTitle}>הוסף נכס</Text>
+                  <Text style={styles.addModalTitle}>{t('addAsset')}</Text>
                   <TouchableOpacity
                     onPress={() => setIsAddModalVisible(false)}
                     hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -1047,7 +1082,7 @@ export default function PortfolioScreen() {
                         selectedCategory === 'Core' && { backgroundColor: colors.core },
                       ]}
                       onPress={() => setSelectedCategory('Core')}>
-                      <Text style={styles.categoryButtonText}>{CATEGORY_LABEL_HE.Core}</Text>
+                      <Text style={styles.categoryButtonText}>{categoryLabel(t, 'Core')}</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={[
@@ -1056,7 +1091,7 @@ export default function PortfolioScreen() {
                         selectedCategory === 'Satellite' && { backgroundColor: colors.satellite },
                       ]}
                       onPress={() => setSelectedCategory('Satellite')}>
-                      <Text style={styles.categoryButtonText}>{CATEGORY_LABEL_HE.Satellite}</Text>
+                      <Text style={styles.categoryButtonText}>{categoryLabel(t, 'Satellite')}</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={[
@@ -1065,7 +1100,7 @@ export default function PortfolioScreen() {
                         selectedCategory === 'Quality' && { backgroundColor: colors.quality },
                       ]}
                       onPress={() => setSelectedCategory('Quality')}>
-                      <Text style={styles.categoryButtonText}>{CATEGORY_LABEL_HE.Quality}</Text>
+                      <Text style={styles.categoryButtonText}>{categoryLabel(t, 'Quality')}</Text>
                     </TouchableOpacity>
                   </View>
 
@@ -1078,7 +1113,7 @@ export default function PortfolioScreen() {
                         selectedAssetType === 'Stock' && { backgroundColor: colors.bullish },
                       ]}
                       onPress={() => setSelectedAssetType('Stock')}>
-                      <Text style={styles.assetTypeButtonText}>{ASSET_TYPE_LABEL_HE.Stock}</Text>
+                      <Text style={styles.assetTypeButtonText}>{assetTypeLabel(t, 'Stock')}</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={[
@@ -1087,7 +1122,7 @@ export default function PortfolioScreen() {
                         selectedAssetType === 'ETF' && { backgroundColor: colors.core },
                       ]}
                       onPress={() => setSelectedAssetType('ETF')}>
-                      <Text style={styles.assetTypeButtonText}>{ASSET_TYPE_LABEL_HE.ETF}</Text>
+                      <Text style={styles.assetTypeButtonText}>{assetTypeLabel(t, 'ETF')}</Text>
                     </TouchableOpacity>
                   </View>
 
@@ -1295,21 +1330,22 @@ type PortfolioStockRowProps = {
   colors: PipelineColorScheme;
   styles: PortfolioStyles;
   language: Language;
+  t: TFunction;
 };
 
 // Wrapped in memo() so updating one position (price refresh, edit, delete)
 // doesn't re-render every other row in the SectionList — stocks state
 // updates already keep unaffected PortfolioStock objects referentially
 // stable (see onRefresh/handleSaveEdit/handleDeleteTicker above), and
-// accentColor/onDelete/onSaveEdit/colors/styles/language are all stable
+// accentColor/onDelete/onSaveEdit/colors/styles/language/t are all stable
 // across renders too (a fixed per-theme accent color, useCallback-wrapped
 // handlers, the parent's own useMemo-derived theme values, and the
-// language string itself respectively — colors/styles only actually change
-// reference on a real theme toggle, language only on a real language
-// switch), so
+// language string/translator function respectively — colors/styles only
+// actually change reference on a real theme toggle, language/t only on a
+// real language switch), so
 // this comparison is meaningful, not a no-op. memo() only shallow-compares
 // props, not context, but this component reads no context of its own —
-// colors/styles/language arrive as props from PortfolioScreen, which is
+// colors/styles/language/t arrive as props from PortfolioScreen, which is
 // what actually re-renders on a theme or language change and passes the
 // new values down.
 const PortfolioStockRow = memo(function PortfolioStockRow({
@@ -1320,10 +1356,20 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   colors,
   styles,
   language,
+  t,
 }: PortfolioStockRowProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [unitsText, setUnitsText] = useState(String(stock.units));
   const [editedAssetType, setEditedAssetType] = useState<AssetType>(stock.assetType);
+
+  // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
+  // `units` is a Nominal Value quantity — 100 nominal units = 1 real
+  // pricing unit — so BOTH this row's own local total AND
+  // PortfolioScreen's USD layer/portfolio totals (see allSections /
+  // buildSectionTitle) go through getEffectiveUnits first. The raw
+  // `stock.units` the user actually entered is still what's shown in the
+  // quantity row itself below — only the VALUE math changes.
+  const effectiveUnits = getEffectiveUnits(stock.ticker, stock.assetType, stock.units);
 
   // MULTI-CURRENCY DISPLAY: this row's own total, shown in the
   // instrument's own local currency (self-consistent — it's all one
@@ -1331,13 +1377,14 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // NEVER used for portfolio-wide totals/allocation math — that's computed
   // independently in PortfolioScreen from `stock.price` (USD) alone; see
   // the IMPORTANT note above allSections there.
-  const localTotalValue = stock.units * stock.localPrice;
+  const localTotalValue = effectiveUnits * stock.localPrice;
 
   // TASE AGOROT DISPLAY: the UNIT price, Agorot-formatted for a ".TA"
   // ticker (e.g. "3985 אג'") — the position TOTAL above/below always stays
   // in whole Shekels regardless (see formatTotalValue), matching how
   // Israeli banks quote unit prices vs. position values differently.
-  const unitPriceDisplay = formatUnitPrice(stock.ticker, stock.localPrice, stock.currencySymbol, language);
+  const agorotSuffix = t('ag');
+  const unitPriceDisplay = formatUnitPrice(stock.ticker, stock.localPrice, stock.currencySymbol, agorotSuffix);
   const totalValueDisplay = formatTotalValue(localTotalValue, stock.currencySymbol);
 
   // Same Agorot treatment for the 52-week high shown in the drawdown row
@@ -1346,7 +1393,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // approximation — see deriveLocalValue) before formatting.
   const localHigh52 = stock.high52 !== null ? deriveLocalValue(stock.high52, stock.localPrice, stock.price) : null;
   const high52Display =
-    localHigh52 !== null ? formatUnitPrice(stock.ticker, localHigh52, stock.currencySymbol, language) : null;
+    localHigh52 !== null ? formatUnitPrice(stock.ticker, localHigh52, stock.currencySymbol, agorotSuffix) : null;
   // Trailing stops are a Satellite-only mechanic: Core positions are meant
   // to be held through drawdowns, and Quality positions are risk-reviewed
   // manually (see the drawdown-review styling below) rather than
@@ -1393,10 +1440,10 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
         <Text style={styles.stockTicker}>{stock.ticker}</Text>
         <View style={styles.stockTopRight}>
           <View style={styles.assetTypeBadge}>
-            <Text style={styles.assetTypeBadgeText}>{ASSET_TYPE_LABEL_HE[stock.assetType]}</Text>
+            <Text style={styles.assetTypeBadgeText}>{assetTypeLabel(t, stock.assetType)}</Text>
           </View>
           <View style={[styles.categoryBadge, { backgroundColor: accentColor }]}>
-            <Text style={styles.categoryBadgeText}>{CATEGORY_LABEL_HE[stock.category]}</Text>
+            <Text style={styles.categoryBadgeText}>{categoryLabel(t, stock.category)}</Text>
           </View>
           <TouchableOpacity
             onPress={() => onDelete(stock.ticker)}
@@ -1434,7 +1481,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 editedAssetType === 'Stock' && { backgroundColor: colors.bullish },
               ]}
               onPress={() => setEditedAssetType('Stock')}>
-              <Text style={styles.editAssetTypeButtonText}>{ASSET_TYPE_LABEL_HE.Stock}</Text>
+              <Text style={styles.editAssetTypeButtonText}>{assetTypeLabel(t, 'Stock')}</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[
@@ -1443,29 +1490,33 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 editedAssetType === 'ETF' && { backgroundColor: colors.core },
               ]}
               onPress={() => setEditedAssetType('ETF')}>
-              <Text style={styles.editAssetTypeButtonText}>{ASSET_TYPE_LABEL_HE.ETF}</Text>
+              <Text style={styles.editAssetTypeButtonText}>{assetTypeLabel(t, 'ETF')}</Text>
             </TouchableOpacity>
           </View>
         </View>
       ) : (
         <View style={styles.stockBottomRow}>
           <View style={styles.unitsDisplayRow}>
-            {/* RTL MIXED TEXT RENDERING FIX: this used to be one interpolated
-                string starting with a number ("1436 יח' ב-₪39.85"), which
-                the bidi text engine renders reversed — a number-first run
-                inside an RTL-aligned Text confuses it in a way a
-                Hebrew-first string doesn't. Split into three independent
-                <Text> nodes instead, laid out by an explicit row/row-reverse
-                View so each language's natural reading order (and its own
-                phrasing — see AT_PRICE_LABEL/formatUnitsLabel) determines
-                the visual order directly, rather than relying on bidi to
-                sort out a single mixed-content string.
+            {/* STRICT RTL/LTR TEXT SEPARATION: this used to be one
+                interpolated string starting with a number ("1436 יח'
+                ב-₪39.85"), which the bidi rendering engine reverses — a
+                number-first run inside an RTL-aligned Text confuses it in a
+                way a word-first string doesn't. Split into three
+                independent <Text> nodes instead — the units count+word, the
+                translated "at" word, and the price value — laid out by an
+                explicit row/row-reverse View so each language's natural
+                reading order (and its own phrasing, via t()) determines the
+                visual order directly, rather than relying on bidi to sort
+                out a single mixed-content string.
                 TASE AGOROT DISPLAY: unitPriceDisplay reads e.g. "3985 אג'"
                 instead of "₪39.85" for a ".TA" ticker — see
-                formatUnitPrice above. */}
+                formatUnitPrice above. Note this row still shows the RAW
+                `stock.units` the user entered/holds (Nominal Value, for a
+                TASE ETF) — only the VALUE math (totalValueDisplay) uses
+                effectiveUnits; see the TASE ETF MATH FIX note above. */}
             <View style={styles.unitsPriceRow}>
-              <Text style={styles.stockDetailText}>{formatUnitsLabel(language, stock.units)}</Text>
-              <Text style={styles.stockDetailText}>{AT_PRICE_LABEL[language]}</Text>
+              <Text style={styles.stockDetailText}>{formatUnitsLabel(t, stock.units)}</Text>
+              <Text style={styles.stockDetailText}>{t('atPrice')}</Text>
               <Text style={styles.stockDetailValueText}>{unitPriceDisplay}</Text>
             </View>
             <TouchableOpacity
@@ -1509,10 +1560,10 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
         <View style={styles.drawdownRow}>
           <Text
             style={[styles.drawdownText, isQualityDrawdownReview && styles.drawdownTextReview]}>
-            שיא 52 שבועות: {high52Display} (ירידה: {stock.drawdownPct.toFixed(2)}%)
+            {t('high52')}: {high52Display} ({t('drop')}: {stock.drawdownPct.toFixed(2)}%)
           </Text>
           {isQualityDrawdownReview && (
-            <Text style={styles.drawdownReviewTag}>[לבדיקה]</Text>
+            <Text style={styles.drawdownReviewTag}>[{t('review')}]</Text>
           )}
         </View>
       )}
@@ -1529,6 +1580,13 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 // isDarkMode, language]) inside PortfolioScreen, so it only actually
 // re-runs on a real theme or language change, not on every render.
 function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language: Language) {
+  // ROBUST LANGUAGE CONTEXT: styles for every element that now renders
+  // translated (t()) text switch alignment/writingDirection with the
+  // language; elements whose text is still Hebrew-only regardless of the
+  // toggle (out of this pass's translation scope — see PortfolioScreen's
+  // top-level comments) deliberately keep their literal 'right'/'rtl'.
+  const isHebrew = language === 'he';
+
   return StyleSheet.create({
   safeArea: {
     flex: 1,
@@ -1542,19 +1600,38 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     paddingVertical: 12,
   },
   headerTitle: {
-    // RTL LOCALIZATION: standard Hebrew label text is right-aligned;
-    // numeric values/ticker symbols elsewhere are deliberately left at
-    // their default (LTR) alignment instead (see StockCard.tsx).
+    // RTL/LTR LOCALIZATION: right-aligned in Hebrew, left-aligned in
+    // English; numeric values/ticker symbols elsewhere are deliberately
+    // left at their default (LTR) alignment regardless (see StockCard.tsx).
     color: colors.textPrimary,
     fontSize: 28,
     fontWeight: '700',
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 16,
+  },
+  // LANGUAGE TOGGLE BUTTON UI: a small bordered pill showing "HEB"/"EN" —
+  // replaces the earlier Globe icon so the CURRENT language is visible at a
+  // glance, not just implied by an icon.
+  languageToggleButton: {
+    borderWidth: 1.5,
+    borderColor: colors.textSecondary,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  languageToggleButtonText: {
+    // A language CODE, not translatable text — always LTR/centered
+    // regardless of the active language, same reasoning as ticker symbols
+    // elsewhere in this app.
+    color: colors.textPrimary,
+    fontSize: 12,
+    fontWeight: '700',
+    writingDirection: 'ltr',
   },
   inputRow: {
     flexDirection: 'row',
@@ -1684,7 +1761,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   assetTypeRow: {
     flexDirection: 'row',
@@ -1704,7 +1781,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '600',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   addRow: {
     marginBottom: 4,
@@ -1747,7 +1824,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textSecondary,
     fontSize: 13,
     fontWeight: '600',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   filterButtonTextActive: {
     color: colors.background,
@@ -1765,16 +1842,17 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   // spacing/background instead of inheriting it from a parent "section"
   // container.
   sectionTitle: {
-    // RTL: the full "<layer> (יעד: X% | מצוי: Y%) - N נכסים" string is
-    // Hebrew-first with embedded LTR numeric runs (percentages, the
-    // count) — the Unicode bidi algorithm places those correctly within
-    // an RTL-aligned paragraph on its own, no special handling needed.
+    // RTL/LTR: the full "<layer> (Target: X% | Actual: Y%) - N Assets"
+    // string is translated-word-first with embedded LTR numeric runs
+    // (percentages, the count) — the Unicode bidi algorithm places those
+    // correctly within an aligned paragraph on its own (in either
+    // direction), no per-token splitting needed — see buildSectionTitle.
     fontSize: 16,
     fontWeight: '700',
     marginTop: 16,
     marginBottom: 10,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   sectionEmptyText: {
     color: colors.textSecondary,
@@ -1831,7 +1909,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textSecondary,
     fontSize: 10,
     fontWeight: '700',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   categoryBadge: {
     paddingHorizontal: 10,
@@ -1842,7 +1920,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '700',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   deleteButtonText: {
     color: colors.bearish,
@@ -1925,7 +2003,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '600',
-    writingDirection: 'rtl',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   trailingStopText: {
     // Hebrew label + LTR '$' threshold value — RTL paragraph, bidi handles
@@ -1947,10 +2025,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     marginTop: 6,
   },
   drawdownText: {
+    // Translated-word-first ("High52: ... (Drop: ...)"), same bidi-safety
+    // reasoning as sectionTitle above — safe as one Text node.
     color: colors.textSecondary,
     fontSize: 12,
-    textAlign: 'right',
-    writingDirection: 'rtl',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   drawdownTextReview: {
     color: colors.reviewAlert,
