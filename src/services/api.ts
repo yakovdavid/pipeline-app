@@ -1,3 +1,5 @@
+import type { TrendLabel } from '@/types/asset';
+
 export type StockQuote = {
   // Multi-Currency engine: normalized to USD by the backend — this is the
   // ONLY field allocation math (portfolio totals, layer percentages,
@@ -11,9 +13,22 @@ export type StockQuote = {
   currencySymbol: string;
   // Yahoo Finance doesn't always publish these for every instrument (e.g. a
   // very newly listed ticker), so the backend passes that absence through
-  // as null rather than failing the whole request.
+  // as null rather than failing the whole request. Returned for EVERY
+  // asset now (Portfolio included, not just Ambush Radar — see
+  // backend/main.py's get_stock), since MomentumBar (see
+  // @/components/MomentumBar) is now shared by both screens.
   sma50: number | null;
   sma200: number | null;
+  // TREND CLASSIFICATION: two independent signals computed backend-side
+  // (see backend/main.py's _classify_trend) — macroTrend is price vs.
+  // SMA200 (the long-term trend), tacticalMomentum is price vs. SMA50 (the
+  // finer-grained momentum signal). Replaces the old single, asset-type-
+  // dependent Bullish/Bearish verdict this app used to compute client-side
+  // (SMA200 for ETFs, SMA50 for Stocks — silently hiding whichever signal
+  // it didn't pick). null when the underlying SMA itself is unavailable,
+  // same as sma50/sma200 above — never a guessed default.
+  macroTrend: TrendLabel;
+  tacticalMomentum: TrendLabel;
   // Present when the backend's Anomaly News Fetcher detects a same-day
   // move of 4%+ and finds explanatory headlines; null otherwise (no
   // notable move, or no news found).
@@ -115,12 +130,22 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
     throw new Error(`Failed to fetch data for ${normalizedTicker}: ${detail}`);
   }
 
-  const data = (await response.json()) as Partial<StockQuote> & {
+  const data = (await response.json()) as {
+    price?: number;
     anomaly?: string | null;
     high_52?: number | null;
     drawdown_pct?: number | null;
     local_price?: number | null;
     currency_symbol?: string | null;
+    // Backend field names, snake_case with an underscore — matching every
+    // other multi-word key in this response (local_price, high_52,
+    // drawdown_pct). Deliberately distinct from this file's own camelCase
+    // sma50/sma200/macroTrend/tacticalMomentum StockQuote fields below,
+    // same as every other field in this raw-JSON shape.
+    sma_50?: number | null;
+    sma_200?: number | null;
+    macro_trend?: string | null;
+    tactical_momentum?: string | null;
   };
 
   if (typeof data.price !== 'number') {
@@ -134,12 +159,23 @@ export async function fetchStockData(ticker: string): Promise<StockQuote> {
     // fields degrading gracefully is preferable to breaking the fetch.
     localPrice: typeof data.local_price === 'number' ? data.local_price : data.price,
     currencySymbol: typeof data.currency_symbol === 'string' ? data.currency_symbol : '$',
-    sma50: typeof data.sma50 === 'number' ? data.sma50 : null,
-    sma200: typeof data.sma200 === 'number' ? data.sma200 : null,
+    sma50: typeof data.sma_50 === 'number' ? data.sma_50 : null,
+    sma200: typeof data.sma_200 === 'number' ? data.sma_200 : null,
+    macroTrend: parseTrendLabel(data.macro_trend),
+    tacticalMomentum: parseTrendLabel(data.tactical_momentum),
     anomalyReport: typeof data.anomaly === 'string' ? data.anomaly : null,
     high52: typeof data.high_52 === 'number' ? data.high_52 : null,
     drawdownPct: typeof data.drawdown_pct === 'number' ? data.drawdown_pct : null,
   };
+}
+
+// TREND CLASSIFICATION: validates the backend's macro_trend/
+// tactical_momentum strings into the TrendLabel union rather than trusting
+// them as-is — anything other than exactly 'Bullish'/'Bearish' (missing,
+// null, or an unexpected value from a future backend change) degrades to
+// null ("can't be evaluated"), never a guessed default.
+function parseTrendLabel(value: string | null | undefined): TrendLabel {
+  return value === 'Bullish' || value === 'Bearish' ? value : null;
 }
 
 // On-Demand Intel V3.1: latest news for one or more comma-separated

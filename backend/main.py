@@ -29,6 +29,21 @@ others as 'ILA'/'ILX', with no consistent signal — so those are instead
 keyed unconditionally off the ".TA" suffix itself: any ".TA" ticker is
 always treated as Agorot-quoted (divide by 100 for ILS, then again by the
 USD/ILS rate for USD), regardless of what currency Yahoo reports for it.
+
+Every /api/stock/{ticker} response (Portfolio and Ambush Radar alike — both
+screens hit this same endpoint) also carries two independent trend
+indicators (see _classify_trend): macro_trend (price vs. SMA200, the
+"is this still in a long-term uptrend" question) and tactical_momentum
+(price vs. SMA50, the finer-grained "is short-term momentum still intact"
+question) — deliberately kept separate rather than collapsed into one
+asset-type-dependent Bullish/Bearish verdict, since an ETF holding its
+200-day trend while breaking its 50-day one (or vice versa) is a real,
+distinct signal either indicator alone would hide.
+
+/api/health is a separate, deliberately trivial liveness endpoint (see
+health_check) — it exists purely so an external uptime ping (a cron job)
+can keep a free-tier host warm without ever touching yfinance/Yahoo, so
+pinging it can never itself contribute to Yahoo rate-limiting.
 """
 
 import random
@@ -472,6 +487,21 @@ app.add_middleware(
 )
 
 
+# PERFORMANCE OPTIMIZATION (ANTI-COLD-START): a deliberately trivial
+# liveness endpoint for an external uptime pinger (a cron job) to hit on an
+# interval, so a free-tier host (e.g. Render) never fully spins down and
+# every REAL user request pays a cold-start penalty. This MUST stay cheap
+# and self-contained forever — no yfinance call, no TICKER_CACHE/stock_cache
+# lookup, no yahoo_rate_limiter involvement of any kind — so pinging it as
+# often as the uptime job likes can never itself contribute to Yahoo
+# rate-limiting or contend with a real request for the rate limiter's single
+# in-flight slot. Deliberately declared before every other route, as the
+# simplest one in the file.
+@app.get("/api/health")
+def health_check() -> dict[str, str]:
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
 # Anti-rate-limit architecture: the primary (yfinance) path gets a full,
 # genuine retry budget — up to 3 attempts total (1 initial + 2 retries),
 # backing off 2s then 4s — before this file gives up on it and tries the
@@ -877,6 +907,24 @@ def _resolve_currency_converters(
     return CURRENCY_SYMBOL_USD, identity, identity
 
 
+# TREND CLASSIFICATION: two independent, equally-weighted signals rather
+# than one asset-type-dependent verdict (the old logic silently used SMA200
+# for ETFs and SMA50 for Stocks, hiding whichever signal it didn't pick).
+# Deliberately symmetric between the two callers below (macro_trend vs.
+# SMA200, tactical_momentum vs. SMA50) — same function, different sma
+# argument — so both indicators are computed identically off the same
+# already-currency-normalized `price`.
+#
+# Returns None (not a guessed "Bearish") when `sma` itself is None —
+# insufficient price history to compute it — matching this file's existing
+# convention elsewhere (drawdown_pct, mean_reversion_anomaly) of surfacing
+# "can't be evaluated" as null rather than a misleading default verdict.
+def _classify_trend(price: float, sma: float | None) -> str | None:
+    if sma is None:
+        return None
+    return "Bullish" if price > sma else "Bearish"
+
+
 @app.get("/api/stock/{ticker}")
 def get_stock(
     ticker: str, include_anomaly: bool = False, asset_type: str = DEFAULT_ANOMALY_ASSET_TYPE
@@ -1000,6 +1048,17 @@ def get_stock(
 
     high_52_rounded = round(float(high_52), 2) if high_52 is not None else None
 
+    # TREND CLASSIFICATION: computed from the already USD-normalized
+    # price/sma50/sma200 above — see _classify_trend. Note this is valid
+    # regardless of any further scaling a caller might apply downstream
+    # (e.g. the frontend's own per-position Auto-Calibration correction for
+    # a handful of TASE funds Yahoo misreports): price > sma is a ratio
+    # comparison, so multiplying both sides by the same positive factor
+    # never flips it. Callers can trust these labels as-is without
+    # recomputing them against a rescaled price.
+    macro_trend = _classify_trend(price, sma200)
+    tactical_momentum = _classify_trend(price, sma50)
+
     try:
         print(
             f"[intel] {symbol}: price={currency_symbol}{local_price:.2f} (${price:.2f} USD) | 52W High="
@@ -1023,10 +1082,19 @@ def get_stock(
         # for display alongside currency_symbol — never used in math.
         "local_price": round(float(local_price), 2),
         "currency_symbol": currency_symbol,
-        "sma50": round(float(sma50), 2) if sma50 is not None else None,
-        "sma200": round(float(sma200), 2) if sma200 is not None else None,
+        # Named with the same snake_case + underscore convention as every
+        # other multi-word key in this response (local_price, high_52,
+        # drawdown_pct) — for BOTH Portfolio and Ambush Radar callers alike,
+        # since both hit this same endpoint.
+        "sma_50": round(float(sma50), 2) if sma50 is not None else None,
+        "sma_200": round(float(sma200), 2) if sma200 is not None else None,
         "high_52": high_52_rounded,
         "drawdown_pct": drawdown_pct,
+        # TREND CLASSIFICATION: see _classify_trend above. Null (not a
+        # guessed "Bearish") whenever the underlying SMA itself is
+        # unavailable.
+        "macro_trend": macro_trend,
+        "tactical_momentum": tactical_momentum,
     }
 
     if include_anomaly:

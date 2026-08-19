@@ -27,9 +27,11 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
+import { MomentumBar } from '@/components/MomentumBar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
+import { TrendBadges } from '@/components/TrendBadges';
 import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT, formatUnitsLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
@@ -376,6 +378,13 @@ export default function PortfolioScreen() {
             anomalyReport: calibratedQuote.anomalyReport,
             high52: calibratedQuote.high52,
             drawdownPct: calibratedQuote.drawdownPct,
+            // Add SMA Visuals to Portfolio / Dashboard Trend Display:
+            // previously Ambush-Radar-only fields — see PortfolioStock's
+            // own field comments.
+            sma50: calibratedQuote.sma50,
+            sma200: calibratedQuote.sma200,
+            macroTrend: calibratedQuote.macroTrend,
+            tacticalMomentum: calibratedQuote.tacticalMomentum,
             highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
           });
         }
@@ -480,6 +489,10 @@ export default function PortfolioScreen() {
           anomalyReport: calibratedQuote.anomalyReport,
           high52: calibratedQuote.high52,
           drawdownPct: calibratedQuote.drawdownPct,
+          sma50: calibratedQuote.sma50,
+          sma200: calibratedQuote.sma200,
+          macroTrend: calibratedQuote.macroTrend,
+          tacticalMomentum: calibratedQuote.tacticalMomentum,
           highestWatermark: computeHighestWatermark(null, calibratedQuote.price),
           calibrationFactor,
         },
@@ -538,22 +551,29 @@ export default function PortfolioScreen() {
             return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark };
           }
 
-          // Recalibrating: stock.price/localPrice/high52 are already
-          // calibrated (see calibrateQuote) — strip the OLD factor back off
-          // to recover the raw Yahoo figures, then compute and apply a NEW
-          // factor from the fresh Total Value against those same raw
-          // figures. The old highestWatermark's basis is no longer valid
+          // Recalibrating: stock.price/localPrice/high52/sma50/sma200 are
+          // already calibrated (see calibrateQuote) — strip the OLD factor
+          // back off to recover the raw Yahoo figures, then compute and
+          // apply a NEW factor from the fresh Total Value against those
+          // same raw figures. macroTrend/tacticalMomentum are untouched —
+          // they're a price-vs-SMA ratio comparison, unaffected by scaling
+          // both sides by the same factor (see calibrateQuote's own
+          // comment). The old highestWatermark's basis is no longer valid
           // once the scale changes, so it's reseeded from the newly
           // corrected price instead of carried forward stale.
           const existingFactor = stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR;
           const rawLocalPrice = stripCalibration(stock.localPrice, existingFactor);
           const rawUsdPrice = stripCalibration(stock.price, existingFactor);
           const rawHigh52 = stock.high52 !== null ? stripCalibration(stock.high52, existingFactor) : null;
+          const rawSma50 = stock.sma50 !== null ? stripCalibration(stock.sma50, existingFactor) : null;
+          const rawSma200 = stock.sma200 !== null ? stripCalibration(stock.sma200, existingFactor) : null;
 
           const calibrationFactor = computeCalibrationFactor(parsedTotalValue, newUnits, rawLocalPrice);
           const newLocalPrice = applyCalibration(rawLocalPrice, calibrationFactor);
           const newUsdPrice = applyCalibration(rawUsdPrice, calibrationFactor);
           const newHigh52 = rawHigh52 !== null ? applyCalibration(rawHigh52, calibrationFactor) : null;
+          const newSma50 = rawSma50 !== null ? applyCalibration(rawSma50, calibrationFactor) : null;
+          const newSma200 = rawSma200 !== null ? applyCalibration(rawSma200, calibrationFactor) : null;
 
           return {
             ...stock,
@@ -562,6 +582,8 @@ export default function PortfolioScreen() {
             price: newUsdPrice,
             localPrice: newLocalPrice,
             high52: newHigh52,
+            sma50: newSma50,
+            sma200: newSma200,
             calibrationFactor,
             highestWatermark: newUsdPrice,
           };
@@ -626,6 +648,10 @@ export default function PortfolioScreen() {
             anomalyReport: calibratedQuote.anomalyReport,
             high52: calibratedQuote.high52,
             drawdownPct: calibratedQuote.drawdownPct,
+            sma50: calibratedQuote.sma50,
+            sma200: calibratedQuote.sma200,
+            macroTrend: calibratedQuote.macroTrend,
+            tacticalMomentum: calibratedQuote.tacticalMomentum,
             highestWatermark: computeHighestWatermark(stock.highestWatermark, calibratedQuote.price),
           };
         }),
@@ -741,6 +767,10 @@ export default function PortfolioScreen() {
             anomalyReport: calibratedQuote.anomalyReport,
             high52: calibratedQuote.high52,
             drawdownPct: calibratedQuote.drawdownPct,
+            sma50: calibratedQuote.sma50,
+            sma200: calibratedQuote.sma200,
+            macroTrend: calibratedQuote.macroTrend,
+            tacticalMomentum: calibratedQuote.tacticalMomentum,
             highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
           });
         }
@@ -1159,7 +1189,15 @@ export default function PortfolioScreen() {
                   contentContainerStyle={styles.addAssetModalScrollContent}
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}>
-                  <View style={styles.inputRow}>
+                  {/* ADD ASSET MODAL LAYOUT FIX: the ticker input now gets
+                      its OWN full-width row (its autocomplete dropdown
+                      shows "SYMBOL - Company Name (Exchange)", which needs
+                      real room to be readable while typing) instead of
+                      splitting a row 50/50 with the units field, which
+                      used to squeeze it down to roughly half-width for no
+                      good reason — units/total value don't need nearly as
+                      much space as a ticker name does. */}
+                  <View style={styles.tickerRow}>
                     <TickerAutocomplete
                       value={ticker}
                       onChangeText={setTicker}
@@ -1167,11 +1205,16 @@ export default function PortfolioScreen() {
                       onSubmit={handleAddTicker}
                       editable={!isAdding}
                     />
-                    {/* TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (see
-                        unitsInput's style) so a large unit count like
-                        11347 is never truncated by a fixed pixel width —
-                        maxLength=15 is a generous ceiling, not a practical
-                        limit for any real position size. */}
+                  </View>
+
+                  {/* Units and the optional Total Value now share their OWN
+                      smaller row (flex: 1 each — see unitsInput's style),
+                      no longer competing with the ticker input for space.
+                      TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (not a
+                      fixed pixel width) so a large unit count like 11347 is
+                      never truncated — maxLength=15 is a generous ceiling,
+                      not a practical limit for any real position size. */}
+                  <View style={styles.unitsValueRow}>
                     <TextInput
                       style={styles.unitsInput}
                       value={units}
@@ -1182,22 +1225,20 @@ export default function PortfolioScreen() {
                       maxLength={15}
                       editable={!isAdding}
                     />
+                    {/* AUTO-CALIBRATION FOR BROKEN PRICES: optional — see
+                        handleAddTicker for how a value here becomes a
+                        calibrationFactor. */}
+                    <TextInput
+                      style={styles.unitsInput}
+                      value={totalValueInput}
+                      onChangeText={setTotalValueInput}
+                      placeholder={t('totalValueInBank')}
+                      placeholderTextColor={colors.textSecondary}
+                      keyboardType="numeric"
+                      maxLength={15}
+                      editable={!isAdding}
+                    />
                   </View>
-
-                  {/* AUTO-CALIBRATION FOR BROKEN PRICES: optional — see
-                      handleAddTicker for how a value here becomes a
-                      calibrationFactor. Same width fix as the units field
-                      above, for the same reason (large ILS totals). */}
-                  <TextInput
-                    style={[styles.unitsInput, styles.totalValueInput]}
-                    value={totalValueInput}
-                    onChangeText={setTotalValueInput}
-                    placeholder={t('totalValueInBank')}
-                    placeholderTextColor={colors.textSecondary}
-                    keyboardType="numeric"
-                    maxLength={15}
-                    editable={!isAdding}
-                  />
 
                   <Text style={styles.modalSectionLabel}>{t('category')}</Text>
                   <View style={styles.categoryRow}>
@@ -1692,6 +1733,30 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
         </View>
       )}
 
+      {/* Add SMA Visuals to Portfolio: the exact same MomentumBar component
+          the Ambush Radar StockCard renders — see @/components/MomentumBar.
+          Dashboard Trend Display: Macro Trend + Tactical Momentum badges,
+          same shared component as StockCard too — see
+          @/components/TrendBadges. Both gated on !isEditing, same as the
+          trailing-stop/drawdown blocks below. */}
+      {!isEditing && (
+        <View style={styles.momentumRow}>
+          <MomentumBar
+            ticker={stock.ticker}
+            price={stock.price}
+            sma50={stock.sma50}
+            sma200={stock.sma200}
+            localPrice={stock.localPrice}
+            currencySymbol={stock.currencySymbol}
+            tacticalMomentum={stock.tacticalMomentum}
+          />
+        </View>
+      )}
+
+      {!isEditing && (
+        <TrendBadges macroTrend={stock.macroTrend} tacticalMomentum={stock.tacticalMomentum} />
+      )}
+
       {!isEditing && trailingStopPrice !== null && (
         // Trailing Stop is a computed USD threshold (highestWatermark is
         // tracked in USD — see computeHighestWatermark above), not a raw
@@ -1799,12 +1864,33 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     gap: 8,
     zIndex: 10,
   },
+  // ADD ASSET MODAL LAYOUT FIX: the ticker input gets its own full-width
+  // row — a plain block-level View (no flexDirection: 'row' siblings), so
+  // TickerAutocomplete's own flex: 1 container fills the entire row width,
+  // giving its "SYMBOL - Company Name (Exchange)" autocomplete dropdown
+  // (and the typed ticker itself) genuine room to be readable. zIndex
+  // matches the old shared inputRow's, so the dropdown still renders above
+  // the units/total-value row below it.
+  tickerRow: {
+    marginBottom: 16,
+    zIndex: 10,
+  },
+  // Units and the optional Total Value share a SMALLER second row, each
+  // flex: 1 (see unitsInput below) — they don't need nearly as much space
+  // as the ticker input above, which is exactly why splitting that row
+  // 50/50 with them (the old layout) was the bug: it squeezed the ticker
+  // down for two fields that don't need the room.
+  unitsValueRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+    gap: 8,
+  },
   // TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (not a fixed pixel
   // width, which was the actual bug — 70px truncates/can't fit a large
-  // unit count like 11347) so this grows to a genuinely usable width
-  // whether it's sharing inputRow with TickerAutocomplete (both flex: 1,
-  // splitting the row) or standalone (totalValueInput below, alone in its
-  // own row — flex: 1 there just fills the full row width).
+  // unit count like 11347) so both the units and Total Value fields (which
+  // share this exact style, via unitsValueRow above) grow to a genuinely
+  // usable width instead of being squeezed or clipped.
   unitsInput: {
     flex: 1,
     minWidth: '45%',
@@ -1815,13 +1901,6 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     paddingVertical: 10,
     fontSize: 16,
     textAlign: 'center',
-  },
-  // AUTO-CALIBRATION FOR BROKEN PRICES: the new "Total Value in Bank"
-  // field in the Add Asset modal — same base look as unitsInput (shared
-  // via a style array at the call site), standalone in its own row below
-  // the ticker/units row.
-  totalValueInput: {
-    marginBottom: 16,
   },
   modalSectionLabel: {
     color: colors.textSecondary,
@@ -2109,6 +2188,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     alignItems: 'center',
     justifyContent: 'space-between',
     marginTop: 6,
+  },
+  // Add SMA Visuals to Portfolio: wraps the shared MomentumBar (see
+  // @/components/MomentumBar) — matches StockCard.tsx's own bottomRow
+  // exactly, so the visual sits identically on both screens.
+  momentumRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+    alignItems: 'flex-start',
   },
   // RTL MIXED TEXT RENDERING FIX: split into 3 independent <Text> nodes
   // (units label / at-word / price value — see unitsPriceRow below) instead

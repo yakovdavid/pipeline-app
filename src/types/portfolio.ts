@@ -1,4 +1,4 @@
-import type { AssetType } from '@/types/asset';
+import type { AssetType, TrendLabel } from '@/types/asset';
 
 export type PortfolioCategory = 'Core' | 'Satellite' | 'Quality';
 
@@ -48,4 +48,17 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // persisted, for the same reason.
   high52: number | null;
   drawdownPct: number | null;
+  // Add SMA Visuals to Portfolio: previously an Ambush-Radar-only pair
+  // (StockQuote already carried them; PortfolioStock didn't). Live/
+  // ephemeral like every other fetched field above, never persisted — see
+  // MomentumBar (shared by both screens) and TrendBadges in index.tsx.
+  sma50: number | null;
+  sma200: number | null;
+  // TREND CLASSIFICATION: two independent backend-computed signals — see
+  // StockQuote's own field comments for the full rationale. Replaces the
+  // single trend indicator this screen never actually had before (Ambush
+  // Radar was the only screen with a Bullish/Bearish badge); now both
+  // screens show both indicators identically.
+  macroTrend: TrendLabel;
+  tacticalMomentum: TrendLabel;
 };

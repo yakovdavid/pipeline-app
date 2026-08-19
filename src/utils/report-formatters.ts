@@ -10,10 +10,14 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
     return ['  (none)'];
   }
   return stocks.flatMap((stock) => {
-    // ETFs are judged against SMA200, stocks against SMA50 — matches the
-    // trend rule rendered on the card itself (see StockCard.tsx).
-    const relevantSma = stock.assetType === 'ETF' ? stock.sma200 : stock.sma50;
-    const trend = relevantSma === null ? 'N/A' : stock.price > relevantSma ? 'Bullish' : 'Bearish';
+    // TREND CLASSIFICATION: both backend-computed signals (see
+    // backend/main.py's _classify_trend), replacing the old single,
+    // asset-type-dependent Bullish/Bearish verdict this export used to
+    // compute itself (SMA200 for ETFs, SMA50 for Stocks) — matches the
+    // Macro Trend / Tactical Momentum badges rendered on the card itself
+    // (see StockCard.tsx / TrendBadges).
+    const macroTrendText = stock.macroTrend ?? 'N/A';
+    const tacticalMomentumText = stock.tacticalMomentum ?? 'N/A';
     const sma50Text = stock.sma50 === null ? 'N/A' : `$${stock.sma50.toFixed(2)}`;
     const sma200Text = stock.sma200 === null ? 'N/A' : `$${stock.sma200.toFixed(2)}`;
 
@@ -25,7 +29,8 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
 
     const line =
       `  ${stock.ticker} (${stock.assetType}): Price $${stock.price.toFixed(2)} | ` +
-      `SMA50 ${sma50Text} | SMA200 ${sma200Text} | ${trend}${warningSuffix}`;
+      `SMA50 ${sma50Text} | SMA200 ${sma200Text} | Macro: ${macroTrendText} | ` +
+      `Tactical: ${tacticalMomentumText}${warningSuffix}`;
 
     return stock.anomalyReport ? [line, `    ${stock.anomalyReport}`] : [line];
   });

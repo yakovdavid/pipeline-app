@@ -1,20 +1,22 @@
 import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
+import { MomentumBar } from '@/components/MomentumBar';
+import { TrendBadges } from '@/components/TrendBadges';
 import { assetTypeLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
-import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
+import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
-import type { AssetType } from '@/types/asset';
-import { deriveLocalValue, formatUnitPrice } from '@/utils/currency';
+import type { AssetType, TrendLabel } from '@/types/asset';
+import { formatUnitPrice } from '@/utils/currency';
 
 export type Stock = {
   ticker: string;
   assetType: AssetType;
   // Multi-Currency engine: normalized to USD by the backend — used for the
-  // Bullish/Bearish trend comparison against sma50/sma200 below (also
-  // USD-normalized), never mixed with localPrice.
+  // structural-stop check below (also USD-normalized), never mixed with
+  // localPrice.
   price: number;
   // The instrument's own actual local-currency value and the symbol to
   // display it with ('$' or '₪') — display-only.
@@ -24,6 +26,12 @@ export type Stock = {
   // instrument, so a missing value degrades the UI instead of failing it.
   sma50: number | null;
   sma200: number | null;
+  // TREND CLASSIFICATION: two independent backend-computed signals — see
+  // StockQuote's own field comments (services/api.ts) for the full
+  // rationale. Rendered via the shared TrendBadges component below,
+  // replacing the old single asset-type-dependent Bullish/Bearish badge.
+  macroTrend: TrendLabel;
+  tacticalMomentum: TrendLabel;
   // Anomaly News Fetcher output: set when today's move is 4%+ and the
   // backend found explanatory headlines. Not rendered on the card itself
   // (see report-formatters.ts) — just carried through so exports can use it.
@@ -42,8 +50,6 @@ export type StockCardProps = {
   onDelete: (ticker: string) => void;
 };
 
-type StockCardStyles = ReturnType<typeof createStyles>;
-
 // Wrapped in memo() so a price/SMA update on one ticker doesn't re-render
 // every other card in the list — the ambush.tsx list already keeps
 // unaffected Stock objects referentially stable on every state update
@@ -60,32 +66,24 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
-  const { ticker, assetType, price, localPrice, currencySymbol, sma50, sma200 } = stock;
-
-  // ETFs are judged against the longer 200-day trend; individual stocks
-  // keep the original 50-day mean-reversion rule.
-  const relevantSma = assetType === 'ETF' ? sma200 : sma50;
-  const hasTrendData = relevantSma !== null;
-  const isBullish = hasTrendData && price > relevantSma;
+  const {
+    ticker,
+    assetType,
+    price,
+    localPrice,
+    currencySymbol,
+    sma50,
+    sma200,
+    macroTrend,
+    tacticalMomentum,
+  } = stock;
 
   const isNearStructuralStop =
     assetType === 'ETF' && sma200 !== null && price <= sma200 * STRUCTURAL_STOP_THRESHOLD;
 
-  // TASE AGOROT DISPLAY: the current UNIT price. sma50/sma200 are USD-
-  // normalized by the backend's Multi-Currency engine (same as `price`), so
-  // they're first scaled onto localPrice's basis (see deriveLocalValue) —
-  // exact, not an approximation, since the backend applies one identical
-  // linear conversion to every price-like field for a given ticker — and
-  // only then formatted, so a ".TA" ticker's moving averages show in
-  // Agorot right alongside its current price, not mixed USD/Agorot.
+  // TASE AGOROT DISPLAY: the current UNIT price — see formatUnitPrice.
   const agorotSuffix = t('ag');
   const priceDisplay = formatUnitPrice(ticker, localPrice, currencySymbol, agorotSuffix);
-  const localSma50 = sma50 !== null ? deriveLocalValue(sma50, localPrice, price) : null;
-  const localSma200 = sma200 !== null ? deriveLocalValue(sma200, localPrice, price) : null;
-  const sma50Display =
-    localSma50 !== null ? formatUnitPrice(ticker, localSma50, currencySymbol, agorotSuffix) : null;
-  const sma200Display =
-    localSma200 !== null ? formatUnitPrice(ticker, localSma200, currencySymbol, agorotSuffix) : null;
 
   return (
     <View style={styles.card}>
@@ -120,117 +118,28 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
         </View>
       </View>
 
-      <View style={[styles.row, styles.bottomRow]}>
+      {/* Add SMA Visuals to Portfolio: this MomentumBar is the exact same
+          shared component PortfolioStockRow (index.tsx) renders — see
+          @/components/MomentumBar. */}
+      <View style={styles.bottomRow}>
         <MomentumBar
+          ticker={ticker}
           price={price}
           sma50={sma50}
           sma200={sma200}
-          sma50Display={sma50Display}
-          sma200Display={sma200Display}
-          isBullish={isBullish}
-          colors={colors}
-          styles={styles}
-          t={t}
+          localPrice={localPrice}
+          currencySymbol={currencySymbol}
+          tacticalMomentum={tacticalMomentum}
         />
-        <View
-          style={[
-            styles.badge,
-            {
-              backgroundColor: !hasTrendData
-                ? colors.textSecondary
-                : isBullish
-                  ? colors.bullish
-                  : colors.bearish,
-            },
-          ]}>
-          <Text style={styles.badgeText}>
-            {!hasTrendData ? t('notAvailable') : isBullish ? t('bullish') : t('bearish')}
-          </Text>
-        </View>
       </View>
+
+      {/* Dashboard Trend Display: Macro Trend + Tactical Momentum, replacing
+          the old single Bullish/Bearish badge — shared component, see
+          @/components/TrendBadges. */}
+      <TrendBadges macroTrend={macroTrend} tacticalMomentum={tacticalMomentum} />
     </View>
   );
 });
-
-type MomentumBarProps = {
-  price: number;
-  sma50: number | null;
-  sma200: number | null;
-  // Pre-formatted display strings (local-currency/Agorot-aware — see
-  // formatUnitPrice/deriveLocalValue in StockCard above), rendered as the
-  // labels below. The raw numeric sma50/sma200 (always USD-normalized) are
-  // kept separately since the marker-position math must stay in one
-  // consistent currency basis regardless of what's on screen.
-  sma50Display: string | null;
-  sma200Display: string | null;
-  isBullish: boolean;
-  colors: PipelineColorScheme;
-  styles: StockCardStyles;
-  t: TFunction;
-};
-
-// Minimalist visual showing where the current price sits relative to the
-// SMA50/SMA200 range, replacing the old plain "SMA 50: $X" text line.
-// A private sub-component of StockCard (not exported/reused elsewhere), so
-// it takes colors/styles as props from its parent's already-memoized theme
-// read rather than calling usePipelineTheme() again itself.
-function MomentumBar({
-  price,
-  sma50,
-  sma200,
-  sma50Display,
-  sma200Display,
-  isBullish,
-  colors,
-  styles,
-  t,
-}: MomentumBarProps) {
-  if (sma50 === null || sma200 === null || sma50Display === null || sma200Display === null) {
-    return <Text style={styles.momentumFallbackText}>{t('insufficientMomentumData')}</Text>;
-  }
-
-  // The dot's position on the track is intentionally still dynamic — it
-  // maps to where price actually sits between the lower and higher of the
-  // two SMAs, whichever that happens to be this render.
-  const low = Math.min(sma50, sma200);
-  const high = Math.max(sma50, sma200);
-  const range = high - low;
-  const rawPosition = range > 0 ? (price - low) / range : 0.5;
-  const markerPosition = Math.min(1, Math.max(0, rawPosition));
-  const markerColor = isBullish ? colors.bullish : colors.bearish;
-
-  return (
-    <View style={styles.momentumContainer}>
-      <View style={styles.momentumTrack}>
-        <View
-          style={[
-            styles.momentumMarker,
-            { left: `${markerPosition * 100}%`, backgroundColor: markerColor },
-          ]}
-        />
-      </View>
-      {/* Static layout, deliberately NOT tied to which of sma50/sma200 is
-          numerically higher (unlike the dot above): SMA50 always reads on
-          the left and SMA200 always on the right, so the row doesn't swap
-          positions out from under a user scanning the list — a text swap
-          that tracked the dot used to make quick visual scanning unreliable.
-          Each label is still ONE Text node combining a translated word with
-          a number, but — unlike the units/price row in PortfolioStockRow
-          (index.tsx) — this is safe as a single string: it always starts
-          with the translated word (SMA50/SMA200 or their Hebrew equivalent),
-          never a bare leading numeral, which is what actually confuses the
-          bidi text engine (see the RTL MIXED TEXT RENDERING FIX note there). */}
-      <View style={styles.momentumLabelRow}>
-        <Text style={styles.momentumLabelText}>
-          {t('sma50')} {sma50Display}
-        </Text>
-        <Text style={styles.momentumLabelText}>
-          {t('sma200')} {sma200Display}
-        </Text>
-      </View>
-    </View>
-  );
-}
 
 // A factory (not a module-level StyleSheet.create) so it can be re-derived
 // whenever the active theme OR language changes — StyleSheet.create bakes
@@ -292,6 +201,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       justifyContent: 'space-between',
     },
     bottomRow: {
+      flexDirection: 'row',
       marginTop: 12,
       alignItems: 'flex-start',
     },
@@ -339,51 +249,6 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.bearish,
       fontSize: 16,
       fontWeight: '700',
-    },
-    badge: {
-      paddingHorizontal: 10,
-      paddingVertical: 4,
-      borderRadius: 6,
-      marginLeft: 12,
-    },
-    badgeText: {
-      color: colors.textPrimary,
-      fontSize: 12,
-      fontWeight: '700',
-      textAlign: isHebrew ? 'right' : 'left',
-      writingDirection: isHebrew ? 'rtl' : 'ltr',
-    },
-    momentumContainer: {
-      flex: 1,
-    },
-    momentumFallbackText: {
-      flex: 1,
-      color: colors.textSecondary,
-      fontSize: 13,
-      textAlign: isHebrew ? 'right' : 'left',
-      writingDirection: isHebrew ? 'rtl' : 'ltr',
-    },
-    momentumTrack: {
-      height: 6,
-      borderRadius: 3,
-      backgroundColor: colors.background,
-      justifyContent: 'center',
-    },
-    momentumMarker: {
-      position: 'absolute',
-      width: 12,
-      height: 12,
-      borderRadius: 6,
-      marginLeft: -6,
-    },
-    momentumLabelRow: {
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-      marginTop: 6,
-    },
-    momentumLabelText: {
-      color: colors.textSecondary,
-      fontSize: 11,
     },
   });
 }

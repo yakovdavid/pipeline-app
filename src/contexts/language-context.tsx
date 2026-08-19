@@ -29,6 +29,8 @@ export type TranslationKey =
   | 'ag'
   | 'sma50'
   | 'sma200'
+  | 'macroTrend'
+  | 'tacticalMomentum'
   | 'high52'
   | 'drop'
   | 'target'
@@ -131,6 +133,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     ag: "אג'",
     sma50: 'מ.נ 50',
     sma200: 'מ.נ 200',
+    macroTrend: 'מגמה כללית',
+    tacticalMomentum: 'מומנטום טקטי',
     high52: 'שיא 52 שבועות',
     drop: 'ירידה',
     target: 'יעד',
@@ -221,6 +225,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     ag: 'Ag.',
     sma50: 'SMA50',
     sma200: 'SMA200',
+    macroTrend: 'Macro Trend',
+    tacticalMomentum: 'Tactical Momentum',
     high52: '52-Week High',
     drop: 'Drop',
     target: 'Target',
