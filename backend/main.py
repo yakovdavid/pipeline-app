@@ -170,20 +170,49 @@ ANOMALY_NEWS_COUNT = 3
 ANOMALY_FETCH_MAX_RETRIES = 1
 ANOMALY_FETCH_BASE_BACKOFF_SECONDS = 1.0
 
-# Bifurcated Mean Reversion (Ambush) anomaly thresholds: Sector ETFs are
-# structurally less volatile than individual Stocks (diversified holdings
-# damp out idiosyncratic single-name moves), so one shared threshold would
-# either almost never fire on ETFs (if sized for Stocks) or fire constantly
-# on ordinary Stock noise (if sized for ETFs). Two independent triggers per
-# asset type — either one fires the alert:
+# Bifurcated Mean Reversion (Ambush) anomaly thresholds — UNIFIED DEFENSE
+# PROTOCOLS: previously keyed by asset_type (Stock 15% / ETF 7%), now keyed
+# by the Fortress 2.0 portfolio LAYER (Satellite / Quality) instead, per
+# "The Fortress 2.0" architectural overhaul. This is a real behavior change,
+# not just a rename: a Satellite position is now judged the same way
+# whether it's a Stock or an ETF (one unified -7% trigger), and the old
+# -15% threshold is no longer a "large-cap stock" allowance — it's
+# exclusively the Quality layer's slower-moving "Kill Switch" for a
+# fundamental (not tactical) review. 'Core' positions get NO trigger at all
+# (see check_mean_reversion_anomaly): Core is held through drawdowns by
+# design, matching the frontend's own Core philosophy (no trailing stop
+# either — see SATELLITE_STOCK_TS_PCT/SATELLITE_ETF_TS_PCT client-side).
+#
+# NOTE on a pre-existing gap this also fixes: the frontend never actually
+# sent the old `asset_type` query param on any request (fetchStockData(t)
+# never appended it), so in production this bifurcation always silently
+# resolved to the "Stock" branch regardless of the real asset type — every
+# request got the 15% threshold. The new `category` param is now actually
+# sent by the Portfolio screen (see index.tsx), so this fix also closes
+# that gap, not just the rename.
+#
+# Two independent triggers per layer — either one fires the alert:
 #   - Drawdown: price is >= drawdown_pct below the 52-week high.
 #   - Structural support break: price < SMA50 - (std_dev_multiplier * the
 #     20-day close std dev).
 ANOMALY_STD_DEV_WINDOW = 20
-DEFAULT_ANOMALY_ASSET_TYPE = "Stock"
+# Ambush Radar has no portfolio-layer concept of its own (its watchlist
+# entries only ever carry a ticker + Stock/ETF asset type, never a
+# Core/Satellite/Quality category) — its requests never send `category` at
+# all, so they fall back to this default. Satellite (the tactical,
+# opportunistic layer) is the closer conceptual match for a mean-reversion
+# watchlist than Quality (a slow-moving, manually-reviewed layer), and its
+# tighter 7% threshold also errs toward actually firing rather than
+# under-alerting, consistent with this endpoint's other thresholds
+# (ANOMALY_THRESHOLD_DEFAULT, the structural-support trigger) which
+# likewise default to "surface it" over "stay silent."
+DEFAULT_ANOMALY_CATEGORY = "Satellite"
+# 'Core' is deliberately NOT a key here — see check_mean_reversion_anomaly,
+# which returns None immediately for it rather than falling back to either
+# bucket below.
 BEARISH_ANOMALY_RULES: dict[str, dict[str, float]] = {
-    "Stock": {"drawdown_pct": 15.0, "std_dev_multiplier": 2.0},
-    "ETF": {"drawdown_pct": 7.0, "std_dev_multiplier": 1.5},
+    "Satellite": {"drawdown_pct": 7.0, "std_dev_multiplier": 2.0},
+    "Quality": {"drawdown_pct": 15.0, "std_dev_multiplier": 2.0},
 }
 
 # On-Demand Intel: a user-triggered (not automatic/high-frequency) request
@@ -733,16 +762,23 @@ def _calculate_std_dev(closes: list[float], window: int = ANOMALY_STD_DEV_WINDOW
 
 def check_mean_reversion_anomaly(
     ticker_symbol: str,
-    asset_type: str,
+    category: str,
     price: float,
     sma50: float | None,
     high_52: float | None,
     closes: list[float],
     currency_converter: Callable[[float], float] | None = None,
 ) -> str | None:
-    """Bifurcated Margin-of-Safety anomaly check for the Ambush Radar / Mean
-    Reversion screen (see BEARISH_ANOMALY_RULES for the per-asset-type
-    thresholds this reads).
+    """UNIFIED DEFENSE PROTOCOLS: Margin-of-Safety anomaly check for the
+    Ambush Radar / Mean Reversion screen, bifurcated by Fortress 2.0
+    portfolio LAYER — Satellite vs. Quality (see BEARISH_ANOMALY_RULES) —
+    not by Stock/ETF asset type any more.
+
+    'Core' returns None immediately, before any trigger is evaluated at
+    all: Core positions are held through drawdowns by design (same
+    philosophy as this app's client-side trailing-stop logic, which never
+    gives Core an automatic stop either), so there is no "Core threshold"
+    to fall back to.
 
     price/sma50/high_52 must already be in the same currency (e.g. already
     USD-converted for ILS/Agorot-quoted instruments — see get_stock's
@@ -760,7 +796,10 @@ def check_mean_reversion_anomaly(
     than ANOMALY_STD_DEV_WINDOW closes) rather than treating "unknown" as
     "no anomaly" on one trigger while still checking the other normally.
     """
-    rules = BEARISH_ANOMALY_RULES.get(asset_type, BEARISH_ANOMALY_RULES[DEFAULT_ANOMALY_ASSET_TYPE])
+    if category == "Core":
+        return None
+
+    rules = BEARISH_ANOMALY_RULES.get(category, BEARISH_ANOMALY_RULES[DEFAULT_ANOMALY_CATEGORY])
     drawdown_threshold_pct = rules["drawdown_pct"]
     std_dev_multiplier = rules["std_dev_multiplier"]
 
@@ -769,12 +808,15 @@ def check_mean_reversion_anomaly(
     # Trigger 1: drawdown from the 52-week high. Guarded against a missing
     # or non-positive high_52 to avoid a division-by-zero on bad upstream
     # data (mirrors the guard already used for drawdown_pct in get_stock).
+    # -15% is now EXCLUSIVELY the Quality layer's Kill Switch; every
+    # Satellite position (Stock or ETF alike) is judged at the single
+    # unified -7% threshold instead — see BEARISH_ANOMALY_RULES.
     if high_52 is not None and high_52 > 0:
         drawdown_pct = ((price - high_52) / high_52) * 100
         if drawdown_pct <= -drawdown_threshold_pct:
             triggers.append(
                 f"{abs(drawdown_pct):.1f}% off its 52-week high "
-                f"(>= {drawdown_threshold_pct:.0f}% {asset_type} threshold)"
+                f"(>= {drawdown_threshold_pct:.0f}% {category} threshold)"
             )
 
     # Trigger 2: structural support break, SMA50 - (multiplier * 20-day std dev).
@@ -793,7 +835,8 @@ def check_mean_reversion_anomaly(
     if not triggers:
         return None
 
-    return f"[ANOMALY: {asset_type} MEAN REVERSION] " + "; ".join(triggers)
+    kill_switch_tag = " KILL SWITCH" if category == "Quality" else ""
+    return f"[ANOMALY: {category} MEAN REVERSION{kill_switch_tag}] " + "; ".join(triggers)
 
 
 def _fetch_usd_ils_rate() -> float:
@@ -927,7 +970,7 @@ def _classify_trend(price: float, sma: float | None) -> str | None:
 
 @app.get("/api/stock/{ticker}")
 def get_stock(
-    ticker: str, include_anomaly: bool = False, asset_type: str = DEFAULT_ANOMALY_ASSET_TYPE
+    ticker: str, include_anomaly: bool = False, category: str = DEFAULT_ANOMALY_CATEGORY
 ) -> dict[str, float | str | None]:
     # TASE TICKER INTERCEPTOR: a bare numeric security number (e.g.
     # "1081124") is auto-suffixed to "1081124.TA" here, before anything
@@ -942,17 +985,23 @@ def get_stock(
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker symbol is required.")
 
-    # ASSET TYPE IDENTIFICATION: read from the incoming query mapping
-    # ('Stock' vs 'ETF'), case-insensitively, defaulting to 'Stock' for any
-    # missing/unrecognized value — this keeps the endpoint backward
-    # compatible with callers that don't send it yet.
-    normalized_asset_type = "ETF" if asset_type.strip().upper() == "ETF" else "Stock"
+    # PORTFOLIO LAYER IDENTIFICATION: read from the incoming query mapping
+    # ('Core' / 'Satellite' / 'Quality'), case-insensitively, defaulting to
+    # DEFAULT_ANOMALY_CATEGORY ('Satellite') for any missing/unrecognized
+    # value — Ambush Radar requests never send this at all (it has no
+    # portfolio-layer concept of its own), so they always take that
+    # default. Replaces the old Stock/ETF `asset_type` param entirely — see
+    # BEARISH_ANOMALY_RULES for why the trigger is now layer-based, not
+    # asset-type-based.
+    normalized_category = category.strip().capitalize()
+    if normalized_category not in ("Core", "Satellite", "Quality"):
+        normalized_category = DEFAULT_ANOMALY_CATEGORY
 
     # The formatted-response cache covers the fully-assembled JSON
-    # (including the anomaly checks below, which is why the flag/asset type
-    # are part of the key — the bifurcated thresholds mean the same ticker
-    # can produce a different anomaly string per asset type).
-    cache_key = f"{symbol}:anomaly:{normalized_asset_type}" if include_anomaly else symbol
+    # (including the anomaly checks below, which is why the flag/layer are
+    # part of the key — the bifurcated thresholds mean the same ticker can
+    # produce a different anomaly string per layer).
+    cache_key = f"{symbol}:anomaly:{normalized_category}" if include_anomaly else symbol
     cached_result = stock_cache.get(cache_key)
     if cached_result is not None:
         return cached_result
@@ -1105,7 +1154,7 @@ def get_stock(
         # surface either signal independently.
         result["mean_reversion_anomaly"] = check_mean_reversion_anomaly(
             symbol,
-            normalized_asset_type,
+            normalized_category,
             price,
             sma50,
             high_52,

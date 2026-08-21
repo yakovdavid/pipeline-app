@@ -353,7 +353,7 @@ export default function PortfolioScreen() {
       // overwhelming the network with N simultaneous connections — this
       // still awaits the full queue before moving on, so isInitializing
       // below only flips to false once every batch has resolved.
-      const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
+      const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker, entry.category));
 
       const loadedStocks: PortfolioStock[] = [];
       results.forEach((result, index) => {
@@ -464,7 +464,7 @@ export default function PortfolioScreen() {
 
     setIsAdding(true);
     try {
-      const quote = await fetchStockData(normalizedTicker);
+      const quote = await fetchStockData(normalizedTicker, selectedCategory);
 
       // AUTO-CALIBRATION FOR BROKEN PRICES: quote.localPrice here is the
       // RAW, freshly-fetched API value — nothing has calibrated it yet, so
@@ -612,17 +612,22 @@ export default function PortfolioScreen() {
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      const tickersToRefresh = stocks.map((stock) => stock.ticker);
+      // Refreshes from the live `stocks` array (not just a plain ticker
+      // string list) so each request can carry that position's own
+      // category — see fetchStockData's `category` param — for the
+      // Satellite/Quality-keyed Mean Reversion threshold, same as every
+      // other fetch site below.
+      const stocksToRefresh = stocks;
       // CONCURRENCY LIMITING: see loadInitialStocks above — small batches,
-      // not one Promise.allSettled over the whole list. Parameter
-      // deliberately not named `t` here (unlike elsewhere in this file) to
-      // avoid shadowing the translation function from usePipelineLanguage.
-      const results = await fetchInChunks(tickersToRefresh, (tickerSymbol) => fetchStockData(tickerSymbol));
+      // not one Promise.allSettled over the whole list.
+      const results = await fetchInChunks(stocksToRefresh, (stock) =>
+        fetchStockData(stock.ticker, stock.category),
+      );
 
       const freshQuotes = new Map<string, StockQuote>();
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
-          freshQuotes.set(tickersToRefresh[index], result.value);
+          freshQuotes.set(stocksToRefresh[index].ticker, result.value);
         }
       });
 
@@ -745,7 +750,9 @@ export default function PortfolioScreen() {
       // initial-load flow); Ambush Radar's separate mounted screen picks up
       // its half of the restore the next time its tab gains focus.
       // CONCURRENCY LIMITING: see loadInitialStocks above.
-      const results = await fetchInChunks(payload.portfolio, (entry) => fetchStockData(entry.ticker));
+      const results = await fetchInChunks(payload.portfolio, (entry) =>
+        fetchStockData(entry.ticker, entry.category),
+      );
 
       const hydratedStocks: PortfolioStock[] = [];
       results.forEach((result, index) => {

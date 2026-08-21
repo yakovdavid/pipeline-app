@@ -1,4 +1,5 @@
 import type { TrendLabel } from '@/types/asset';
+import type { PortfolioCategory } from '@/types/portfolio';
 
 export type StockQuote = {
   // Multi-Currency engine: normalized to USD by the backend — this is the
@@ -105,14 +106,27 @@ export async function fetchInChunks<TItem, TResult>(
   return results;
 }
 
-export async function fetchStockData(ticker: string): Promise<StockQuote> {
+// UNIFIED DEFENSE PROTOCOLS: `category` selects which Mean Reversion
+// threshold bucket the backend's Ambush trigger judges this ticker against
+// — 'Satellite' (unified 7% for Stocks and ETFs alike) or 'Quality' (15%,
+// exclusively a Kill Switch) — see backend/main.py's BEARISH_ANOMALY_RULES.
+// 'Core' positions get no trigger at all (held through drawdowns by
+// design). Optional: Ambush Radar has no portfolio-layer concept of its
+// own (its watchlist entries only carry a ticker + Stock/ETF asset type),
+// so its call sites simply omit this — the backend then falls back to its
+// own DEFAULT_ANOMALY_CATEGORY ('Satellite'). Only the Portfolio screen
+// (which knows each position's real category) passes this explicitly.
+export async function fetchStockData(ticker: string, category?: PortfolioCategory): Promise<StockQuote> {
   const normalizedTicker = ticker.trim().toUpperCase();
 
   let response: Response;
   try {
     // include_anomaly=true opts into the backend's Anomaly News Fetcher
     // (an extra, throttled Yahoo call on their side) for every quote fetch.
-    response = await fetch(`${API_BASE_URL}/api/stock/${normalizedTicker}?include_anomaly=true`);
+    const categoryParam = category ? `&category=${encodeURIComponent(category)}` : '';
+    response = await fetch(
+      `${API_BASE_URL}/api/stock/${normalizedTicker}?include_anomaly=true${categoryParam}`,
+    );
   } catch {
     throw new Error(
       `Could not reach the Pipeline API at ${API_BASE_URL}. Check that the backend is running and that your device is on the same network.`,
