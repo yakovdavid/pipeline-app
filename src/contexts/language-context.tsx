@@ -65,6 +65,10 @@ export type TranslationKey =
   | 'readFullArticle'
   | 'copyIntel'
   | 'trailingStopActivatedAt'
+  // Fortress 2.0 layer-specific UI (PortfolioStockRow)
+  | 'allocation'
+  | 'fundamentalAuditRequired'
+  | 'hold'
   // Add/Edit Asset modal
   | 'category'
   | 'assetType'
@@ -167,6 +171,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     readFullArticle: 'קרא כתבה מלאה ←',
     copyIntel: 'העתק מודיעין',
     trailingStopActivatedAt: 'עצירה נגררת מופעלת ב',
+    allocation: 'הקצאה',
+    fundamentalAuditRequired: 'נדרשת בדיקה יסודית',
+    hold: 'החזק',
     category: 'קטגוריה',
     assetType: 'סוג נכס',
     addToPortfolio: 'הוסף לתיק',
@@ -259,6 +266,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     readFullArticle: 'Read full article →',
     copyIntel: 'Copy Intel',
     trailingStopActivatedAt: 'Trailing stop activated at',
+    allocation: 'Allocation',
+    fundamentalAuditRequired: 'Fundamental Audit Required',
+    hold: 'Hold',
     category: 'Category',
     assetType: 'Asset Type',
     addToPortfolio: 'Add to Portfolio',

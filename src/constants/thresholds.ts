@@ -4,12 +4,11 @@
 // so both agree on exactly the same trigger condition.
 export const STRUCTURAL_STOP_THRESHOLD = 1.02;
 
-// Trailing Stop (TS) bifurcation: Satellite is the only category that gets
-// an automatic trailing stop (Core is held through drawdowns, Quality is
-// manually risk-reviewed instead — see PortfolioStockRow). Within
-// Satellite, ETFs are structurally less volatile than individual Stocks, so
-// they get a tighter percentage — a Stock-sized stop would let an ETF give
-// back too much before triggering, while an ETF-sized stop would whipsaw a
-// Stock on ordinary single-name noise.
-export const SATELLITE_STOCK_TS_PCT = 0.12;
-export const SATELLITE_ETF_TS_PCT = 0.07;
+// Trailing Stop (TS) REVERSION: Satellite is the only category that gets an
+// automatic trailing stop (Core is held through drawdowns; Quality gets a
+// Fundamental Audit "Kill Switch" instead — see PortfolioStockRow). A
+// single hard 12% for EVERY Satellite position now, Stock or ETF alike —
+// the old ETF-specific 7% exception has been deliberately removed as part
+// of "The Fortress 2.0" protocol's UI/discipline simplification: one
+// unambiguous tactical rule per layer, not a per-asset-type carve-out.
+export const SATELLITE_TS_PCT = 0.12;

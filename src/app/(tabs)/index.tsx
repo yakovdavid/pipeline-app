@@ -27,15 +27,13 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
-import { MomentumBar } from '@/components/MomentumBar';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
-import { TrendBadges } from '@/components/TrendBadges';
 import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT, formatUnitsLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
-import { SATELLITE_ETF_TS_PCT, SATELLITE_STOCK_TS_PCT } from '@/constants/thresholds';
+import { SATELLITE_TS_PCT } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import {
@@ -92,6 +90,11 @@ type PortfolioListSection = {
   category: PortfolioCategory;
   accentColor: string;
   data: PortfolioStock[];
+  // Core "Allocation Tracking": this layer's live share of the whole
+  // portfolio (see computeLayerWeightPct) — computed once here, read by
+  // every row in this section via the currentWeightPct prop, rather than
+  // each row re-deriving it from the full stocks array.
+  currentWeightPct: number;
 };
 
 // The return type of createStyles (defined at the bottom of this file) —
@@ -109,26 +112,34 @@ function extractPortfolioItemKey(item: PortfolioStock): string {
 }
 
 // Tracks the "Highest Watermark" (highest price seen since a position was
-// added) that drives the Satellite trailing-stop trigger price for both
-// Stock and ETF positions (see the TS_PCT bifurcation in PortfolioStockRow
-// below). Tracked for every position regardless of category/assetType —
-// category isn't available here, and it's harmless to also track it for
-// Core/Quality positions that never actually use it for a TS calculation.
+// added) that drives the Satellite trailing-stop trigger price (see
+// SATELLITE_TS_PCT in PortfolioStockRow below). Tracked for every position
+// regardless of category/assetType — category isn't available here, and
+// it's harmless to also track it for Core/Quality positions that never
+// actually use it for a TS calculation.
 function computeHighestWatermark(previousWatermark: number | null, latestPrice: number): number | null {
   return previousWatermark === null ? latestPrice : Math.max(previousWatermark, latestPrice);
 }
 
-// TS bifurcation: only called for Satellite positions (see
-// PortfolioStockRow) — ETFs get a tighter trailing stop than Stocks since
-// they're structurally less volatile.
-function getSatelliteTrailingStopPct(assetType: AssetType): number {
-  return assetType === 'ETF' ? SATELLITE_ETF_TS_PCT : SATELLITE_STOCK_TS_PCT;
-}
-
-// ALLOCATION STATUS: builds the "<layer> (Target: X% | Actual: Y%) - N
-// Assets" section-header string — target from the fixed Fortress 2.0 Model
-// (CATEGORY_TARGET_PCT), actual computed live from this layer's share of
-// the whole portfolio's value, and N the number of tickers in it.
+// ALLOCATION STATUS / Core "Allocation Tracking": the pure percentage
+// calculation, shared by buildSectionTitle's header string below AND
+// PortfolioStockRow's per-row "Allocation: X% / Target: 70%" line (Core
+// layer only) — computed ONCE per layer here in PortfolioScreen (see
+// allSections) rather than re-derived by every row, and threaded down via
+// PortfolioListSection.currentWeightPct / the currentWeightPct prop.
+//
+// NOTE ON SOURCING: "The Fortress 2.0" overhaul's SQL migration
+// (backend/sql/001_ui_pipeline_metrics.sql) defines this exact calculation
+// as a Postgres window function (SUM(...) OVER (PARTITION BY asset_layer)
+// / SUM(...) OVER ()) inside a `ui_pipeline_metrics` view — but that
+// migration is NOT connected to any live database (see that file's own
+// header comment), and the live FastAPI backend (backend/main.py) has no
+// endpoint that could supply a `current_weight_pct` field even in
+// principle: it's a stateless per-ticker proxy with zero visibility into a
+// user's OTHER positions, which this calculation inherently needs. This
+// stays a client-side computation for that reason — same formula the SQL
+// view specifies, just not literally "read from the backend JSON" since no
+// such JSON field exists yet.
 //
 // Both categoryStocks' contribution and totalPortfolioValue MUST be
 // computed from `stock.price` (USD-normalized by the backend's
@@ -145,6 +156,18 @@ function getSatelliteTrailingStopPct(assetType: AssetType): number {
 // held quantity like 1433 would be multiplied straight through instead of
 // the ~14.33 real units it actually represents, inflating this layer's
 // (and the whole portfolio's) computed value ~100x.
+function computeLayerWeightPct(categoryStocks: PortfolioStock[], totalPortfolioValue: number): number {
+  const categoryValue = categoryStocks.reduce(
+    (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
+    0,
+  );
+  return totalPortfolioValue > 0 ? (categoryValue / totalPortfolioValue) * 100 : 0;
+}
+
+// Builds the "<layer> (Target: X% | Actual: Y%) - N Assets" section-header
+// string — target from the fixed Fortress 2.0 Model (CATEGORY_TARGET_PCT),
+// actual is the SAME currentWeightPct computed once in allSections below
+// (not re-derived here), and N the number of tickers in it.
 //
 // This is a single translated-word-first string (categoryLabel(...) always
 // comes first), which is bidi-safe as one <Text> node — unlike the
@@ -154,16 +177,11 @@ function buildSectionTitle(
   t: TFunction,
   category: PortfolioCategory,
   categoryStocks: PortfolioStock[],
-  totalPortfolioValue: number,
+  currentWeightPct: number,
 ): string {
-  const categoryValue = categoryStocks.reduce(
-    (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
-    0,
-  );
-  const actualPct = totalPortfolioValue > 0 ? (categoryValue / totalPortfolioValue) * 100 : 0;
   return (
     `${categoryLabel(t, category)} (${t('target')}: ${CATEGORY_TARGET_PCT[category]}% | ` +
-    `${t('actual')}: ${actualPct.toFixed(1)}%) - ${categoryStocks.length} ${t('assets')}`
+    `${t('actual')}: ${currentWeightPct.toFixed(1)}%) - ${categoryStocks.length} ${t('assets')}`
   );
 }
 
@@ -598,6 +616,7 @@ export default function PortfolioScreen() {
       <PortfolioStockRow
         stock={item}
         accentColor={section.accentColor}
+        currentWeightPct={section.currentWeightPct}
         onDelete={handleDeleteTicker}
         onSaveEdit={handleSaveEdit}
         colors={colors}
@@ -901,24 +920,35 @@ export default function PortfolioScreen() {
     0,
   );
 
+  // Computed ONCE per layer here (see computeLayerWeightPct's own comment
+  // for why this stays client-side rather than a literal backend JSON
+  // read) — reused for both this section's header string AND, for Core,
+  // every row's own "Allocation: X% / Target: 70%" line.
+  const coreWeightPct = computeLayerWeightPct(coreStocks, totalPortfolioValue);
+  const satelliteWeightPct = computeLayerWeightPct(satelliteStocks, totalPortfolioValue);
+  const qualityWeightPct = computeLayerWeightPct(qualityStocks, totalPortfolioValue);
+
   const allSections: PortfolioListSection[] = [
     {
-      title: buildSectionTitle(t, 'Core', coreStocks, totalPortfolioValue),
+      title: buildSectionTitle(t, 'Core', coreStocks, coreWeightPct),
       category: 'Core',
       accentColor: colors.core,
       data: coreStocks,
+      currentWeightPct: coreWeightPct,
     },
     {
-      title: buildSectionTitle(t, 'Satellite', satelliteStocks, totalPortfolioValue),
+      title: buildSectionTitle(t, 'Satellite', satelliteStocks, satelliteWeightPct),
       category: 'Satellite',
       accentColor: colors.satellite,
       data: satelliteStocks,
+      currentWeightPct: satelliteWeightPct,
     },
     {
-      title: buildSectionTitle(t, 'Quality', qualityStocks, totalPortfolioValue),
+      title: buildSectionTitle(t, 'Quality', qualityStocks, qualityWeightPct),
       category: 'Quality',
       accentColor: colors.quality,
       data: qualityStocks,
+      currentWeightPct: qualityWeightPct,
     },
   ];
   const visibleSections = allSections.filter(
@@ -1503,6 +1533,10 @@ export default function PortfolioScreen() {
 type PortfolioStockRowProps = {
   stock: PortfolioStock;
   accentColor: string;
+  // Core "Allocation Tracking" only — this layer's live share of the whole
+  // portfolio, computed once in PortfolioScreen (see computeLayerWeightPct)
+  // and passed down rather than re-derived per row.
+  currentWeightPct: number;
   onDelete: (ticker: string) => void;
   onSaveEdit: (ticker: string, units: number, assetType: AssetType, totalValueInput: string) => void;
   colors: PipelineColorScheme;
@@ -1515,12 +1549,13 @@ type PortfolioStockRowProps = {
 // doesn't re-render every other row in the SectionList — stocks state
 // updates already keep unaffected PortfolioStock objects referentially
 // stable (see onRefresh/handleSaveEdit/handleDeleteTicker above), and
-// accentColor/onDelete/onSaveEdit/colors/styles/language/t are all stable
-// across renders too (a fixed per-theme accent color, useCallback-wrapped
-// handlers, the parent's own useMemo-derived theme values, and the
-// language string/translator function respectively — colors/styles only
-// actually change reference on a real theme toggle, language/t only on a
-// real language switch), so
+// accentColor/currentWeightPct/onDelete/onSaveEdit/colors/styles/language/t
+// are all stable across renders too (a fixed per-theme accent color, a
+// number that only changes when the layer's actual composition changes,
+// useCallback-wrapped handlers, the parent's own useMemo-derived theme
+// values, and the language string/translator function respectively —
+// colors/styles only actually change reference on a real theme toggle,
+// language/t only on a real language switch), so
 // this comparison is meaningful, not a no-op. memo() only shallow-compares
 // props, not context, but this component reads no context of its own —
 // colors/styles/language/t arrive as props from PortfolioScreen, which is
@@ -1529,6 +1564,7 @@ type PortfolioStockRowProps = {
 const PortfolioStockRow = memo(function PortfolioStockRow({
   stock,
   accentColor,
+  currentWeightPct,
   onDelete,
   onSaveEdit,
   colors,
@@ -1573,35 +1609,43 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const unitPriceDisplay = formatUnitPrice(stock.ticker, stock.localPrice, stock.currencySymbol, agorotSuffix);
   const totalValueDisplay = formatTotalValue(localTotalValue, stock.currencySymbol);
 
-  // Same Agorot treatment for the 52-week high shown in the drawdown row
-  // below — high52 is USD-normalized (see PortfolioStock's own field
-  // comment), so it's first scaled onto localPrice's basis (exact, not an
-  // approximation — see deriveLocalValue) before formatting.
-  const localHigh52 = stock.high52 !== null ? deriveLocalValue(stock.high52, stock.localPrice, stock.price) : null;
-  const high52Display =
-    localHigh52 !== null ? formatUnitPrice(stock.ticker, localHigh52, stock.currencySymbol, agorotSuffix) : null;
-  // Trailing stops are a Satellite-only mechanic: Core positions are meant
-  // to be held through drawdowns, and Quality positions are risk-reviewed
-  // manually (see the drawdown-review styling below) rather than
-  // auto-stopped. A Core/Quality position (which could still have a tracked
-  // highestWatermark from before this rule, or from being reassigned away
-  // from Satellite) must show no TS field at all.
-  //
-  // Within Satellite, the percentage is bifurcated by asset type: ETFs are
-  // structurally less volatile than individual Stocks, so they get a
-  // tighter trailing stop (7% vs. 12% — see thresholds.ts).
-  const trailingStopPct = stock.category === 'Satellite' ? getSatelliteTrailingStopPct(stock.assetType) : null;
+  // LAYER 1: SATELLITE — Trailing Stop Reversion: a single hard 12% for
+  // EVERY Satellite position, Stock or ETF alike (the old ETF-specific 7%
+  // exception is gone — see SATELLITE_TS_PCT in thresholds.ts). Core
+  // positions are held through drawdowns and Quality gets the Fundamental
+  // Audit Kill Switch below instead, so neither ever computes a TS price.
   const trailingStopPrice =
-    trailingStopPct !== null && stock.highestWatermark !== null
-      ? stock.highestWatermark * (1 - trailingStopPct)
+    stock.category === 'Satellite' && stock.highestWatermark !== null
+      ? stock.highestWatermark * (1 - SATELLITE_TS_PCT)
       : null;
+  // Red/green, not just a triggered/untriggered binary: colors.bearish
+  // once price has fallen to (or through) the trigger, colors.bullish while
+  // it's still safely above it — see trailingStopPriceColor at the JSX
+  // call site.
   const isTrailingStopTriggered = trailingStopPrice !== null && stock.price <= trailingStopPrice;
 
-  // Quality-layer review flag: a Quality position that has fallen 15%+
-  // from its 52-week high is flagged for manual review (Quality positions
-  // don't get an automatic trailing stop, so this is the equivalent
-  // "pay attention" signal for that layer instead).
-  const isQualityDrawdownReview =
+  // SMA200 MODIFICATION (Satellite only): read-only macro-context display —
+  // no Bullish/Bearish color coding, no SMA50 at all (INDICATOR PURGE — see
+  // the JSX below, which renders this as plain gray text, never a colored
+  // trend badge). USD-normalized stock.sma200 is scaled onto localPrice's
+  // basis first (exact, not an approximation — see deriveLocalValue), same
+  // as every other Agorot-aware price display in this file.
+  const localSma200 =
+    stock.category === 'Satellite' && stock.sma200 !== null
+      ? deriveLocalValue(stock.sma200, stock.localPrice, stock.price)
+      : null;
+  const sma200Display =
+    localSma200 !== null ? formatUnitPrice(stock.ticker, localSma200, stock.currencySymbol, agorotSuffix) : null;
+
+  // LAYER 2: QUALITY — Kill Switch Tracker: a position that has fallen 15%+
+  // from its 52-week high gets flagged RED with a Fundamental Audit tag,
+  // otherwise it reads HOLD. This is the drawdown-based half of "quality_
+  // status === 'FUNDAMENTAL_AUDIT_REQUIRED' (or drawdown <= -15%)" — the
+  // quality_status API field doesn't exist on the live backend yet (only in
+  // the unexecuted Supabase view — see backend/sql/001_ui_pipeline_metrics.
+  // sql), so this reads the one half of that condition that IS real,
+  // already-delivered data: stock.drawdownPct.
+  const isFundamentalAuditRequired =
     stock.category === 'Quality' && stock.drawdownPct !== null && stock.drawdownPct <= -15;
 
   const handleStartEditing = () => {
@@ -1740,63 +1784,88 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
         </View>
       )}
 
-      {/* Add SMA Visuals to Portfolio: the exact same MomentumBar component
-          the Ambush Radar StockCard renders — see @/components/MomentumBar.
-          Dashboard Trend Display: Macro Trend + Tactical Momentum badges,
-          same shared component as StockCard too — see
-          @/components/TrendBadges. Both gated on !isEditing, same as the
-          trailing-stop/drawdown blocks below. */}
-      {!isEditing && (
-        <View style={styles.momentumRow}>
-          <MomentumBar
-            ticker={stock.ticker}
-            price={stock.price}
-            sma50={stock.sma50}
-            sma200={stock.sma200}
-            localPrice={stock.localPrice}
-            currencySymbol={stock.currencySymbol}
-            tacticalMomentum={stock.tacticalMomentum}
-          />
-        </View>
-      )}
+      {/* INDICATOR PURGE — each layer shows ONLY what its own protocol
+          calls for; nothing here is shared across layers any more (no
+          MomentumBar/TrendBadges — those stay Ambush-Radar-only, see
+          StockCard.tsx). All three blocks are gated on !isEditing, same as
+          the rest of this row's live-data display. */}
 
-      {!isEditing && (
-        <TrendBadges macroTrend={stock.macroTrend} tacticalMomentum={stock.tacticalMomentum} />
-      )}
-
-      {!isEditing && trailingStopPrice !== null && (
-        // Trailing Stop is a computed USD threshold (highestWatermark is
-        // tracked in USD — see computeHighestWatermark above), not a raw
-        // quoted price, so it stays displayed in USD ('$') regardless of
-        // the instrument's own trading currency — converting a derived
-        // threshold back to local currency isn't something the frontend
-        // can do without re-deriving the FX rate itself.
-        <Text
-          style={[
-            styles.trailingStopText,
-            isTrailingStopTriggered && styles.trailingStopTriggeredText,
-          ]}>
-          {isTrailingStopTriggered ? '⚠ ' : ''}
-          {t('trailingStopActivatedAt')}: ${trailingStopPrice.toFixed(2)}
-        </Text>
-      )}
-
-      {!isEditing && high52Display !== null && stock.drawdownPct !== null && (
-        // TASE AGOROT DISPLAY: high52Display reads e.g. "3985 אג'" for a
-        // ".TA" ticker (derived from the USD-normalized stock.high52 via
-        // deriveLocalValue above), or "$X.XX"/"₪X.XX" otherwise — see the
-        // trailing-stop text below for the one price-like field that
-        // deliberately stays USD regardless (a computed threshold, not a
-        // raw quote).
-        <View style={styles.drawdownRow}>
-          <Text
-            style={[styles.drawdownText, isQualityDrawdownReview && styles.drawdownTextReview]}>
-            {t('high52')}: {high52Display} ({t('drop')}: {stock.drawdownPct.toFixed(2)}%)
-          </Text>
-          {isQualityDrawdownReview && (
-            <Text style={styles.drawdownReviewTag}>[{t('review')}]</Text>
+      {/* LAYER 1: SATELLITE — SMA200 read-only, grayed out, no color
+          coding ("macro-context only" — SMA50 is not shown at all, per the
+          Indicator Purge), the precise TS trigger price in red/green based
+          on current price, and the 52-Week Drawdown percentage. */}
+      {!isEditing && stock.category === 'Satellite' && (
+        <>
+          {sma200Display !== null && (
+            <Text style={styles.macroContextText}>
+              {t('sma200')}: {sma200Display}
+            </Text>
           )}
+
+          {trailingStopPrice !== null && (
+            // Trailing Stop is a computed USD threshold (highestWatermark
+            // is tracked in USD — see computeHighestWatermark above), not
+            // a raw quoted price, so it stays displayed in USD ('$')
+            // regardless of the instrument's own trading currency —
+            // converting a derived threshold back to local currency isn't
+            // something the frontend can do without re-deriving the FX
+            // rate itself.
+            <Text
+              style={[
+                styles.trailingStopText,
+                isTrailingStopTriggered ? styles.trailingStopBearishText : styles.trailingStopBullishText,
+              ]}>
+              {isTrailingStopTriggered ? '⚠ ' : ''}
+              {t('trailingStopActivatedAt')}: ${trailingStopPrice.toFixed(2)}
+            </Text>
+          )}
+
+          {stock.drawdownPct !== null && (
+            <Text style={styles.drawdownText}>
+              {t('drop')}: {stock.drawdownPct.toFixed(2)}%
+            </Text>
+          )}
+        </>
+      )}
+
+      {/* LAYER 2: QUALITY — Indicator Purge: no Trailing Stop, no SMA50,
+          no SMA200 at all. Kill Switch Tracker: 52-Week Drawdown + a
+          RED "[FUNDAMENTAL AUDIT REQUIRED]" block when triggered, else a
+          neutral/green "[HOLD]". */}
+      {!isEditing && stock.category === 'Quality' && stock.drawdownPct !== null && (
+        <View
+          style={[
+            styles.killSwitchBlock,
+            isFundamentalAuditRequired && styles.killSwitchBlockAlert,
+          ]}>
+          <Text
+            style={[
+              styles.killSwitchDrawdownText,
+              isFundamentalAuditRequired && styles.killSwitchDrawdownTextAlert,
+            ]}>
+            {t('drop')}: {stock.drawdownPct.toFixed(2)}%
+          </Text>
+          <Text
+            style={[
+              styles.killSwitchTag,
+              isFundamentalAuditRequired ? styles.killSwitchTagAlert : styles.killSwitchTagHold,
+            ]}>
+            {isFundamentalAuditRequired ? `[${t('fundamentalAuditRequired')}]` : `[${t('hold')}]`}
+          </Text>
         </View>
+      )}
+
+      {/* LAYER 3: CORE — Indicator Purge: no TS, no SMAs, no Drawdown.
+          Allocation Tracking only: this layer's live share of the whole
+          portfolio (currentWeightPct — see computeLayerWeightPct in
+          PortfolioScreen) vs. the fixed Fortress 2.0 target. No dividend
+          yield/cash-flow placeholder rendered — that data doesn't exist
+          anywhere in this app's pipeline yet, and a fabricated placeholder
+          would violate "no placeholders" more than simply omitting it. */}
+      {!isEditing && stock.category === 'Core' && (
+        <Text style={styles.allocationText}>
+          {t('allocation')}: {currentWeightPct.toFixed(1)}% / {t('target')}: {CATEGORY_TARGET_PCT.Core}%
+        </Text>
       )}
     </View>
   );
@@ -2196,14 +2265,6 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     justifyContent: 'space-between',
     marginTop: 6,
   },
-  // Add SMA Visuals to Portfolio: wraps the shared MomentumBar (see
-  // @/components/MomentumBar) — matches StockCard.tsx's own bottomRow
-  // exactly, so the visual sits identically on both screens.
-  momentumRow: {
-    flexDirection: 'row',
-    marginTop: 12,
-    alignItems: 'flex-start',
-  },
   // RTL MIXED TEXT RENDERING FIX: split into 3 independent <Text> nodes
   // (units label / at-word / price value — see unitsPriceRow below) instead
   // of one interpolated string, so a number-first run (the units count)
@@ -2286,41 +2347,90 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fontWeight: '600',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
+  // LAYER 1: SATELLITE — SMA200's read-only "macro-context only" display:
+  // deliberately always colors.textSecondary regardless of price/trend —
+  // no bullish/bearish color coding, per the SMA200 Modification.
+  macroContextText: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginTop: 6,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
   trailingStopText: {
     // Translated-word-first label + LTR '$' threshold value — an aligned
     // paragraph, bidi handles the embedded number regardless of direction.
-    color: colors.textSecondary,
+    // Base structural style only — color always comes from the bullish/
+    // bearish variant below, applied at the call site.
     fontSize: 12,
+    fontWeight: '700',
     marginTop: 6,
     textAlign: isHebrew ? 'right' : 'left',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
-  trailingStopTriggeredText: {
-    color: colors.warning,
-    fontWeight: '700',
+  // Trailing Stop Reversion: "the precise TS price trigger in red/green
+  // based on current price" — always one or the other, not a neutral
+  // default that only turns a warning color once triggered.
+  trailingStopBullishText: {
+    color: colors.bullish,
   },
-  drawdownRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    marginTop: 6,
+  trailingStopBearishText: {
+    color: colors.bearish,
   },
   drawdownText: {
-    // Translated-word-first ("High52: ... (Drop: ...)"), same bidi-safety
-    // reasoning as sectionTitle above — safe as one Text node.
+    // Translated-word-first ("Drop: -X%"), same bidi-safety reasoning as
+    // sectionTitle above — safe as one Text node.
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginTop: 6,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  // LAYER 2: QUALITY — Kill Switch Tracker. Alert (FUNDAMENTAL_AUDIT_
+  // REQUIRED) is a loud, filled reviewAlert-red block; Hold is deliberately
+  // quiet (no fill, just green text) — an "everything's fine" status
+  // shouldn't compete visually with a real alert.
+  killSwitchBlock: {
+    marginTop: 8,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  killSwitchBlockAlert: {
+    backgroundColor: colors.reviewAlert,
+  },
+  killSwitchDrawdownText: {
     color: colors.textSecondary,
     fontSize: 12,
     textAlign: isHebrew ? 'right' : 'left',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
-  drawdownTextReview: {
-    color: colors.reviewAlert,
-    fontWeight: '700',
+  killSwitchDrawdownTextAlert: {
+    color: colors.reviewAlertText,
   },
-  drawdownReviewTag: {
-    color: colors.reviewAlert,
-    fontSize: 12,
-    fontWeight: '700',
+  killSwitchTag: {
+    fontSize: 13,
+    fontWeight: '800',
+    marginTop: 4,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  killSwitchTagAlert: {
+    color: colors.reviewAlertText,
+  },
+  killSwitchTagHold: {
+    color: colors.bullish,
+  },
+  // LAYER 3: CORE — Allocation Tracking. Translated-word-first
+  // ("Allocation: X% / Target: 70%"), same bidi-safety reasoning as
+  // sectionTitle above — safe as one Text node.
+  allocationText: {
+    color: colors.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 6,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   initializingContainer: {
     flex: 1,

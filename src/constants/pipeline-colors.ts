@@ -24,6 +24,12 @@ export type PipelineColorScheme = {
   // (>= 15% off the high) — deliberately its own color, not reused from
   // "bearish", so this specific manual-review signal reads distinctly.
   reviewAlert: string;
+  // Fixed white text for content painted on top of `reviewAlert` (the
+  // Quality Kill Switch's "[FUNDAMENTAL AUDIT REQUIRED]" alert block) — same
+  // "fixed regardless of theme" reasoning as `warningText` above: reviewAlert
+  // is a saturated red in both themes, so white stays legible on it either
+  // way, unlike `textPrimary` which flips light/dark with the theme.
+  reviewAlertText: string;
 };
 
 export const DarkPipelineColors: PipelineColorScheme = {
@@ -39,6 +45,7 @@ export const DarkPipelineColors: PipelineColorScheme = {
   warning: '#FFA726',
   warningText: '#121212',
   reviewAlert: '#FF4444',
+  reviewAlertText: '#FFFFFF',
 };
 
 // Clean white/light-gray backgrounds, dark text, white cards (shadows are
@@ -59,4 +66,5 @@ export const LightPipelineColors: PipelineColorScheme = {
   warning: '#FB8C00',
   warningText: '#1C1C1E',
   reviewAlert: '#D32F2F',
+  reviewAlertText: '#FFFFFF',
 };

@@ -12,9 +12,8 @@ export type PortfolioTickerEntry = {
   units: number;
   // Highest price observed for this position since it was added, tracked
   // for every asset type (drives the Satellite trailing-stop trigger price
-  // for both Stock and ETF positions — see SATELLITE_STOCK_TS_PCT /
-  // SATELLITE_ETF_TS_PCT in thresholds.ts). Null until the first live price
-  // is fetched.
+  // — a single hard 12% for Stocks and ETFs alike, see SATELLITE_TS_PCT in
+  // thresholds.ts). Null until the first live price is fetched.
   highestWatermark: number | null;
   // AUTO-CALIBRATION FOR BROKEN PRICES: for a handful of funds (observed:
   // HRL-F95.TA) Yahoo Finance returns a raw index value instead of a real
@@ -48,17 +47,19 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // persisted, for the same reason.
   high52: number | null;
   drawdownPct: number | null;
-  // Add SMA Visuals to Portfolio: previously an Ambush-Radar-only pair
-  // (StockQuote already carried them; PortfolioStock didn't). Live/
-  // ephemeral like every other fetched field above, never persisted — see
-  // MomentumBar (shared by both screens) and TrendBadges in index.tsx.
+  // Live/ephemeral like every other fetched field above, never persisted.
+  // "Fortress 2.0" Indicator Purge: sma50 is fetched (still returned by the
+  // API for every asset — see StockQuote's own comment) but no longer
+  // rendered anywhere in the Portfolio UI at all; sma200 is shown ONLY for
+  // Satellite, as plain read-only macro-context text (no color coding) —
+  // see PortfolioStockRow in index.tsx.
   sma50: number | null;
   sma200: number | null;
   // TREND CLASSIFICATION: two independent backend-computed signals — see
-  // StockQuote's own field comments for the full rationale. Replaces the
-  // single trend indicator this screen never actually had before (Ambush
-  // Radar was the only screen with a Bullish/Bearish badge); now both
-  // screens show both indicators identically.
+  // StockQuote's own field comments for the full rationale. Fetched/stored
+  // for every position but, per the Indicator Purge, no longer rendered in
+  // the Portfolio UI (macroTrend/tacticalMomentum badges were removed —
+  // Ambush Radar's StockCard is the only screen that still shows them).
   macroTrend: TrendLabel;
   tacticalMomentum: TrendLabel;
 };
