@@ -44,8 +44,24 @@ distinct signal either indicator alone would hide.
 health_check) — it exists purely so an external uptime ping (a cron job)
 can keep a free-tier host warm without ever touching yfinance/Yahoo, so
 pinging it can never itself contribute to Yahoo rate-limiting.
+
+"The Fortress 2.0" additions — Trailing Stop Engine and Quality Z-Score
+Module (see get_stock's high_water_mark/roic/quality_weight_pct params and
+_with_request_scoped_fields): pullback_depth and, for Quality assets only,
+quality_z_score are computed fresh on every request from already-fetched
+Yahoo data (no new outbound calls). trailing_stop_price/high_water_mark
+and the quality_z_score_alert gate are deliberately kept OUT of the
+formatted-response cache (stock_cache) since they depend on per-request,
+caller-supplied portfolio context (a position's own watermark, its roic,
+the Quality layer's current weight) rather than Yahoo data — see
+_with_request_scoped_fields for why caching them would risk a stale Sell
+Alert. An optional, env-var-gated Supabase sync
+(_sync_high_water_mark_to_supabase) persists high_water_mark/roic to a
+`portfolio_assets` table when a real Supabase project is configured (see
+backend/sql/) — a guaranteed no-op today, since none is.
 """
 
+import os
 import random
 import re
 import threading
@@ -73,6 +89,64 @@ except ImportError:  # pragma: no cover - depends on host platform
     import requests as _http_backend  # type: ignore[no-redef]
 
     _HAS_CURL_CFFI = False
+
+# --- Optional Supabase sync (Trailing Stop Engine / Quality Z-Score) -----
+# "The Fortress 2.0" high_water_mark sync: best-effort, env-var-gated, and
+# a guaranteed no-op today. As documented extensively in backend/sql/
+# README.md and backend/sql/001_ui_pipeline_metrics.sql, this repository
+# has NO Supabase project connected as of this feature being written —
+# there is no SUPABASE_URL/SUPABASE_SERVICE_KEY in any deployed
+# environment yet. Rather than block the Trailing Stop Engine's backend
+# logic on "wait for a database to exist," this guards the import (same
+# pattern as the curl_cffi fallback above) and the client construction
+# behind both env vars being present, so:
+#   - With no Supabase project configured (today): _supabase_client is
+#     None, _sync_high_water_mark_to_supabase is a no-op, and every other
+#     line in this file behaves exactly as it did before this feature.
+#   - Once a real Supabase project exists and its URL/service key are set
+#     as environment variables: the exact same code starts actually
+#     persisting high_water_mark/roic to portfolio_assets (see
+#     backend/sql/002_trailing_stop_and_quality_zscore.sql), with no
+#     further code change required.
+try:
+    from supabase import Client, create_client
+
+    _SUPABASE_URL = os.environ.get("SUPABASE_URL")
+    _SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
+    _supabase_client: "Client | None" = (
+        create_client(_SUPABASE_URL, _SUPABASE_KEY) if _SUPABASE_URL and _SUPABASE_KEY else None
+    )
+except ImportError:  # pragma: no cover - `supabase` may not be installed in every environment
+    _supabase_client = None
+
+PORTFOLIO_ASSETS_TABLE = "portfolio_assets"
+
+
+def _sync_high_water_mark_to_supabase(symbol: str, updated_high_water_mark: float, roic: float | None) -> None:
+    """Trailing Stop Engine / Quality Z-Score Module: best-effort
+    persistence of high_water_mark (and roic, when supplied) to Supabase's
+    portfolio_assets table for `symbol` — see backend/sql/
+    002_trailing_stop_and_quality_zscore.sql for the column definitions.
+
+    A no-op whenever Supabase isn't configured (_supabase_client is None —
+    see above) or the `supabase` package isn't installed. Any failure here
+    is caught and logged, never raised: this is a side effect of the
+    primary price/SMA response, and a Supabase hiccup must never be
+    allowed to break that response the way a Yahoo failure could (same
+    resilience philosophy as fetch_anomaly_news elsewhere in this file).
+    """
+    if _supabase_client is None:
+        return
+
+    update_payload: dict[str, float] = {"high_water_mark": updated_high_water_mark}
+    if roic is not None:
+        update_payload["roic"] = roic
+
+    try:
+        _supabase_client.table(PORTFOLIO_ASSETS_TABLE).update(update_payload).eq("ticker", symbol).execute()
+    except Exception as error:  # noqa: BLE001 - best-effort sync; never fail the main response over this
+        print(f"[resilience] Supabase high_water_mark sync failed for '{symbol}': {error}")
+
 
 MAX_SEARCH_RESULTS = 6
 
@@ -214,6 +288,51 @@ BEARISH_ANOMALY_RULES: dict[str, dict[str, float]] = {
     "Satellite": {"drawdown_pct": 7.0, "std_dev_multiplier": 2.0},
     "Quality": {"drawdown_pct": 15.0, "std_dev_multiplier": 2.0},
 }
+
+# --- Trailing Stop Engine (Satellite only) -------------------------------
+# A single hard 12% drop from a position's own high_water_mark — the exact
+# same figure the frontend has computed client-side for a while now (see
+# SATELLITE_TS_PCT in src/constants/thresholds.ts: highestWatermark * (1 -
+# 0.12), i.e. * 0.88); this constant is the backend's own copy of that same
+# rule, kept in sync deliberately, now also driving backend/sql/
+# 002_trailing_stop_and_quality_zscore.sql's view. TRAILING STOP DEFENSE
+# CONSTRAINTS: this is a Satellite-ONLY mechanism — see the hardcoded
+# `normalized_category == "Satellite"` guard around every use of this
+# constant in get_stock below. Core is held through drawdowns by design;
+# Quality gets its own Fundamental Audit Kill Switch (BEARISH_ANOMALY_RULES
+# above) instead. Neither Core nor Quality may ever compute a trailing-stop
+# trigger price, regardless of what high_water_mark a caller supplies.
+SATELLITE_TRAILING_STOP_PCT = 0.12
+
+# --- Quality Z-Score Module (Quality only) -------------------------------
+# Rolling-window lookback for the "standard deviation of price relative to
+# SMA50" calculation (see _calculate_quality_zscore) — 20 trading days,
+# matching this file's existing ANOMALY_STD_DEV_WINDOW convention for a
+# short-term structural std dev elsewhere in this same file. Needs at
+# least SMA_50_WINDOW additional closes before the lookback window even
+# starts (each of the WINDOW historical days needs its own trailing 50-day
+# SMA), hence QUALITY_ZSCORE_MIN_HISTORY below.
+QUALITY_ZSCORE_WINDOW = 20
+QUALITY_ZSCORE_MIN_HISTORY = SMA_50_WINDOW + QUALITY_ZSCORE_WINDOW
+
+# Z-SCORE CONSTRAINTS: the alert (not the raw z_score value, which is
+# always returned for a Quality asset whenever there's enough history to
+# compute one) MUST ONLY be evaluated as active when ALL THREE hold:
+#   1. the z_score itself falls in [-2.0, -1.5] (a moderate-to-strong
+#      mean-reversion-below-SMA50 reading);
+#   2. the asset's own roic (Return on Invested Capital) is >= 15 — a
+#      quality-screen gate: don't flag a statistical dip on a
+#      fundamentally weak business as a buying opportunity;
+#   3. the Quality layer's OWN current share of the whole portfolio is
+#      <= 10% — the Fortress 2.0 Model's target Quality allocation (see
+#      CATEGORY_TARGET_PCT.Quality in src/constants/labels.ts) — so the
+#      alert never encourages adding to Quality once it's already at (or
+#      past) its intended weight.
+# See _quality_zscore_alert_active for the actual gate.
+QUALITY_ZSCORE_ALERT_LOWER = -2.0
+QUALITY_ZSCORE_ALERT_UPPER = -1.5
+QUALITY_ZSCORE_MIN_ROIC = 15.0
+QUALITY_MAX_LAYER_WEIGHT_PCT = 10.0
 
 # On-Demand Intel: a user-triggered (not automatic/high-frequency) request
 # for a ticker's latest headlines regardless of price movement. Since it's
@@ -760,6 +879,114 @@ def _calculate_std_dev(closes: list[float], window: int = ANOMALY_STD_DEV_WINDOW
     return variance**0.5
 
 
+def _update_high_water_mark(existing_high_water_mark: float | None, current_price: float) -> float:
+    """Trailing Stop Engine: the sync rule, verbatim — "update
+    high_water_mark ... if the new current_price is strictly greater than
+    the existing high_water_mark." A missing existing watermark (a
+    position's very first fetch — nothing to compare against yet) seeds it
+    from current_price, matching the frontend's own computeHighestWatermark
+    (src/app/(tabs)/index.tsx) so the two stay consistent whether or not a
+    caller has an existing value to send.
+    """
+    if existing_high_water_mark is None:
+        return current_price
+    return current_price if current_price > existing_high_water_mark else existing_high_water_mark
+
+
+def _calculate_quality_zscore(
+    closes: list[float], current_price: float, current_sma50: float | None
+) -> float | None:
+    """Quality Z-Score Module: how many standard deviations `current_price`
+    sits away from its own SMA50, relative to how that same (price - SMA50)
+    / SMA50 relationship has behaved over the trailing QUALITY_ZSCORE_WINDOW
+    trading days.
+
+    For each of the last QUALITY_ZSCORE_WINDOW days, computes that day's own
+    trailing SMA50 (a rolling calculation, not the single current SMA50
+    reused for every day) and its percentage deviation from it, then takes
+    the population mean/std dev of those deviations. The current deviation
+    is standardized against that mean/std dev the usual way: z = (x -
+    mean) / std_dev.
+
+    Deliberately computed from RATIOS ((close - sma) / sma), not raw price
+    differences — this is currency-scale-invariant (a fixed linear
+    conversion like Agorot -> ILS or ILS -> USD cancels out of a ratio), so
+    `closes` can safely be the raw/native-currency history already cached
+    on the TickerSnapshot (same one check_mean_reversion_anomaly reuses)
+    without needing its own currency-converted history. `current_price`/
+    `current_sma50` should be from that same raw basis for consistency,
+    though the ratio math means it would be equally valid on the
+    USD-converted basis instead.
+
+    Returns None whenever there isn't enough history
+    (QUALITY_ZSCORE_MIN_HISTORY closes) to compute every rolling SMA50 the
+    window needs, current_sma50 itself is unavailable/non-positive, or the
+    historical deviations have zero variance (a division-by-zero guard,
+    not expected in practice for real price data) — "can't be evaluated,"
+    never a misleading guessed value, matching this file's existing
+    convention (drawdown_pct, mean_reversion_anomaly's own std dev).
+    """
+    if current_sma50 is None or current_sma50 <= 0:
+        return None
+    if len(closes) < QUALITY_ZSCORE_MIN_HISTORY:
+        return None
+
+    historical_deviations: list[float] = []
+    for offset in range(QUALITY_ZSCORE_WINDOW):
+        # offset 0 = the most recent historical day in the window, up to
+        # QUALITY_ZSCORE_WINDOW - 1 = the oldest. end_index is exclusive
+        # (Python slice convention), so closes[end_index - 1] is that day's
+        # own close and closes[end_index - SMA_50_WINDOW:end_index] is the
+        # trailing 50 closes ending on (and including) it.
+        end_index = len(closes) - offset
+        rolling_window = closes[end_index - SMA_50_WINDOW : end_index]
+        day_sma50 = sum(rolling_window) / SMA_50_WINDOW
+        if day_sma50 <= 0:
+            continue
+        day_close = closes[end_index - 1]
+        historical_deviations.append(((day_close - day_sma50) / day_sma50) * 100)
+
+    # Fewer than 2 usable data points can't produce a meaningful std dev
+    # (and would risk a near-zero one even if it technically computed).
+    if len(historical_deviations) < 2:
+        return None
+
+    mean_deviation = sum(historical_deviations) / len(historical_deviations)
+    variance = sum((deviation - mean_deviation) ** 2 for deviation in historical_deviations) / len(
+        historical_deviations
+    )
+    std_deviation = variance**0.5
+    if std_deviation == 0:
+        return None
+
+    current_deviation = ((current_price - current_sma50) / current_sma50) * 100
+    return (current_deviation - mean_deviation) / std_deviation
+
+
+def _quality_zscore_alert_active(
+    z_score: float | None, roic: float | None, quality_layer_weight_pct: float | None
+) -> bool:
+    """Z-SCORE CONSTRAINTS gate — see the constants' own comments above for
+    the full rationale. Returns False (never raises, never guesses "maybe")
+    whenever any one of the three conditions is unmet OR unknown: a missing
+    roic or quality_layer_weight_pct (the caller simply didn't supply
+    portfolio-composition context — see get_stock's own query params) is
+    treated the same as "condition not satisfied," not as "condition
+    doesn't apply." This is a pure gate function, deliberately separate
+    from _calculate_quality_zscore, so the raw z_score can always be
+    returned/displayed even when the alert itself can't fire.
+    """
+    if z_score is None:
+        return False
+    if not (QUALITY_ZSCORE_ALERT_LOWER <= z_score <= QUALITY_ZSCORE_ALERT_UPPER):
+        return False
+    if roic is None or roic < QUALITY_ZSCORE_MIN_ROIC:
+        return False
+    if quality_layer_weight_pct is None or quality_layer_weight_pct > QUALITY_MAX_LAYER_WEIGHT_PCT:
+        return False
+    return True
+
+
 def check_mean_reversion_anomaly(
     ticker_symbol: str,
     category: str,
@@ -968,10 +1195,87 @@ def _classify_trend(price: float, sma: float | None) -> str | None:
     return "Bullish" if price > sma else "Bearish"
 
 
+def _with_request_scoped_fields(
+    cached_result: dict[str, float | str | None],
+    normalized_category: str,
+    high_water_mark: float | None,
+    roic: float | None,
+    quality_weight_pct: float | None,
+) -> dict[str, float | str | bool | None]:
+    """Layers the Trailing Stop Engine's high_water_mark/trailing_stop_price
+    and the Quality Z-Score Module's alert gate on top of an already-
+    computed (possibly cached) base response.
+
+    These three fields must NEVER be part of the cached payload itself
+    (get_stock's stock_cache): they're derived from PER-REQUEST,
+    caller-supplied context (a position's own currently-tracked watermark,
+    its roic, the Quality layer's current live portfolio weight) rather
+    than from Yahoo data — baking them into the shared, symbol-keyed cache
+    would let one caller's numbers leak into another's, or let a stale
+    watermark survive past whatever CACHE_TTL_SECONDS this ticker happens
+    to be cached for. A stale Sell Alert / trailing-stop price is exactly
+    the class of bug that isn't acceptable here, so these are always
+    recomputed fresh, on every single call, cache hit or miss alike.
+
+    Returns a NEW dict (`dict(cached_result)`, a shallow copy) — never
+    mutates cached_result in place, since on a cache hit that's the literal
+    object sitting inside stock_cache, and mutating it would corrupt every
+    OTHER caller's (and every future request's, until the TTL expires)
+    view of it with THIS request's one-off watermark/roic/weight.
+    """
+    result: dict[str, float | str | bool | None] = dict(cached_result)
+
+    current_price = result["price"]
+    assert isinstance(current_price, (int, float))  # always set by get_stock
+
+    updated_high_water_mark = _update_high_water_mark(high_water_mark, float(current_price))
+    result["high_water_mark"] = round(updated_high_water_mark, 2)
+
+    # TRAILING STOP DEFENSE CONSTRAINTS: a hardcoded architectural block —
+    # Core/Quality get None here UNCONDITIONALLY, never a computed price,
+    # regardless of what high_water_mark a caller supplies. Mirrors the
+    # identical guard on the frontend (see computeSatelliteTrailingStopPrice
+    # in src/app/(tabs)/index.tsx) — belt and suspenders, per the PRD's own
+    # "Hardcode a block preventing this from ever showing or calculating
+    # for 'Core' or 'Quality' assets" requirement.
+    result["trailing_stop_price"] = (
+        round(updated_high_water_mark * (1 - SATELLITE_TRAILING_STOP_PCT), 2)
+        if normalized_category == "Satellite"
+        else None
+    )
+
+    raw_z_score = result.get("quality_z_score")
+    z_score = raw_z_score if isinstance(raw_z_score, (int, float)) else None
+    result["quality_z_score_alert"] = _quality_zscore_alert_active(z_score, roic, quality_weight_pct)
+
+    return result
+
+
 @app.get("/api/stock/{ticker}")
 def get_stock(
-    ticker: str, include_anomaly: bool = False, category: str = DEFAULT_ANOMALY_CATEGORY
-) -> dict[str, float | str | None]:
+    ticker: str,
+    include_anomaly: bool = False,
+    category: str = DEFAULT_ANOMALY_CATEGORY,
+    # TRAILING STOP ENGINE: this position's currently-tracked high water
+    # mark (see PortfolioTickerEntry.highestWatermark on the frontend),
+    # sent so the sync rule (_update_high_water_mark) and the Satellite-
+    # only trailing_stop_price below have something to compare the fresh
+    # `price` against. None (the default) means "no prior watermark to
+    # compare against" — _update_high_water_mark then seeds it from this
+    # response's own price, same as a brand-new position.
+    high_water_mark: float | None = None,
+    # QUALITY Z-SCORE MODULE: this asset's fundamental Return on Invested
+    # Capital and the Quality layer's current live share of the whole
+    # portfolio — the two portfolio-composition-dependent halves of the
+    # Z-Score alert gate (see QUALITY_ZSCORE_* / _quality_zscore_alert_
+    # active) that this stateless, per-ticker endpoint has no way to know
+    # on its own. Ambush Radar never sends either (no layer/fundamentals
+    # concept at all — same reasoning as `category` above), so both
+    # default to None, which _quality_zscore_alert_active treats as
+    # "gate not satisfied," never "gate doesn't apply."
+    roic: float | None = None,
+    quality_weight_pct: float | None = None,
+) -> dict[str, float | str | bool | None]:
     # TASE TICKER INTERCEPTOR: a bare numeric security number (e.g.
     # "1081124") is auto-suffixed to "1081124.TA" here, before anything
     # else touches it, so the rest of this function — and every helper it
@@ -1000,11 +1304,24 @@ def get_stock(
     # The formatted-response cache covers the fully-assembled JSON
     # (including the anomaly checks below, which is why the flag/layer are
     # part of the key — the bifurcated thresholds mean the same ticker can
-    # produce a different anomaly string per layer).
-    cache_key = f"{symbol}:anomaly:{normalized_category}" if include_anomaly else symbol
+    # produce a different anomaly string per layer). ALWAYS includes
+    # normalized_category now (not just when include_anomaly) — the
+    # Quality Z-Score Module's quality_z_score below is category-gated
+    # too, so a bare `symbol` key is no longer safe on its own the way it
+    # used to be when every non-anomaly field was category-independent.
+    # high_water_mark/roic/quality_weight_pct deliberately do NOT become
+    # part of this key: those drive fields that must be computed fresh on
+    # every single call, after this cache lookup, never cached — see
+    # _with_request_scoped_fields' own comment for why baking them in here
+    # would risk handing back a stale Sell Alert / trailing-stop price.
+    cache_key = f"{symbol}:{normalized_category}:{include_anomaly}"
     cached_result = stock_cache.get(cache_key)
     if cached_result is not None:
-        return cached_result
+        final_result = _with_request_scoped_fields(
+            cached_result, normalized_category, high_water_mark, roic, quality_weight_pct
+        )
+        _sync_high_water_mark_to_supabase(symbol, final_result["high_water_mark"], roic)
+        return final_result
 
     # THE SPEED FIX: check TICKER_CACHE before making any outbound Yahoo
     # call at all. A hit here means this request costs zero network calls,
@@ -1097,6 +1414,34 @@ def get_stock(
 
     high_52_rounded = round(float(high_52), 2) if high_52 is not None else None
 
+    # PULLBACK DEPTH CALCULATION: how far price sits below (or above) its
+    # own SMA50, as a percentage — the continuous, graduated sibling of
+    # tactical_momentum's binary Bullish/Bearish verdict below, and the
+    # basis for the frontend's 3-tier Pullback Depth Indicator (Gray
+    # "Premium" > 0%, Orange "Watch" 0% to -2.9%, Red "Kill Zone" <= -3%,
+    # see src/components/TrendBadges.tsx). Computed for EVERY asset
+    # regardless of category — unlike the Quality Z-Score below, this
+    # isn't gated, since both Portfolio and Ambush Radar callers use SMA50
+    # already (see tactical_momentum). None whenever sma50 itself is
+    # unavailable, same "can't be evaluated" convention as drawdown_pct.
+    if sma50 is not None and sma50 > 0:
+        pullback_depth = round(((price - sma50) / sma50) * 100, 2)
+    else:
+        pullback_depth = None
+
+    # QUALITY Z-SCORE MODULE: "For 'Quality' category assets only, fetch
+    # historical data to calculate the standard deviation of the price
+    # relative to the SMA50 to derive the Z-Score" — see
+    # _calculate_quality_zscore. Computed from the RAW (pre-currency-
+    # conversion) price/sma50/closes — see that function's own comment for
+    # why a ratio-based calculation is currency-scale-invariant regardless.
+    # None for every other category, unconditionally — this is gated
+    # exactly like tactical_momentum/macro_trend are gated on SMA
+    # availability, just on category instead.
+    quality_z_score = (
+        _calculate_quality_zscore(closes, raw_price, raw_sma50) if normalized_category == "Quality" else None
+    )
+
     # TREND CLASSIFICATION: computed from the already USD-normalized
     # price/sma50/sma200 above — see _classify_trend. Note this is valid
     # regardless of any further scaling a caller might apply downstream
@@ -1139,6 +1484,15 @@ def get_stock(
         "sma_200": round(float(sma200), 2) if sma200 is not None else None,
         "high_52": high_52_rounded,
         "drawdown_pct": drawdown_pct,
+        # PULLBACK DEPTH CALCULATION: see its own comment above. Category-
+        # independent, unlike quality_z_score below.
+        "pullback_depth": pullback_depth,
+        # QUALITY Z-SCORE MODULE: the raw score (None for every non-Quality
+        # asset, or when there isn't enough history) — see its own comment
+        # above. The gated ALERT boolean is NOT part of this cached dict;
+        # it's layered on per-request by _with_request_scoped_fields, same
+        # as trailing_stop_price/high_water_mark.
+        "quality_z_score": round(quality_z_score, 2) if quality_z_score is not None else None,
         # TREND CLASSIFICATION: see _classify_trend above. Null (not a
         # guessed "Bearish") whenever the underlying SMA itself is
         # unavailable.
@@ -1163,7 +1517,10 @@ def get_stock(
         )
 
     stock_cache.set(cache_key, result)
-    return result
+
+    final_result = _with_request_scoped_fields(result, normalized_category, high_water_mark, roic, quality_weight_pct)
+    _sync_high_water_mark_to_supabase(symbol, final_result["high_water_mark"], roic)
+    return final_result
 
 
 @app.get("/api/search/{query}")

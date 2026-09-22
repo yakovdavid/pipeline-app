@@ -3,3 +3,10 @@ uvicorn
 yfinance
 pandas
 curl_cffi
+# Optional Trailing Stop Engine / Quality Z-Score sync target (see
+# backend/main.py's _sync_high_water_mark_to_supabase and backend/sql/) —
+# imported behind a guarded try/except, so its absence never breaks the
+# app; installed here so the sync actually activates the moment
+# SUPABASE_URL/SUPABASE_SERVICE_KEY are set in a deployed environment,
+# with no further code or dependency change required.
+supabase

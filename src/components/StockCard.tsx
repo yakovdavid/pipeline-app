@@ -43,6 +43,9 @@ export type Stock = {
   // StockQuote only, unused by this component's own UI.
   high52: number | null;
   drawdownPct: number | null;
+  // PULLBACK DEPTH INDICATOR: replaces the old binary Tactical Momentum
+  // badge in TrendBadges below — see that component's own comment.
+  pullbackDepth: number | null;
 };
 
 export type StockCardProps = {
@@ -76,6 +79,7 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
     sma200,
     macroTrend,
     tacticalMomentum,
+    pullbackDepth,
   } = stock;
 
   const isNearStructuralStop =
@@ -133,10 +137,11 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
         />
       </View>
 
-      {/* Dashboard Trend Display: Macro Trend + Tactical Momentum, replacing
-          the old single Bullish/Bearish badge — shared component, see
+      {/* Dashboard Trend Display: Macro Trend + Pullback Depth Indicator
+          (replacing the old binary Tactical Momentum badge), replacing the
+          even older single Bullish/Bearish badge — shared component, see
           @/components/TrendBadges. */}
-      <TrendBadges macroTrend={macroTrend} tacticalMomentum={tacticalMomentum} />
+      <TrendBadges macroTrend={macroTrend} pullbackDepth={pullbackDepth} />
     </View>
   );
 });

@@ -42,6 +42,15 @@ export type TranslationKey =
   | 'notAvailable'
   | 'insufficientMomentumData'
   | 'structuralStopWarning'
+  // Pullback Depth Indicator (replaces the binary Tactical Momentum
+  // badge — see TrendBadges.tsx) and Quality Z-Score Module
+  | 'pullbackDepth'
+  | 'premium'
+  | 'watch'
+  | 'killZone'
+  | 'qualityZScore'
+  | 'zScoreAlert'
+  | 'roicPlaceholder'
   // Loading states
   | 'loadingPortfolio'
   | 'loadingAmbush'
@@ -150,6 +159,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     notAvailable: 'לא זמין',
     insufficientMomentumData: 'אין מספיק נתוני ממוצע נע',
     structuralStopWarning: '⚠ אזהרת עצירה מבנית: במרחק 2% מתמיכת ממוצע 200 יום',
+    pullbackDepth: 'עומק נסיגה',
+    premium: 'פרימיום',
+    watch: 'מעקב',
+    killZone: 'אזור כניסה',
+    qualityZScore: 'ציון Z איכות',
+    zScoreAlert: 'התראת ציון Z',
+    roicPlaceholder: "תשואה על ההון המושקע % (איכות) - אופציונלי",
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
     noPositionsYet: 'אין עדיין פוזיציות.',
@@ -245,6 +261,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     notAvailable: 'N/A',
     insufficientMomentumData: 'Not enough moving-average data',
     structuralStopWarning: '⚠ Structural Stop Warning: within 2% of 200-day support',
+    pullbackDepth: 'Pullback Depth',
+    premium: 'Premium',
+    watch: 'Watch',
+    killZone: 'Kill Zone',
+    qualityZScore: 'Quality Z-Score',
+    zScoreAlert: 'Z-Score Alert',
+    roicPlaceholder: 'ROIC % (Quality) - optional',
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
     noPositionsYet: 'No positions yet.',

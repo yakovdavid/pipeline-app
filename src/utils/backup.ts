@@ -46,7 +46,7 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
   if (typeof value === 'string') {
     const ticker = value.trim().toUpperCase();
     return ticker.length > 0
-      ? { ticker, category: 'Satellite', assetType: 'Stock', units: 0, highestWatermark: null }
+      ? { ticker, category: 'Satellite', assetType: 'Stock', units: 0, highestWatermark: null, roic: null }
       : null;
   }
   if (typeof value !== 'object' || value === null) {
@@ -76,6 +76,11 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
       typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
         ? entry.calibrationFactor
         : undefined,
+    // QUALITY Z-SCORE MODULE: must round-trip through backup export/
+    // import same as every other persisted field — dropping it here would
+    // silently wipe out a user-entered ROIC the moment a backup is
+    // restored.
+    roic: typeof entry.roic === 'number' ? entry.roic : null,
   };
 }
 

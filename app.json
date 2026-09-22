@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "pipeline-app",
-    "slug": "pipeline-app",
+    "slug": "pipleline-app-2nd",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -42,8 +42,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "6de79ef8-bb6b-4a7f-b9e6-470e64d0e740"
+        "projectId": "aa40c446-664b-42c2-a623-aa2b3cee26be"
       }
-    }
+    },
+    "owner": "yakovdavid2023s-team"
   }
 }

@@ -26,6 +26,14 @@ export type PortfolioTickerEntry = {
   // Undefined/missing (older, pre-feature entries) and exactly 1.0 both
   // mean "no correction" — see DEFAULT_CALIBRATION_FACTOR.
   calibrationFactor?: number;
+  // QUALITY Z-SCORE MODULE: this position's fundamental Return on
+  // Invested Capital, entered manually (Yahoo/yfinance doesn't expose
+  // this) — one half of the backend's Z-Score alert gate (see
+  // backend/main.py's QUALITY_ZSCORE_MIN_ROIC). Null until the user
+  // enters one; relevant for Quality-category positions only, but tracked
+  // regardless of category (harmless, same reasoning as
+  // highestWatermark above) in case a position is later recategorized.
+  roic: number | null;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {
@@ -62,4 +70,24 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // Ambush Radar's StockCard is the only screen that still shows them).
   macroTrend: TrendLabel;
   tacticalMomentum: TrendLabel;
+  // PULLBACK DEPTH CALCULATION: ((price - sma50) / sma50) * 100 from the
+  // backend (see backend/main.py) — live/ephemeral like drawdownPct,
+  // never persisted. Category-independent (computed for every asset), but
+  // only actually rendered for Satellite today (see
+  // src/components/TrendBadges.tsx, shared with Ambush Radar's StockCard —
+  // PortfolioStockRow itself still follows the Fortress 2.0 Indicator
+  // Purge and shows nothing SMA-derived outside Satellite).
+  pullbackDepth: number | null;
+  // QUALITY Z-SCORE MODULE: backend-computed (see backend/main.py's
+  // _calculate_quality_zscore), null for every non-Quality asset or
+  // whenever there isn't enough price history. Live/ephemeral, never
+  // persisted, same as drawdownPct.
+  qualityZScore: number | null;
+  // Whether the backend's roic >= 15% AND Quality-layer-weight <= 10% gate
+  // (see backend/main.py's QUALITY_ZSCORE_* constants) was satisfied for
+  // THIS specific request — never re-derived client-side; PortfolioStockRow
+  // additionally hardcodes a `stock.category === 'Quality'` check before
+  // ever showing this, so a stale/mis-set value from a future bug can't
+  // surface an alert on the wrong layer.
+  qualityZScoreAlert: boolean;
 };

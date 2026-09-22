@@ -40,6 +40,23 @@ export type StockQuote = {
   // a 52-week high for this instrument.
   high52: number | null;
   drawdownPct: number | null;
+  // PULLBACK DEPTH CALCULATION: ((price - sma50) / sma50) * 100, computed
+  // backend-side for every asset (see backend/main.py) — the continuous,
+  // graduated sibling of tacticalMomentum's binary Bullish/Bearish verdict
+  // above. Null whenever sma50 itself is unavailable, same convention as
+  // every other nullable field here.
+  pullbackDepth: number | null;
+  // QUALITY Z-SCORE MODULE: backend-computed (see backend/main.py's
+  // _calculate_quality_zscore) — null for any non-Quality request (the
+  // `category` param wasn't 'Quality') or when there isn't enough price
+  // history yet.
+  qualityZScore: number | null;
+  // The backend's own roic >= 15% AND Quality-layer-weight <= 10% Z-Score
+  // alert gate (see backend/main.py's QUALITY_ZSCORE_* constants),
+  // evaluated against whatever roic/qualityWeightPct this specific
+  // request supplied (see fetchStockData's options param below) — always
+  // false when those weren't supplied, never a guessed default.
+  qualityZScoreAlert: boolean;
 };
 
 export type TickerSearchResult = {
@@ -116,17 +133,47 @@ export async function fetchInChunks<TItem, TResult>(
 // so its call sites simply omit this — the backend then falls back to its
 // own DEFAULT_ANOMALY_CATEGORY ('Satellite'). Only the Portfolio screen
 // (which knows each position's real category) passes this explicitly.
-export async function fetchStockData(ticker: string, category?: PortfolioCategory): Promise<StockQuote> {
+// TRAILING STOP ENGINE / QUALITY Z-SCORE MODULE: optional, portfolio-
+// composition-dependent context only the Portfolio screen (index.tsx) can
+// supply — Ambush Radar has neither a watermark, a fundamentals concept,
+// nor a layer-weight concept, so it always omits this entirely (same as
+// it already omits `category`). All three are read by the backend as
+// query params (see backend/main.py's get_stock) but never required: a
+// missing highWaterMark just means "no prior watermark to compare
+// against yet," and a missing roic/qualityWeightPct means the Z-Score
+// alert gate simply can't be satisfied for this request (never "doesn't
+// apply" — see backend/main.py's _quality_zscore_alert_active).
+export type StockDataOptions = {
+  highWaterMark?: number | null;
+  roic?: number | null;
+  qualityWeightPct?: number | null;
+};
+
+export async function fetchStockData(
+  ticker: string,
+  category?: PortfolioCategory,
+  options?: StockDataOptions,
+): Promise<StockQuote> {
   const normalizedTicker = ticker.trim().toUpperCase();
 
   let response: Response;
   try {
     // include_anomaly=true opts into the backend's Anomaly News Fetcher
     // (an extra, throttled Yahoo call on their side) for every quote fetch.
-    const categoryParam = category ? `&category=${encodeURIComponent(category)}` : '';
-    response = await fetch(
-      `${API_BASE_URL}/api/stock/${normalizedTicker}?include_anomaly=true${categoryParam}`,
-    );
+    const params = new URLSearchParams({ include_anomaly: 'true' });
+    if (category) {
+      params.set('category', category);
+    }
+    if (options?.highWaterMark !== undefined && options.highWaterMark !== null) {
+      params.set('high_water_mark', String(options.highWaterMark));
+    }
+    if (options?.roic !== undefined && options.roic !== null) {
+      params.set('roic', String(options.roic));
+    }
+    if (options?.qualityWeightPct !== undefined && options.qualityWeightPct !== null) {
+      params.set('quality_weight_pct', String(options.qualityWeightPct));
+    }
+    response = await fetch(`${API_BASE_URL}/api/stock/${normalizedTicker}?${params.toString()}`);
   } catch {
     throw new Error(
       `Could not reach the Pipeline API at ${API_BASE_URL}. Check that the backend is running and that your device is on the same network.`,
@@ -160,6 +207,9 @@ export async function fetchStockData(ticker: string, category?: PortfolioCategor
     sma_200?: number | null;
     macro_trend?: string | null;
     tactical_momentum?: string | null;
+    pullback_depth?: number | null;
+    quality_z_score?: number | null;
+    quality_z_score_alert?: boolean;
   };
 
   if (typeof data.price !== 'number') {
@@ -180,6 +230,9 @@ export async function fetchStockData(ticker: string, category?: PortfolioCategor
     anomalyReport: typeof data.anomaly === 'string' ? data.anomaly : null,
     high52: typeof data.high_52 === 'number' ? data.high_52 : null,
     drawdownPct: typeof data.drawdown_pct === 'number' ? data.drawdown_pct : null,
+    pullbackDepth: typeof data.pullback_depth === 'number' ? data.pullback_depth : null,
+    qualityZScore: typeof data.quality_z_score === 'number' ? data.quality_z_score : null,
+    qualityZScoreAlert: data.quality_z_score_alert === true,
   };
 }
 
