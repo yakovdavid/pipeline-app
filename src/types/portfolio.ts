@@ -34,6 +34,16 @@ export type PortfolioTickerEntry = {
   // regardless of category (harmless, same reasoning as
   // highestWatermark above) in case a position is later recategorized.
   roic: number | null;
+  // CORE LAYER INTERNAL ALLOCATION: an optional, user-defined target for
+  // this asset's own share WITHIN its layer (e.g. "AAPL should be 40% of
+  // Core"), entered manually — there's no fixed model for sub-asset
+  // targets the way CATEGORY_TARGET_PCT fixes the Core/Satellite/Quality
+  // split at the layer level (src/constants/labels.ts), so this is null
+  // ("no internal target set") until the user defines one. Primarily
+  // surfaced for Core positions today (see PortfolioStockRow's
+  // "Internal Allocation" line), but tracked regardless of category, same
+  // reasoning as roic/highestWatermark above.
+  internalTargetPct: number | null;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {

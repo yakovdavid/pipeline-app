@@ -190,6 +190,24 @@ CHART_HISTORY_INTERVAL = "1d"
 SMA_50_WINDOW = 50
 SMA_200_WINDOW = 200
 
+# AMBUSH RADAR MOVING-AVERAGE FIX: a distinct, LONGER fallback range/period
+# tried only as a last resort (see _fetch_ticker_snapshot_with_fallback)
+# when NEITHER the default-range yfinance history nor the default-range
+# chart API returned enough daily closes to compute SMA200 (>=
+# SMA_200_WINDOW). Observed live: yfinance's history(period="1y") can come
+# back truncated under load/rate-limiting WITHOUT ever raising an
+# exception — it just silently returns however many rows it managed to
+# fetch — which the old code accepted as final and cached for 15 minutes,
+# permanently showing "Not enough moving-average data" for a ticker that
+# actually has plenty of trading history. Asking for a 2-year window
+# instead of 1-year gives a transient truncation real room to still land
+# >= 200 closes even if it drops some of the most recent ones, while a
+# genuinely short-history ticker (a recent IPO) will still legitimately
+# come up short here too — see _fetch_ticker_snapshot_with_fallback's own
+# comment for how that case is told apart from a bug.
+EXTENDED_HISTORY_PERIOD = "2y"
+EXTENDED_CHART_HISTORY_RANGE = "2y"
+
 
 def _normalize_ticker_symbol(raw_ticker: str) -> str:
     """TASE ticker interceptor: normalizes a raw user-supplied ticker and,
@@ -443,6 +461,14 @@ MAX_RETRIES = 2
 BASE_BACKOFF_SECONDS = 2.0
 RETRYABLE_STATUS_CODES = {429, 503}
 
+# RATE LIMIT HANDLING (429): a hard ceiling on how long a single
+# Retry-After-driven wait is allowed to be — Yahoo (or any CDN/proxy in
+# front of it) telling us to wait is worth honoring (see
+# _extract_retry_after_seconds), but a malformed, malicious, or just
+# unreasonably large header value must never be allowed to stall a request
+# far longer than this app's own exponential backoff ever would.
+MAX_RETRY_AFTER_SECONDS = 30.0
+
 T = TypeVar("T")
 
 
@@ -469,6 +495,49 @@ def _is_retryable_error(error: Exception) -> bool:
     return any(str(code) in message for code in RETRYABLE_STATUS_CODES)
 
 
+def _extract_retry_after_seconds(error: Exception) -> float | None:
+    """RATE LIMIT HANDLING (429): reads the Retry-After header off a
+    429/503 response, if present — Yahoo (or a CDN/proxy in front of it)
+    explicitly telling the client how long to wait before retrying is more
+    correct than this file's own blind exponential guess, and honoring it
+    can go either way in practice: sometimes shorter (recovering faster
+    than our schedule would have retried), more often LONGER (in which
+    case respecting it actually avoids hammering an already-rate-limited
+    endpoint with another too-early retry that just burns the remaining
+    retry budget for nothing).
+
+    Returns None (the caller then falls back to exponential backoff)
+    whenever the header is missing, non-numeric, negative, or the
+    response/headers object isn't present at all — deliberately broad
+    `getattr(..., None)` chains rather than assuming every raised
+    exception (yfinance/curl_cffi/httpx all raise different types) exposes
+    the same `.response.headers` shape.
+    """
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw_value = headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 - headers may not even be dict-like on every error type
+        return None
+    if not raw_value:
+        return None
+    try:
+        seconds = float(raw_value)
+    except (TypeError, ValueError):
+        # Retry-After can also be an HTTP-date string per RFC 7231, not
+        # just a delay in seconds — Yahoo has only ever been observed to
+        # send the numeric-seconds form, so a date string here is treated
+        # as "unusable" and falls back to exponential backoff rather than
+        # this file taking on a date-parsing dependency for a format that
+        # doesn't occur in practice against this specific upstream.
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
 def _rotate_user_agent() -> None:
     """Randomly picks a User-Agent from USER_AGENTS and applies it to the
     shared Yahoo session. Called from fetch_with_retry before every single
@@ -485,11 +554,20 @@ def fetch_with_retry(
     base_backoff_seconds: float = BASE_BACKOFF_SECONDS,
 ) -> T:
     """Runs fetch_fn under the shared rate limiter, retrying on a 429/503 or
-    a generic network error with exponential backoff (base, base*2, base*4,
-    ...) up to max_retries times. A freshly randomized User-Agent (see
-    _rotate_user_agent) is applied to the shared session before every
-    attempt. Callers with a known-good fallback can pass a smaller
-    max_retries to fail fast instead of burning the full backoff budget."""
+    a generic network error up to max_retries times. A freshly randomized
+    User-Agent (see _rotate_user_agent) is applied to the shared session
+    before every attempt. Callers with a known-good fallback can pass a
+    smaller max_retries to fail fast instead of burning the full backoff
+    budget.
+
+    RATE LIMIT HANDLING (429): the actual wait between attempts prefers
+    the failing response's own Retry-After header (see
+    _extract_retry_after_seconds) whenever one is present — Yahoo
+    explicitly telling us how long to back off is more correct than a
+    blind guess — and only falls back to exponential backoff (base,
+    base*2, base*4, ...) when there isn't one (a 503, a generic network
+    error, or a 429 with no Retry-After header at all).
+    """
     last_error: Exception | None = None
 
     for attempt in range(max_retries + 1):
@@ -501,10 +579,17 @@ def fetch_with_retry(
             last_error = error
             if attempt >= max_retries or not _is_retryable_error(error):
                 raise
-            backoff_seconds = base_backoff_seconds * (2**attempt)
+            retry_after_seconds = _extract_retry_after_seconds(error)
+            if retry_after_seconds is not None:
+                backoff_seconds = retry_after_seconds
+                backoff_source = "Retry-After header"
+            else:
+                backoff_seconds = base_backoff_seconds * (2**attempt)
+                backoff_source = "exponential backoff"
             print(
                 f"[resilience] {description} failed on attempt {attempt + 1}/"
-                f"{max_retries + 1} ({error}); retrying in {backoff_seconds:.0f}s with a new User-Agent."
+                f"{max_retries + 1} ({error}); retrying in {backoff_seconds:.0f}s "
+                f"({backoff_source}) with a new User-Agent."
             )
             time.sleep(backoff_seconds)
 
@@ -651,33 +736,44 @@ def health_check() -> dict[str, str]:
 
 
 # Anti-rate-limit architecture: the primary (yfinance) path gets a full,
-# genuine retry budget — up to 3 attempts total (1 initial + 2 retries),
-# backing off 2s then 4s — before this file gives up on it and tries the
-# chart API fallback. The chart fallback below gets its own equally full
-# budget (MAX_RETRIES/BASE_BACKOFF_SECONDS defaults), so a ticker survives
-# up to ~3 attempts against *each* data source before failing outright.
-PRIMARY_FETCH_MAX_RETRIES = 2
+# genuine retry budget — up to 4 attempts total (1 initial + 3 retries) —
+# before this file gives up on it and tries the chart API fallback, which
+# gets its own equally full budget. AMBUSH RADAR MOVING-AVERAGE FIX: bumped
+# from 2 retries (3 attempts) to 3 (4 attempts) specifically for these
+# history-driving calls — SMA50/SMA200 depend on a full, uninterrupted
+# history fetch succeeding, unlike a one-off price check, so a little more
+# retry budget here specifically is worth the extra latency on the rare
+# request that actually needs it.
+PRIMARY_FETCH_MAX_RETRIES = 3
 PRIMARY_FETCH_BASE_BACKOFF_SECONDS = 2.0
+FALLBACK_FETCH_MAX_RETRIES = 3
 TICKER_HISTORY_PERIOD = "1y"
 
 
-def _fetch_ticker_snapshot_via_yfinance(symbol: str) -> TickerSnapshot:
+def _fetch_ticker_snapshot_via_yfinance(
+    symbol: str, history_period: str = TICKER_HISTORY_PERIOD
+) -> TickerSnapshot:
     """Primary data source: yf.Ticker(symbol).fast_info for a real-time
-    current price, plus ONE yf.Ticker(symbol).history(period="1y") call for
-    everything else (SMA50/SMA200, 52-week high, and the daily closes the
-    anomaly checks reuse) — deliberately never yf.Ticker(symbol).info,
-    which pulls the full quoteSummary payload and is by far the most
-    rate-limit-prone endpoint yfinance exposes. SMA50/SMA200 are always
-    computed here from the closes ourselves (not read from fast_info's own
-    fifty_day_average/two_hundred_day_average fields), so the calculation
-    is identical regardless of whether this path or the chart API fallback
-    below ends up serving the request.
+    current price, plus ONE yf.Ticker(symbol).history(period=history_period)
+    call for everything else (SMA50/SMA200, 52-week high, and the daily
+    closes the anomaly checks reuse) — deliberately never
+    yf.Ticker(symbol).info, which pulls the full quoteSummary payload and
+    is by far the most rate-limit-prone endpoint yfinance exposes.
+    SMA50/SMA200 are always computed here from the closes ourselves (not
+    read from fast_info's own fifty_day_average/two_hundred_day_average
+    fields), so the calculation is identical regardless of whether this
+    path or the chart API fallback below ends up serving the request.
+
+    history_period defaults to TICKER_HISTORY_PERIOD ("1y") but can be
+    overridden to EXTENDED_HISTORY_PERIOD ("2y") — see
+    _fetch_ticker_snapshot_with_fallback's own comment for why a caller
+    would ask for a longer window.
     """
     ticker = yf.Ticker(symbol, session=_yahoo_session)
 
     history = fetch_with_retry(
-        lambda: ticker.history(period=TICKER_HISTORY_PERIOD),
-        description=f"yfinance {TICKER_HISTORY_PERIOD} history fetch for '{symbol}'",
+        lambda: ticker.history(period=history_period),
+        description=f"yfinance {history_period} history fetch for '{symbol}'",
         max_retries=PRIMARY_FETCH_MAX_RETRIES,
         base_backoff_seconds=PRIMARY_FETCH_BASE_BACKOFF_SECONDS,
     )
@@ -726,24 +822,34 @@ def _fetch_ticker_snapshot_via_yfinance(symbol: str) -> TickerSnapshot:
     )
 
 
-def _fetch_ticker_snapshot_via_chart_fallback(symbol: str) -> TickerSnapshot:
+def _fetch_ticker_snapshot_via_chart_fallback(
+    symbol: str, history_range: str = CHART_HISTORY_RANGE
+) -> TickerSnapshot:
     """Fallback data source: a direct request to Yahoo's chart endpoint,
     bypassing yfinance entirely (not just .info) — used when
     _fetch_ticker_snapshot_via_yfinance's history/fast_info calls fail
-    outright. SMA50/SMA200 are computed from the returned daily close
+    outright, OR (see _fetch_ticker_snapshot_with_fallback) when they
+    technically succeeded but didn't return enough closes to compute
+    SMA200. SMA50/SMA200 are computed from the returned daily close
     history the same way as the primary path; 52-week high prefers Yahoo's
     own "fiftyTwoWeekHigh" meta field (accounts for intraday highs) and
     falls back to the max of the returned daily highs.
 
+    history_range defaults to CHART_HISTORY_RANGE ("1y") but can be
+    overridden to EXTENDED_CHART_HISTORY_RANGE ("2y") — see
+    _fetch_ticker_snapshot_with_fallback's own comment for why a caller
+    would ask for a longer window.
+
     Routed through fetch_with_retry just like the primary path, so it gets
-    the exact same anti-rate-limit treatment: up to 3 attempts with 2s/4s
-    backoff, and a freshly randomized User-Agent applied to the shared
-    session before each one."""
+    the exact same anti-rate-limit treatment (see FALLBACK_FETCH_MAX_
+    RETRIES) — up to 4 attempts, honoring a 429's own Retry-After header
+    when present (see fetch_with_retry), and a freshly randomized
+    User-Agent applied to the shared session before each one."""
 
     def do_fetch():
         response = _yahoo_session.get(
             f"{CHART_API_BASE_URL}/{symbol}",
-            params={"interval": CHART_HISTORY_INTERVAL, "range": CHART_HISTORY_RANGE},
+            params={"interval": CHART_HISTORY_INTERVAL, "range": history_range},
             timeout=10.0,
         )
         # Confirmed by testing: Yahoo returns HTTP 404 (with a well-formed
@@ -756,7 +862,12 @@ def _fetch_ticker_snapshot_via_chart_fallback(symbol: str) -> TickerSnapshot:
             response.raise_for_status()
         return response
 
-    response = fetch_with_retry(do_fetch, description=f"chart API fallback fetch for '{symbol}'")
+    response = fetch_with_retry(
+        do_fetch,
+        description=f"chart API fallback fetch ({history_range}) for '{symbol}'",
+        max_retries=FALLBACK_FETCH_MAX_RETRIES,
+        base_backoff_seconds=PRIMARY_FETCH_BASE_BACKOFF_SECONDS,
+    )
 
     try:
         payload = response.json()
@@ -801,6 +912,134 @@ def _fetch_ticker_snapshot_via_chart_fallback(symbol: str) -> TickerSnapshot:
     return TickerSnapshot(
         price=price, sma50=sma50, sma200=sma200, high_52=high_52, closes=closes, currency=currency
     )
+
+
+def _has_sufficient_sma_history(snapshot: TickerSnapshot) -> bool:
+    """True once a snapshot has enough daily closes to compute SMA200 — the
+    stricter of the two windows this file cares about, so "sufficient for
+    SMA200" always implies "sufficient for SMA50" too (SMA_200_WINDOW >
+    SMA_50_WINDOW). Used by _fetch_ticker_snapshot_with_fallback to decide
+    whether a technically-successful fetch is actually good enough to stop
+    on, or whether it's worth trying another source/window instead.
+    """
+    return len(snapshot.closes) >= SMA_200_WINDOW
+
+
+def _fetch_ticker_snapshot_with_fallback(symbol: str) -> TickerSnapshot:
+    """AMBUSH RADAR MOVING-AVERAGE FIX: orchestrates the full SMA50/SMA200
+    history fetch across every data source/window this file has, in order
+    of preference, stopping as soon as one actually returns enough daily
+    closes to compute SMA200 — not just as soon as one merely avoids
+    raising an exception.
+
+    That distinction is the actual bug this fixes. The old orchestration
+    (formerly inlined in get_stock) only ever tried the chart API fallback
+    when the primary yfinance fetch RAISED — but yfinance's
+    history(period="1y") has been observed, live, to sometimes return a
+    truncated series under load/rate-limiting WITHOUT raising anything at
+    all; it just silently hands back however many rows it happened to
+    fetch. That truncated-but-"successful" snapshot used to be accepted as
+    final and cached for CACHE_TTL_SECONDS (15 minutes), which is exactly
+    what produced "Not enough moving-average data" for tickers that
+    genuinely do have 200+ trading days available — a transient fetch
+    problem, not a real data gap, being treated as if it were one.
+
+    The order tried:
+      1. yfinance, default TICKER_HISTORY_PERIOD ("1y").
+      2. Yahoo's chart API, default CHART_HISTORY_RANGE ("1y") — tried
+         both on an outright failure of (1) AND when (1) "succeeded" but
+         came up short on closes, since an independent endpoint is a
+         meaningfully different chance at a clean, untruncated response.
+      3. Yahoo's chart API again, but with EXTENDED_CHART_HISTORY_RANGE
+         ("2y") — a last resort, only reached if BOTH default-range
+         attempts above came up short, on the theory that a longer
+         requested window has a real chance of still landing >= 200 closes
+         even if the underlying truncation issue drops some of the most
+         recent rows.
+
+    If every attempt raises outright, the first one's error is the one
+    surfaced (via TickerNotFoundError, or re-raised for get_stock's own
+    generic-failure handling) — matching the original behavior for a
+    ticker that doesn't exist at all. If at least one attempt SUCCEEDED
+    but none reached SMA_200_WINDOW closes, the snapshot with the MOST
+    closes collected is returned (not simply the last one tried) — at that
+    point this is very likely a genuinely short-history ticker (a recent
+    IPO), not a bug, so SMA50 can still be computed even though SMA200
+    legitimately can't be, exactly like before this fix for that case.
+    """
+    candidates: list[TickerSnapshot] = []
+    first_error: Exception | None = None
+
+    try:
+        snapshot = _fetch_ticker_snapshot_via_yfinance(symbol)
+        candidates.append(snapshot)
+        if _has_sufficient_sma_history(snapshot):
+            return snapshot
+        print(
+            f"[resilience] yfinance returned only {len(snapshot.closes)} closes for '{symbol}' "
+            f"(need {SMA_200_WINDOW} for SMA200); trying the chart API fallback for more history."
+        )
+    except TickerNotFoundError as not_found_error:
+        # A clean "not found" from yfinance itself is still worth
+        # double-checking against the fallback, since yfinance being
+        # blocked can sometimes surface as an empty/missing-price result
+        # rather than a raised network error.
+        first_error = not_found_error
+    except Exception as primary_error:  # noqa: BLE001 - yfinance raises many different error types
+        print(f"[resilience] yfinance failed for '{symbol}' ({primary_error}); trying chart API fallback.")
+        first_error = primary_error
+
+    try:
+        snapshot = _fetch_ticker_snapshot_via_chart_fallback(symbol)
+        candidates.append(snapshot)
+        if _has_sufficient_sma_history(snapshot):
+            return snapshot
+        print(
+            f"[resilience] chart API fallback also returned only {len(snapshot.closes)} closes for "
+            f"'{symbol}'; retrying with an extended {EXTENDED_CHART_HISTORY_RANGE} window."
+        )
+    except TickerNotFoundError as not_found_error:
+        # A clean "this ticker doesn't exist" signal from a SECOND,
+        # independent data source (not a transient network/rate-limit
+        # failure) — no amount of extended-window retrying changes that,
+        # so short-circuit straight to raising it rather than burning
+        # another 4-attempt retry budget against a symbol that simply
+        # isn't real. Only short-circuits when yfinance didn't already
+        # collect a real (if insufficient) candidate of its own — if it
+        # did, this ticker clearly DOES exist, and the extended window is
+        # still worth trying for it despite the chart API's own failure.
+        if not candidates:
+            raise
+        first_error = first_error or not_found_error
+    except Exception as fallback_error:  # noqa: BLE001 - network/parse errors from the fallback request
+        if first_error is None:
+            first_error = fallback_error
+        print(f"[resilience] chart API fallback failed for '{symbol}' ({fallback_error}).")
+
+    # LAST RESORT: neither default-range attempt reached SMA_200_WINDOW
+    # closes (or both raised outright). One more try, explicitly asking
+    # for a longer window — see this function's own docstring for why that
+    # has a real chance of recovering from a transient truncation that a
+    # 1-year request didn't.
+    try:
+        snapshot = _fetch_ticker_snapshot_via_chart_fallback(symbol, history_range=EXTENDED_CHART_HISTORY_RANGE)
+        candidates.append(snapshot)
+        if _has_sufficient_sma_history(snapshot):
+            return snapshot
+    except Exception as extended_error:  # noqa: BLE001 - best-effort last resort; candidates may still have data
+        print(f"[resilience] extended {EXTENDED_CHART_HISTORY_RANGE} chart API fetch failed for '{symbol}' ({extended_error}).")
+        if first_error is None:
+            first_error = extended_error
+
+    if not candidates:
+        assert first_error is not None
+        raise first_error
+
+    # Every attempt fell short of SMA_200_WINDOW closes, but at least one
+    # returned SOME data — return whichever collected the most (very
+    # likely a genuinely short-history ticker at this point, not a bug),
+    # so SMA50 can still be computed even where SMA200 legitimately can't.
+    return max(candidates, key=lambda candidate: len(candidate.closes))
 
 
 def fetch_anomaly_news(
@@ -1330,37 +1569,33 @@ def get_stock(
     # already fetched and cached moments ago by a different screen).
     snapshot = _get_cached_ticker_snapshot(symbol)
     if snapshot is None:
+        # AMBUSH RADAR MOVING-AVERAGE FIX: this used to be an inline
+        # try/except chain that only tried the chart API fallback when the
+        # primary yfinance fetch RAISED — see
+        # _fetch_ticker_snapshot_with_fallback's own (much longer) comment
+        # for why that missed the actual bug: a "successful" yfinance fetch
+        # that came back truncated (too few closes for SMA200) used to be
+        # accepted as final here. That whole orchestration — including the
+        # extended-window last resort — is now centralized there instead.
         try:
-            snapshot = _fetch_ticker_snapshot_via_yfinance(symbol)
-        except TickerNotFoundError:
-            # A clean "not found" from yfinance itself is still worth
-            # double-checking against the fallback, since yfinance being
-            # blocked can sometimes surface as an empty/missing-price result
-            # rather than a raised network error.
-            snapshot = None
-        except Exception as primary_error:  # noqa: BLE001 - yfinance raises many different error types
-            print(f"[resilience] yfinance failed for '{symbol}' ({primary_error}); trying chart API fallback.")
-            snapshot = None
-
-        if snapshot is None:
-            try:
-                snapshot = _fetch_ticker_snapshot_via_chart_fallback(symbol)
-            except TickerNotFoundError as not_found_error:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No market data found for ticker '{symbol}'.",
-                ) from not_found_error
-            except Exception as fallback_error:  # noqa: BLE001 - network/parse errors from the fallback request
-                # Both data sources failed: return a clean, formatted JSON
-                # error instead of letting an unhandled exception surface as
-                # an opaque 502 from the platform (Render) itself.
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Failed to fetch data for ticker '{symbol}' from both yfinance and "
-                        f"the direct chart API fallback: {fallback_error}"
-                    ),
-                ) from fallback_error
+            snapshot = _fetch_ticker_snapshot_with_fallback(symbol)
+        except TickerNotFoundError as not_found_error:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No market data found for ticker '{symbol}'.",
+            ) from not_found_error
+        except Exception as fetch_error:  # noqa: BLE001 - network/parse errors from every data source tried
+            # Every data source/window failed outright: return a clean,
+            # formatted JSON error instead of letting an unhandled
+            # exception surface as an opaque 502 from the platform
+            # (Render) itself.
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Failed to fetch data for ticker '{symbol}' from yfinance, the direct chart API "
+                    f"fallback, and the extended-window retry: {fetch_error}"
+                ),
+            ) from fetch_error
 
         _set_cached_ticker_snapshot(symbol, snapshot)
 

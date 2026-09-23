@@ -33,6 +33,8 @@ export type TranslationKey =
   | 'tacticalMomentum'
   | 'high52'
   | 'drop'
+  | 'highWaterMark'
+  | 'dropFromHwm'
   | 'target'
   | 'actual'
   | 'assets'
@@ -51,6 +53,9 @@ export type TranslationKey =
   | 'qualityZScore'
   | 'zScoreAlert'
   | 'roicPlaceholder'
+  // Core Layer Internal Allocation
+  | 'internalAllocation'
+  | 'internalTargetPlaceholder'
   // Loading states
   | 'loadingPortfolio'
   | 'loadingAmbush'
@@ -150,6 +155,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     tacticalMomentum: 'מומנטום טקטי',
     high52: 'שיא 52 שבועות',
     drop: 'ירידה',
+    highWaterMark: 'שיא מעקב (HWM)',
+    dropFromHwm: 'ירידה משיא המעקב',
     target: 'יעד',
     actual: 'מצוי',
     assets: 'נכסים',
@@ -166,6 +173,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     qualityZScore: 'ציון Z איכות',
     zScoreAlert: 'התראת ציון Z',
     roicPlaceholder: "תשואה על ההון המושקע % (איכות) - אופציונלי",
+    internalAllocation: 'הקצאה פנימית',
+    internalTargetPlaceholder: 'יעד פנימי % (ליבה) - אופציונלי',
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
     noPositionsYet: 'אין עדיין פוזיציות.',
@@ -252,6 +261,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     tacticalMomentum: 'Tactical Momentum',
     high52: '52-Week High',
     drop: 'Drop',
+    highWaterMark: 'High Water Mark',
+    dropFromHwm: 'Drop from HWM',
     target: 'Target',
     actual: 'Actual',
     assets: 'Assets',
@@ -268,6 +279,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     qualityZScore: 'Quality Z-Score',
     zScoreAlert: 'Z-Score Alert',
     roicPlaceholder: 'ROIC % (Quality) - optional',
+    internalAllocation: 'Internal Allocation',
+    internalTargetPlaceholder: 'Internal Target % (Core) - optional',
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
     noPositionsYet: 'No positions yet.',

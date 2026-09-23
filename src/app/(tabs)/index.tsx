@@ -95,6 +95,13 @@ type PortfolioListSection = {
   // every row in this section via the currentWeightPct prop, rather than
   // each row re-deriving it from the full stocks array.
   currentWeightPct: number;
+  // CORE LAYER INTERNAL ALLOCATION FIX: this layer's own total market
+  // value (see computeLayerTotalValue) — the denominator each row needs
+  // to compute ITS OWN internal share of the layer (computeInternalWeightPct
+  // in PortfolioStockRow), as opposed to currentWeightPct above, which is
+  // this layer's share of the WHOLE portfolio. Computed once here, same
+  // reasoning as currentWeightPct, rather than each row re-deriving it.
+  layerTotalValue: number;
 };
 
 // The return type of createStyles (defined at the bottom of this file) —
@@ -182,12 +189,40 @@ function computeSatelliteTrailingStopPrice(
 // held quantity like 1433 would be multiplied straight through instead of
 // the ~14.33 real units it actually represents, inflating this layer's
 // (and the whole portfolio's) computed value ~100x.
-function computeLayerWeightPct(categoryStocks: PortfolioStock[], totalPortfolioValue: number): number {
-  const categoryValue = categoryStocks.reduce(
+// Shared by computeLayerWeightPct (this layer's share of the WHOLE
+// portfolio) and computeInternalWeightPct below (one asset's share of
+// THIS layer alone) — both are "value / some total * 100", just with a
+// different denominator, so the value-summing half is factored out once
+// rather than duplicated. TASE ETF MATH FIX: getEffectiveUnits applies the
+// Nominal Value / Erech Nakuv ÷100 conversion (see @/utils/currency) —
+// without it, a TASE ETF's raw nominal `units` would be multiplied
+// straight through, inflating this total ~100x.
+function computeLayerTotalValue(categoryStocks: PortfolioStock[]): number {
+  return categoryStocks.reduce(
     (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
     0,
   );
+}
+
+function computeLayerWeightPct(categoryStocks: PortfolioStock[], totalPortfolioValue: number): number {
+  const categoryValue = computeLayerTotalValue(categoryStocks);
   return totalPortfolioValue > 0 ? (categoryValue / totalPortfolioValue) * 100 : 0;
+}
+
+// CORE LAYER INTERNAL ALLOCATION FIX: one asset's share of its OWN layer's
+// total value — (Asset Total Value / Layer Total Value) * 100, exactly as
+// specified — as opposed to computeLayerWeightPct above, which is that
+// SAME layer's share of the WHOLE PORTFOLIO. Those are two genuinely
+// different numbers (e.g. Core might be 68% of the whole portfolio, while
+// one specific Core holding might be 40% of Core itself), and the bug
+// this fixes was PortfolioStockRow displaying the former on every Core
+// card when the latter is what actually tells a user how their own Core
+// holdings are balanced against EACH OTHER. Returns 0 (not NaN/Infinity)
+// when the layer is empty/worthless, matching computeLayerWeightPct's own
+// zero-division guard.
+function computeInternalWeightPct(stock: PortfolioStock, layerTotalValue: number): number {
+  const stockValue = getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price;
+  return layerTotalValue > 0 ? (stockValue / layerTotalValue) * 100 : 0;
 }
 
 // Builds the "<layer> (Target: X% | Actual: Y%) - N Assets" section-header
@@ -226,6 +261,11 @@ export default function PortfolioScreen() {
   // (see the "ROIC" field's own conditional render below) — see
   // handleAddTicker for how this becomes a PortfolioTickerEntry.roic.
   const [roicInput, setRoicInput] = useState('');
+  // CORE LAYER INTERNAL ALLOCATION: optional, relevant for Core positions
+  // only (see the "Internal Target" field's own conditional render below)
+  // — see handleAddTicker for how this becomes a
+  // PortfolioTickerEntry.internalTargetPct.
+  const [internalTargetInput, setInternalTargetInput] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<PortfolioCategory>('Core');
   const [selectedAssetType, setSelectedAssetType] = useState<AssetType>('Stock');
   const [activeFilter, setActiveFilter] = useState<FilterOption>('All');
@@ -357,11 +397,12 @@ export default function PortfolioScreen() {
           throw new Error('Stored portfolio data is not an array.');
         }
         // Entries saved before "units", "assetType", "highestWatermark",
-        // "calibrationFactor", or "roic" existed won't have valid values;
-        // backfill them rather than letting totals/trailing-stop math
-        // break on undefined/NaN. calibrationFactor is left undefined (not
-        // coerced to 1.0) for old entries so calibrateQuote's DEFAULT_
-        // CALIBRATION_FACTOR fast path still applies.
+        // "calibrationFactor", "roic", or "internalTargetPct" existed
+        // won't have valid values; backfill them rather than letting
+        // totals/trailing-stop math break on undefined/NaN.
+        // calibrationFactor is left undefined (not coerced to 1.0) for old
+        // entries so calibrateQuote's DEFAULT_CALIBRATION_FACTOR fast path
+        // still applies.
         entries = parsed.map((entry) => ({
           ticker: entry.ticker ?? '',
           category: entry.category ?? 'Core',
@@ -378,6 +419,9 @@ export default function PortfolioScreen() {
           // evaluated as "no ROIC entered") rather than 0 (which would
           // read as a genuinely terrible ROIC).
           roic: typeof entry.roic === 'number' ? entry.roic : null,
+          // CORE LAYER INTERNAL ALLOCATION: same backfill reasoning as
+          // roic above — null means "no internal target defined", not 0%.
+          internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
         }));
       } catch (error) {
         console.error(
@@ -495,7 +539,16 @@ export default function PortfolioScreen() {
     }
 
     const entries: PortfolioTickerEntry[] = stocks.map(
-      ({ ticker: symbol, category, assetType, units: unitCount, highestWatermark, calibrationFactor, roic }) => ({
+      ({
+        ticker: symbol,
+        category,
+        assetType,
+        units: unitCount,
+        highestWatermark,
+        calibrationFactor,
+        roic,
+        internalTargetPct,
+      }) => ({
         ticker: symbol,
         category,
         assetType,
@@ -510,6 +563,11 @@ export default function PortfolioScreen() {
         // per-position field — dropping it here would silently wipe out a
         // user-entered ROIC the next time the app restarts.
         roic,
+        // CORE LAYER INTERNAL ALLOCATION: must be persisted like every
+        // other per-position field — dropping it here would silently wipe
+        // out a user-defined internal target the next time the app
+        // restarts.
+        internalTargetPct,
       }),
     );
     AsyncStorage.setItem(PORTFOLIO_TICKERS_STORAGE_KEY, JSON.stringify(entries)).catch((error) => {
@@ -540,6 +598,15 @@ export default function PortfolioScreen() {
     const trimmedRoicInput = roicInput.trim();
     const parsedRoic = trimmedRoicInput === '' ? null : Number(trimmedRoicInput);
     const roic = parsedRoic !== null && Number.isFinite(parsedRoic) ? parsedRoic : null;
+
+    // CORE LAYER INTERNAL ALLOCATION: blank means "no internal target
+    // entered" (null), same "blank input degrades to a safe no-op"
+    // pattern as roic just above.
+    const trimmedInternalTargetInput = internalTargetInput.trim();
+    const parsedInternalTarget =
+      trimmedInternalTargetInput === '' ? null : Number(trimmedInternalTargetInput);
+    const internalTargetPct =
+      parsedInternalTarget !== null && Number.isFinite(parsedInternalTarget) ? parsedInternalTarget : null;
 
     setIsAdding(true);
     try {
@@ -588,12 +655,14 @@ export default function PortfolioScreen() {
           highestWatermark: computeHighestWatermark(null, calibratedQuote.price),
           calibrationFactor,
           roic,
+          internalTargetPct,
         },
       ]);
       setTicker('');
       setUnits('1');
       setTotalValueInput('');
       setRoicInput('');
+      setInternalTargetInput('');
       setIsAddModalVisible(false);
     } catch (error) {
       const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: normalizedTicker });
@@ -618,6 +687,7 @@ export default function PortfolioScreen() {
       newAssetType: AssetType,
       newTotalValueInput: string,
       newRoicInput: string,
+      newInternalTargetInput: string,
     ) => {
       setStocks((prevStocks) =>
         prevStocks.map((stock) => {
@@ -642,6 +712,16 @@ export default function PortfolioScreen() {
           const parsedRoic = trimmedRoicInput === '' ? null : Number(trimmedRoicInput);
           const roic = trimmedRoicInput === '' || !Number.isFinite(parsedRoic) ? stock.roic : parsedRoic;
 
+          // CORE LAYER INTERNAL ALLOCATION: same "blank preserves the
+          // existing value" reasoning as roic just above.
+          const trimmedInternalTargetInput = newInternalTargetInput.trim();
+          const parsedInternalTarget =
+            trimmedInternalTargetInput === '' ? null : Number(trimmedInternalTargetInput);
+          const internalTargetPct =
+            trimmedInternalTargetInput === '' || !Number.isFinite(parsedInternalTarget)
+              ? stock.internalTargetPct
+              : parsedInternalTarget;
+
           // AUTO-CALIBRATION FOR BROKEN PRICES: a BLANK Total Value field
           // here deliberately PRESERVES this position's existing
           // calibrationFactor unchanged, rather than resetting it to 1.0 —
@@ -658,7 +738,14 @@ export default function PortfolioScreen() {
             !Number.isFinite(parsedTotalValue) ||
             parsedTotalValue <= 0
           ) {
-            return { ...stock, units: newUnits, assetType: newAssetType, highestWatermark, roic };
+            return {
+              ...stock,
+              units: newUnits,
+              assetType: newAssetType,
+              highestWatermark,
+              roic,
+              internalTargetPct,
+            };
           }
 
           // Recalibrating: stock.price/localPrice/high52/sma50/sma200 are
@@ -697,6 +784,7 @@ export default function PortfolioScreen() {
             calibrationFactor,
             highestWatermark: newUsdPrice,
             roic,
+            internalTargetPct,
           };
         }),
       );
@@ -709,7 +797,7 @@ export default function PortfolioScreen() {
       <PortfolioStockRow
         stock={item}
         accentColor={section.accentColor}
-        currentWeightPct={section.currentWeightPct}
+        layerTotalValue={section.layerTotalValue}
         onDelete={handleDeleteTicker}
         onSaveEdit={handleSaveEdit}
         colors={colors}
@@ -1046,8 +1134,16 @@ export default function PortfolioScreen() {
 
   // Computed ONCE per layer here (see computeLayerWeightPct's own comment
   // for why this stays client-side rather than a literal backend JSON
-  // read) — reused for both this section's header string AND, for Core,
-  // every row's own "Allocation: X% / Target: 70%" line.
+  // read) — reused for this section's header string. CORE LAYER INTERNAL
+  // ALLOCATION FIX: each layer's OWN total value (computeLayerTotalValue)
+  // is now ALSO computed once here and threaded through as
+  // layerTotalValue, so every row can derive ITS OWN internal share of the
+  // layer (see computeInternalWeightPct in PortfolioStockRow) instead of
+  // every Core card showing this same coreWeightPct (the layer's share of
+  // the WHOLE portfolio) like the old bug did.
+  const coreLayerTotalValue = computeLayerTotalValue(coreStocks);
+  const satelliteLayerTotalValue = computeLayerTotalValue(satelliteStocks);
+  const qualityLayerTotalValue = computeLayerTotalValue(qualityStocks);
   const coreWeightPct = computeLayerWeightPct(coreStocks, totalPortfolioValue);
   const satelliteWeightPct = computeLayerWeightPct(satelliteStocks, totalPortfolioValue);
   const qualityWeightPct = computeLayerWeightPct(qualityStocks, totalPortfolioValue);
@@ -1059,6 +1155,7 @@ export default function PortfolioScreen() {
       accentColor: colors.core,
       data: coreStocks,
       currentWeightPct: coreWeightPct,
+      layerTotalValue: coreLayerTotalValue,
     },
     {
       title: buildSectionTitle(t, 'Satellite', satelliteStocks, satelliteWeightPct),
@@ -1066,6 +1163,7 @@ export default function PortfolioScreen() {
       accentColor: colors.satellite,
       data: satelliteStocks,
       currentWeightPct: satelliteWeightPct,
+      layerTotalValue: satelliteLayerTotalValue,
     },
     {
       title: buildSectionTitle(t, 'Quality', qualityStocks, qualityWeightPct),
@@ -1073,6 +1171,7 @@ export default function PortfolioScreen() {
       accentColor: colors.quality,
       data: qualityStocks,
       currentWeightPct: qualityWeightPct,
+      layerTotalValue: qualityLayerTotalValue,
     },
   ];
   const visibleSections = allSections.filter(
@@ -1439,10 +1538,28 @@ export default function PortfolioScreen() {
                       here becomes a null roic. */}
                   {selectedCategory === 'Quality' && (
                     <TextInput
-                      style={[styles.unitsInput, styles.roicInput]}
+                      style={[styles.unitsInput, styles.standaloneInput]}
                       value={roicInput}
                       onChangeText={setRoicInput}
                       placeholder={t('roicPlaceholder')}
+                      placeholderTextColor={colors.textSecondary}
+                      keyboardType="numeric"
+                      maxLength={15}
+                      editable={!isAdding}
+                    />
+                  )}
+
+                  {/* CORE LAYER INTERNAL ALLOCATION: only shown once Core
+                      is selected above — an internal target is meaningless
+                      to the Trailing Stop/Kill Switch mechanisms the other
+                      two layers use. Optional; see handleAddTicker for how
+                      a blank value here becomes a null internalTargetPct. */}
+                  {selectedCategory === 'Core' && (
+                    <TextInput
+                      style={[styles.unitsInput, styles.standaloneInput]}
+                      value={internalTargetInput}
+                      onChangeText={setInternalTargetInput}
+                      placeholder={t('internalTargetPlaceholder')}
                       placeholderTextColor={colors.textSecondary}
                       keyboardType="numeric"
                       maxLength={15}
@@ -1675,10 +1792,16 @@ export default function PortfolioScreen() {
 type PortfolioStockRowProps = {
   stock: PortfolioStock;
   accentColor: string;
-  // Core "Allocation Tracking" only — this layer's live share of the whole
-  // portfolio, computed once in PortfolioScreen (see computeLayerWeightPct)
-  // and passed down rather than re-derived per row.
-  currentWeightPct: number;
+  // CORE LAYER INTERNAL ALLOCATION FIX: this layer's own total market
+  // value, computed once in PortfolioScreen (see computeLayerTotalValue)
+  // and passed down — the denominator this row needs to compute ITS OWN
+  // share of the layer via computeInternalWeightPct. Replaces the old
+  // currentWeightPct prop (that layer's share of the WHOLE portfolio,
+  // identical for every card in the section) that used to be shown here
+  // by mistake — see the Core JSX block's own comment. currentWeightPct
+  // itself lives on PortfolioListSection still, for the section HEADER,
+  // which legitimately does want the layer's whole-portfolio share.
+  layerTotalValue: number;
   onDelete: (ticker: string) => void;
   onSaveEdit: (
     ticker: string,
@@ -1686,6 +1809,7 @@ type PortfolioStockRowProps = {
     assetType: AssetType,
     totalValueInput: string,
     roicInput: string,
+    internalTargetInput: string,
   ) => void;
   colors: PipelineColorScheme;
   styles: PortfolioStyles;
@@ -1697,7 +1821,7 @@ type PortfolioStockRowProps = {
 // doesn't re-render every other row in the SectionList — stocks state
 // updates already keep unaffected PortfolioStock objects referentially
 // stable (see onRefresh/handleSaveEdit/handleDeleteTicker above), and
-// accentColor/currentWeightPct/onDelete/onSaveEdit/colors/styles/language/t
+// accentColor/layerTotalValue/onDelete/onSaveEdit/colors/styles/language/t
 // are all stable across renders too (a fixed per-theme accent color, a
 // number that only changes when the layer's actual composition changes,
 // useCallback-wrapped handlers, the parent's own useMemo-derived theme
@@ -1712,7 +1836,7 @@ type PortfolioStockRowProps = {
 const PortfolioStockRow = memo(function PortfolioStockRow({
   stock,
   accentColor,
-  currentWeightPct,
+  layerTotalValue,
   onDelete,
   onSaveEdit,
   colors,
@@ -1734,6 +1858,9 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // QUALITY Z-SCORE MODULE: same "starts blank, means leave unchanged"
   // pattern as totalValueText above — see onSaveEdit in PortfolioScreen.
   const [roicText, setRoicText] = useState('');
+  // CORE LAYER INTERNAL ALLOCATION: same "starts blank, means leave
+  // unchanged" pattern as roicText above.
+  const [internalTargetText, setInternalTargetText] = useState('');
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
   // `units` is a Nominal Value quantity — 100 nominal units = 1 real
@@ -1751,6 +1878,18 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // independently in PortfolioScreen from `stock.price` (USD) alone; see
   // the IMPORTANT note above allSections there.
   const localTotalValue = effectiveUnits * stock.localPrice;
+
+  // CORE LAYER INTERNAL ALLOCATION FIX: (Asset Total Value / Layer Total
+  // Value) * 100 — this asset's own share of ITS layer, as opposed to
+  // currentWeightPct (that layer's share of the whole portfolio). Uses
+  // `stock.price` (USD), the same basis computeLayerTotalValue itself
+  // used to build layerTotalValue, never localPrice — see the IMPORTANT
+  // multi-currency note on allSections in PortfolioScreen for why mixing
+  // those would silently corrupt this for any mixed-currency layer.
+  // Computed for every category (harmless — same reasoning as
+  // highestWatermark/roic being tracked regardless of category), but only
+  // actually rendered for Core today (see the JSX below).
+  const internalWeightPct = computeInternalWeightPct(stock, layerTotalValue);
 
   // TASE AGOROT DISPLAY: the UNIT price, Agorot-formatted for a ".TA"
   // ticker (e.g. "3985 אג'") — the position TOTAL above/below always stays
@@ -1773,6 +1912,27 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // it's still safely above it — see trailingStopPriceColor at the JSX
   // call site.
   const isTrailingStopTriggered = trailingStopPrice !== null && stock.price <= trailingStopPrice;
+
+  // SATELLITE CARD FIX (HWM vs. Drawdown): the card used to show
+  // stock.drawdownPct here (distance from the 52-WEEK HIGH) under a "Drop"
+  // label — a different, and often confusingly different, number from the
+  // trailing stop's own basis. The 12% trailing stop is computed off
+  // highestWatermark (see computeSatelliteTrailingStopPrice above), NOT
+  // off the 52-week high, and the two can diverge in either direction: a
+  // position added well below its 52-week high starts tracking its OWN
+  // watermark from the price it was added at, so "how far below the
+  // 52-week high" tells the user nothing about how close price actually
+  // is to triggering a sell. hwmDropPct is that missing number — the
+  // percentage drop from THIS position's own watermark to its current
+  // price — computed on the exact same USD basis trailingStopPrice
+  // already uses, so the two are always directly comparable (e.g. a
+  // trailing stop at -12% and hwmDropPct reading -9% both being measured
+  // from the same watermark makes it obvious why the stop hasn't fired
+  // yet).
+  const hwmDropPct =
+    stock.highestWatermark !== null && stock.highestWatermark > 0
+      ? ((stock.price - stock.highestWatermark) / stock.highestWatermark) * 100
+      : null;
 
   // SMA200 MODIFICATION (Satellite only): read-only macro-context display —
   // no Bullish/Bearish color coding, no SMA50 at all (INDICATOR PURGE — see
@@ -1815,6 +1975,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     setEditedAssetType(stock.assetType);
     setTotalValueText('');
     setRoicText('');
+    setInternalTargetText('');
     setIsEditing(true);
   };
 
@@ -1824,7 +1985,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       Alert.alert(t('invalidUnitsTitle'), t('invalidUnitsMessage'));
       return;
     }
-    onSaveEdit(stock.ticker, parsedUnits, editedAssetType, totalValueText, roicText);
+    onSaveEdit(stock.ticker, parsedUnits, editedAssetType, totalValueText, roicText, internalTargetText);
     setIsEditing(false);
   };
 
@@ -1902,6 +2063,23 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               onSubmitEditing={handleSaveEdit}
             />
           )}
+          {/* CORE LAYER INTERNAL ALLOCATION: only shown for Core positions
+              — an internal target is meaningless to the Trailing Stop/Kill
+              Switch mechanisms the other two layers use. Same "blank
+              preserves the existing value" pattern as the Total Value/ROIC
+              fields above. */}
+          {stock.category === 'Core' && (
+            <TextInput
+              style={[styles.unitsEditInput, styles.totalValueEditInput]}
+              value={internalTargetText}
+              onChangeText={setInternalTargetText}
+              placeholder={t('internalTargetPlaceholder')}
+              placeholderTextColor={colors.textSecondary}
+              keyboardType="numeric"
+              maxLength={15}
+              onSubmitEditing={handleSaveEdit}
+            />
+          )}
           <View style={styles.editAssetTypeRow}>
             <TouchableOpacity
               style={[
@@ -1948,9 +2126,24 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               <Text style={styles.stockDetailText}>{t('atPrice')}</Text>
               <Text style={styles.stockDetailValueText}>{unitPriceDisplay}</Text>
             </View>
+            {/* EDIT ICON HITBOX FIX: this used to be a bare 14px icon with
+                only hitSlop padding the touch target — on a real device
+                that region sits close enough to stockTotalValue (the price
+                Text, a sibling laid out at the opposite end of
+                stockBottomRow via justifyContent: 'space-between') that
+                taps near the icon's edge could be swallowed by whichever
+                sibling's layout box happened to extend furthest, without
+                the icon's own box being visually distinguishable. Now:
+                (1) real padding (styles.editIconTouchable) grows the
+                ACTUAL layout box, not just the invisible hitSlop region,
+                so the touchable has real size to stack correctly against
+                its neighbors; (2) zIndex lifts it above any sibling text
+                so it always wins hit-testing on overlap; (3) hitSlop is
+                widened further on top of both. */}
             <TouchableOpacity
               onPress={handleStartEditing}
-              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              style={styles.editIconTouchable}
+              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
               accessibilityLabel={`ערוך את ${stock.ticker}`}>
               <Ionicons name="pencil" size={14} color={colors.textSecondary} />
             </TouchableOpacity>
@@ -1971,13 +2164,27 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
       {/* LAYER 1: SATELLITE — SMA200 read-only, grayed out, no color
           coding ("macro-context only" — SMA50 is not shown at all, per the
-          Indicator Purge), the precise TS trigger price in red/green based
-          on current price, and the 52-Week Drawdown percentage. */}
+          Indicator Purge), the High Water Mark itself, the precise TS
+          trigger price in red/green based on current price, and the drop
+          from THAT watermark (not the 52-week high — see hwmDropPct's own
+          comment for why those are different numbers and why this one is
+          the one that actually explains the trailing stop's state). */}
       {!isEditing && stock.category === 'Satellite' && (
         <>
           {sma200Display !== null && (
             <Text style={styles.macroContextText}>
               {t('sma200')}: {sma200Display}
+            </Text>
+          )}
+
+          {/* SATELLITE CARD FIX: the High Water Mark itself, explicitly
+              labeled — previously never shown at all, only its DERIVED
+              trailing-stop price was. Same USD-basis reasoning as
+              trailingStopPrice just below (highestWatermark is tracked in
+              USD regardless of the instrument's own trading currency). */}
+          {stock.highestWatermark !== null && (
+            <Text style={styles.macroContextText}>
+              {t('highWaterMark')}: ${stock.highestWatermark.toFixed(2)}
             </Text>
           )}
 
@@ -1999,9 +2206,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             </Text>
           )}
 
-          {stock.drawdownPct !== null && (
+          {/* SATELLITE CARD FIX: replaces the old stock.drawdownPct-based
+              "Drop" line (distance from the 52-week HIGH, a different
+              basis than the trailing stop itself uses) with the drop from
+              THIS position's own High Water Mark — see hwmDropPct's own
+              comment above for why that's the number that actually
+              explains "why hasn't the 12% trailing stop triggered yet." */}
+          {hwmDropPct !== null && (
             <Text style={styles.drawdownText}>
-              {t('drop')}: {stock.drawdownPct.toFixed(2)}%
+              {t('dropFromHwm')}: {hwmDropPct.toFixed(2)}%
             </Text>
           )}
         </>
@@ -2056,15 +2269,27 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       )}
 
       {/* LAYER 3: CORE — Indicator Purge: no TS, no SMAs, no Drawdown.
-          Allocation Tracking only: this layer's live share of the whole
-          portfolio (currentWeightPct — see computeLayerWeightPct in
-          PortfolioScreen) vs. the fixed Fortress 2.0 target. No dividend
+          CORE LAYER INTERNAL ALLOCATION FIX: this used to show
+          currentWeightPct — this layer's live share of the WHOLE
+          portfolio (e.g. "68%"), IDENTICAL on every single Core card,
+          against the fixed Fortress 2.0 layer-level target
+          (CATEGORY_TARGET_PCT.Core, also identical on every card) — never
+          telling a user how their Core holdings are balanced against EACH
+          OTHER. Now shows internalWeightPct — THIS asset's own share of
+          Core's total value (computeInternalWeightPct) — against an
+          OPTIONAL, per-asset internalTargetPct the user can define for
+          this specific holding (see the Add/Edit forms' "Internal Target"
+          field), since there's no fixed model for sub-asset targets the
+          way there is at the layer level. No target shown at all when the
+          user hasn't set one, rather than fabricating one. No dividend
           yield/cash-flow placeholder rendered — that data doesn't exist
           anywhere in this app's pipeline yet, and a fabricated placeholder
           would violate "no placeholders" more than simply omitting it. */}
       {!isEditing && stock.category === 'Core' && (
         <Text style={styles.allocationText}>
-          {t('allocation')}: {currentWeightPct.toFixed(1)}% / {t('target')}: {CATEGORY_TARGET_PCT.Core}%
+          {t('internalAllocation')}: {internalWeightPct.toFixed(1)}%
+          {stock.internalTargetPct !== null &&
+            ` / ${t('target')}: ${stock.internalTargetPct.toFixed(1)}%`}
         </Text>
       )}
     </View>
@@ -2178,11 +2403,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fontSize: 16,
     textAlign: 'center',
   },
-  // QUALITY Z-SCORE MODULE: the ROIC field stands alone (not inside a
-  // unitsValueRow-style flex row like units/totalValue above), so it needs
-  // its own bottom margin to match the spacing every other field in this
-  // form already has.
-  roicInput: {
+  // Shared by the ROIC field and the Internal Target field (Quality/Core
+  // only, respectively) — both stand alone (not inside a unitsValueRow-
+  // style flex row like units/totalValue above), so both need this same
+  // bottom margin to match the spacing every other field in this form
+  // already has.
+  standaloneInput: {
     marginBottom: 16,
   },
   modalSectionLabel: {
@@ -2509,6 +2735,16 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     flexDirection: language === 'he' ? 'row-reverse' : 'row',
     alignItems: 'center',
     gap: 4,
+  },
+  // EDIT ICON HITBOX FIX: see the TouchableOpacity's own comment at the
+  // call site. Real padding (not just hitSlop) so the touchable's actual
+  // layout box is bigger, plus a positive zIndex/elevation so it always
+  // wins hit-testing over stockTotalValue (the price text) or any other
+  // sibling it might visually sit close to.
+  editIconTouchable: {
+    padding: 8,
+    zIndex: 10,
+    elevation: 2,
   },
   editContainer: {
     marginTop: 8,

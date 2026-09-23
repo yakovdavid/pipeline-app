@@ -46,7 +46,15 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
   if (typeof value === 'string') {
     const ticker = value.trim().toUpperCase();
     return ticker.length > 0
-      ? { ticker, category: 'Satellite', assetType: 'Stock', units: 0, highestWatermark: null, roic: null }
+      ? {
+          ticker,
+          category: 'Satellite',
+          assetType: 'Stock',
+          units: 0,
+          highestWatermark: null,
+          roic: null,
+          internalTargetPct: null,
+        }
       : null;
   }
   if (typeof value !== 'object' || value === null) {
@@ -81,6 +89,11 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
     // silently wipe out a user-entered ROIC the moment a backup is
     // restored.
     roic: typeof entry.roic === 'number' ? entry.roic : null,
+    // CORE LAYER INTERNAL ALLOCATION: must round-trip through backup
+    // export/import same as every other persisted field — dropping it
+    // here would silently wipe out a user-defined internal target the
+    // moment a backup is restored.
+    internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
   };
 }
 
