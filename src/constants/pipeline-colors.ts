@@ -30,6 +30,15 @@ export type PipelineColorScheme = {
   // is a saturated red in both themes, so white stays legible on it either
   // way, unlike `textPrimary` which flips light/dark with the theme.
   reviewAlertText: string;
+  // Pullback Depth "Overshot" tier (deeper than -7%): a dark magenta-red,
+  // deliberately darker than `bearish` (Kill Zone) so a crash never reads as
+  // the entry trigger. Paired with fixed white text in both themes.
+  overshot: string;
+  overshotText: string;
+  // Neutral/disabled surface for the Pullback Depth badge when the Macro
+  // Override invalidates the setup (Macro Trend not Bullish). Muted enough
+  // that `textPrimary` stays legible on it in each theme.
+  invalidated: string;
 };
 
 export const DarkPipelineColors: PipelineColorScheme = {
@@ -46,6 +55,9 @@ export const DarkPipelineColors: PipelineColorScheme = {
   warningText: '#121212',
   reviewAlert: '#FF4444',
   reviewAlertText: '#FFFFFF',
+  overshot: '#880E4F',
+  overshotText: '#FFFFFF',
+  invalidated: '#3A3A3C',
 };
 
 // Clean white/light-gray backgrounds, dark text, white cards (shadows are
@@ -67,4 +79,7 @@ export const LightPipelineColors: PipelineColorScheme = {
   warningText: '#1C1C1E',
   reviewAlert: '#D32F2F',
   reviewAlertText: '#FFFFFF',
+  overshot: '#6A0D3A',
+  overshotText: '#FFFFFF',
+  invalidated: '#D1D1D6',
 };

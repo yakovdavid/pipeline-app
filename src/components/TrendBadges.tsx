@@ -2,10 +2,15 @@ import { useMemo } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
-import { PULLBACK_KILL_ZONE_THRESHOLD_PCT, PULLBACK_PREMIUM_THRESHOLD_PCT } from '@/constants/thresholds';
-import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
+import {
+  usePipelineLanguage,
+  type Language,
+  type TFunction,
+  type TranslationKey,
+} from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { TrendLabel } from '@/types/asset';
+import { resolveAmbushSignal, type AmbushSignal, type AmbushSignalState } from '@/utils/ambush-zone';
 
 export type TrendBadgesProps = {
   macroTrend: TrendLabel;
@@ -30,67 +35,59 @@ function trendText(t: TFunction, value: TrendLabel): string {
   return t('notAvailable');
 }
 
-type PullbackDepthTier = 'premium' | 'watch' | 'killZone';
-
-// PULLBACK DEPTH INDICATOR: see PULLBACK_PREMIUM_THRESHOLD_PCT/
-// PULLBACK_KILL_ZONE_THRESHOLD_PCT in @/constants/thresholds for the exact
-// boundaries and the PRD-vs-implementation rationale. Null (insufficient
-// SMA50 history) is handled separately by the call site, not here.
-function classifyPullbackDepth(pullbackDepth: number): PullbackDepthTier {
-  if (pullbackDepth > PULLBACK_PREMIUM_THRESHOLD_PCT) return 'premium';
-  if (pullbackDepth <= PULLBACK_KILL_ZONE_THRESHOLD_PCT) return 'killZone';
-  return 'watch';
-}
-
-// Color code strictly per the PRD: Gray (Premium), Orange (Watch), Red
-// (Kill Zone / Entry Trigger) — reusing this app's existing palette
-// (textSecondary/warning/bearish) rather than inventing new colors, so
-// this stays consistent with every other gray/orange/red signal already
-// in the app (e.g. the Quality Kill Switch's own reviewAlert red).
-function pullbackDepthColor(colors: PipelineColorScheme, tier: PullbackDepthTier | null): string {
-  switch (tier) {
-    case 'premium':
-      return colors.textSecondary;
+// Background + text color per badge state, strictly per the PRD: Gray
+// (Premium), Orange (Watch), Red (Kill Zone / Entry Trigger), dark magenta
+// (Overshot — a crash, not an entry), and a neutral disabled gray when the
+// Macro Override invalidates the setup. Reuses the app palette rather than
+// inventing ad-hoc colors.
+function pullbackDepthColors(
+  colors: PipelineColorScheme,
+  state: AmbushSignalState | null,
+): { background: string; text: string } {
+  switch (state) {
     case 'watch':
-      return colors.warning;
+      return { background: colors.warning, text: colors.warningText };
     case 'killZone':
-      return colors.bearish;
+      return { background: colors.bearish, text: colors.textPrimary };
+    case 'overshot':
+      return { background: colors.overshot, text: colors.overshotText };
+    case 'invalidated':
+      return { background: colors.invalidated, text: colors.textPrimary };
+    case 'premium':
     default:
-      return colors.textSecondary;
+      return { background: colors.textSecondary, text: colors.textPrimary };
   }
 }
 
-function pullbackDepthTierText(t: TFunction, tier: PullbackDepthTier | null): string {
-  switch (tier) {
-    case 'premium':
-      return t('premium');
-    case 'watch':
-      return t('watch');
-    case 'killZone':
-      return t('killZone');
-    default:
-      return t('notAvailable');
-  }
-}
+const PULLBACK_STATE_TEXT_KEY: Record<AmbushSignalState, TranslationKey> = {
+  premium: 'premium',
+  watch: 'watch',
+  killZone: 'killZone',
+  overshot: 'overshot',
+  invalidated: 'invalidated',
+};
 
-function pullbackDepthValueText(t: TFunction, pullbackDepth: number | null): string {
-  if (pullbackDepth === null) {
+// e.g. "-8.81% (Overshot)" when Bullish, "-4.12% (Invalidated)" when the
+// Macro Override applies — the raw percentage is always kept visible.
+function pullbackDepthValueText(t: TFunction, signal: AmbushSignal): string {
+  if (signal.pullbackDepth === null || signal.state === null) {
     return t('notAvailable');
   }
-  const tier = classifyPullbackDepth(pullbackDepth);
-  return `${pullbackDepth.toFixed(2)}% (${pullbackDepthTierText(t, tier)})`;
+  return `${signal.pullbackDepth.toFixed(2)}% (${t(PULLBACK_STATE_TEXT_KEY[signal.state])})`;
 }
 
 // Dashboard Trend Display: Macro Trend (price vs. SMA200, still a binary
 // Bullish/Bearish badge) alongside the Pullback Depth Indicator (price vs.
-// SMA50, now a graduated 3-tier badge — see classifyPullbackDepth above),
+// SMA50, now a graduated tiered badge — see @/utils/ambush-zone),
 // replacing the old single asset-type-dependent Bullish/Bearish badge this
 // app used to show (SMA200 for ETFs, SMA50 for Stocks, silently hiding
 // whichever signal it didn't pick), and then replacing the Tactical
 // Momentum half of that pair's own binary verdict with the Pullback Depth
 // Indicator per "The Fortress 2.0" PRD. Both values are computed
 // backend-side (see backend/main.py) and passed through as-is; this
-// component only decides how to render them.
+// component only decides how to render them — including the Macro
+// Override, which neutralizes the Pullback Depth badge to gray
+// "Invalidated" unless Macro Trend is Bullish.
 //
 // Self-contained (reads theme/language via context itself), same reasoning
 // as MomentumBar — shared identically by the Ambush Radar StockCard and
@@ -100,7 +97,8 @@ export function TrendBadges({ macroTrend, pullbackDepth }: TrendBadgesProps) {
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, language), [colors, language]);
 
-  const pullbackTier = pullbackDepth === null ? null : classifyPullbackDepth(pullbackDepth);
+  const ambushSignal = resolveAmbushSignal(macroTrend, pullbackDepth);
+  const pullbackColors = pullbackDepthColors(colors, ambushSignal.state);
 
   return (
     <View style={styles.row}>
@@ -108,9 +106,11 @@ export function TrendBadges({ macroTrend, pullbackDepth }: TrendBadgesProps) {
         <Text style={styles.badgeLabel}>{t('macroTrend')}</Text>
         <Text style={styles.badgeValue}>{trendText(t, macroTrend)}</Text>
       </View>
-      <View style={[styles.badge, { backgroundColor: pullbackDepthColor(colors, pullbackTier) }]}>
-        <Text style={styles.badgeLabel}>{t('pullbackDepth')}</Text>
-        <Text style={styles.badgeValue}>{pullbackDepthValueText(t, pullbackDepth)}</Text>
+      <View style={[styles.badge, { backgroundColor: pullbackColors.background }]}>
+        <Text style={[styles.badgeLabel, { color: pullbackColors.text }]}>{t('pullbackDepth')}</Text>
+        <Text style={[styles.badgeValue, { color: pullbackColors.text }]}>
+          {pullbackDepthValueText(t, ambushSignal)}
+        </Text>
       </View>
     </View>
   );

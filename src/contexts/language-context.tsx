@@ -50,6 +50,8 @@ export type TranslationKey =
   | 'premium'
   | 'watch'
   | 'killZone'
+  | 'overshot'
+  | 'invalidated'
   | 'qualityZScore'
   | 'zScoreAlert'
   | 'roicPlaceholder'
@@ -170,6 +172,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     premium: 'פרימיום',
     watch: 'מעקב',
     killZone: 'אזור כניסה',
+    overshot: 'חריגת יתר',
+    invalidated: 'מבוטל',
     qualityZScore: 'ציון Z איכות',
     zScoreAlert: 'התראת ציון Z',
     roicPlaceholder: "תשואה על ההון המושקע % (איכות) - אופציונלי",
@@ -276,6 +280,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     premium: 'Premium',
     watch: 'Watch',
     killZone: 'Kill Zone',
+    overshot: 'Overshot',
+    invalidated: 'Invalidated',
     qualityZScore: 'Quality Z-Score',
     zScoreAlert: 'Z-Score Alert',
     roicPlaceholder: 'ROIC % (Quality) - optional',
