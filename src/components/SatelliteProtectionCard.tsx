@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
+import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { computeProtectionState, type ProtectionState } from '@/utils/protectionState';
 
@@ -13,7 +14,7 @@ export interface SatelliteProtectionCardProps {
   hwm: number;
 }
 
-// How long a copy button shows its "copied" checkmark before reverting to
+// How long a copy button shows its "Copied!" feedback before reverting to
 // the plain copy icon — long enough to register as deliberate feedback,
 // short enough not to feel stuck if the user taps it again quickly.
 const COPY_FEEDBACK_DURATION_MS = 1500;
@@ -28,7 +29,7 @@ function formatUsd(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-// Which specific copy button last fired its "copied" feedback — distinct
+// Which specific copy button last fired its "Copied!" feedback — distinct
 // buttons (stop price vs. alert price) need independent feedback, so this
 // is a key, not a bare boolean.
 type CopiedField = 'stopPrice' | 'alertPrice' | null;
@@ -37,6 +38,15 @@ type CopiedField = 'stopPrice' | 'alertPrice' | null;
 // clipboard icon button — shared by both the Stop Price and the Broker
 // Price Alert rows in the expanded view below, so their layout/behavior
 // can never drift apart.
+//
+// i18n: `label` arrives already translated (built by the caller via t(),
+// since only the caller knows which translation key/params apply) —
+// `value` is deliberately NEVER translated: it's either a raw USD amount
+// or the literal "12%" from @/utils/protectionState, exactly what the
+// user needs to type into/compare against their brokerage account, so it
+// stays in its original, locale-independent form regardless of app
+// language (same convention this app already applies to ticker symbols
+// and prices everywhere else — see e.g. StockCard.tsx).
 type CopyableValueRowProps = {
   label: string;
   value: string;
@@ -45,9 +55,10 @@ type CopyableValueRowProps = {
   onCopy: (fieldKey: Exclude<CopiedField, null>, value: string) => void;
   colors: PipelineColorScheme;
   styles: ReturnType<typeof createStyles>;
+  t: TFunction;
 };
 
-function CopyableValueRow({ label, value, fieldKey, copiedField, onCopy, colors, styles }: CopyableValueRowProps) {
+function CopyableValueRow({ label, value, fieldKey, copiedField, onCopy, colors, styles, t }: CopyableValueRowProps) {
   const isCopied = copiedField === fieldKey;
 
   return (
@@ -56,17 +67,20 @@ function CopyableValueRow({ label, value, fieldKey, copiedField, onCopy, colors,
         <Text style={styles.valueLabel}>{label}</Text>
         <Text style={styles.valueText}>{value}</Text>
       </View>
-      <TouchableOpacity
-        onPress={() => onCopy(fieldKey, value)}
-        style={styles.copyButton}
-        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-        accessibilityLabel={`Copy ${label} to clipboard`}>
-        <Ionicons
-          name={isCopied ? 'checkmark' : 'copy-outline'}
-          size={18}
-          color={isCopied ? colors.bullish : colors.textSecondary}
-        />
-      </TouchableOpacity>
+      <View style={styles.copyButtonGroup}>
+        {isCopied && <Text style={styles.copiedFeedbackText}>{t('copied')}</Text>}
+        <TouchableOpacity
+          onPress={() => onCopy(fieldKey, value)}
+          style={styles.copyButton}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          accessibilityLabel={`Copy ${label} to clipboard`}>
+          <Ionicons
+            name={isCopied ? 'checkmark' : 'copy-outline'}
+            size={18}
+            color={isCopied ? colors.bullish : colors.textSecondary}
+          />
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
@@ -78,9 +92,21 @@ function CopyableValueRow({ label, value, fieldKey, copiedField, onCopy, colors,
 // the user needs to type into their brokerage account — kept hidden by
 // default specifically so a list of many Satellite positions doesn't dump
 // every position's full order-ticket detail on screen at once.
+//
+// INTEGRATION NOTE: this is rendered embedded inside PortfolioStockRow's
+// own asset card (index.tsx), directly below that card's existing
+// Satellite metrics (SMA200/High Water Mark/Trailing Stop/Drop-from-HWM) —
+// NOT as a separate, standalone list item — so its own outer wrapper
+// deliberately carries no card chrome of its own (no background, no
+// shadow/elevation, no bottom margin): see the `wrapper` style below.
 export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: SatelliteProtectionCardProps) {
-  const { colors, isDarkMode } = usePipelineTheme();
-  const styles = useMemo(() => createStyles(colors, isDarkMode), [colors, isDarkMode]);
+  const { colors } = usePipelineTheme();
+  // ROBUST LANGUAGE CONTEXT: a plain context read, same as usePipelineTheme
+  // above — a language switch re-renders this card, and every translated
+  // string on it, immediately, no app restart (see
+  // @/contexts/language-context).
+  const { language, t } = usePipelineLanguage();
+  const styles = useMemo(() => createStyles(colors, language), [colors, language]);
 
   const [isExpanded, setIsExpanded] = useState(false);
   const [copiedField, setCopiedField] = useState<CopiedField>(null);
@@ -109,7 +135,7 @@ export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: Satellite
   // new hardcoded hex colors — this is what gives the badge correct
   // light/dark-mode contrast "for free."
   const statusBadgeColor = isAutomatedTracking ? colors.bullish : colors.warning;
-  const statusLabel = isAutomatedTracking ? 'Automated Tracking' : 'Manual Setup Required';
+  const statusLabel = isAutomatedTracking ? t('automatedTracking') : t('manualSetupRequired');
 
   const stopPriceDisplay =
     typeof protectionState.stopPriceTarget === 'number'
@@ -119,8 +145,8 @@ export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: Satellite
   const handleCopy = (fieldKey: Exclude<CopiedField, null>, value: string) => {
     Clipboard.setStringAsync(value).catch(() => {
       // Copying to the clipboard failing is not something the user can
-      // act on here; the button simply won't show its "copied" checkmark,
-      // which is feedback enough that nothing happened.
+      // act on here; the button simply won't show its "Copied!" feedback,
+      // which is signal enough that nothing happened.
       return;
     });
 
@@ -135,10 +161,12 @@ export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: Satellite
   };
 
   return (
-    <View style={styles.card}>
+    <View style={styles.wrapper}>
       {/* COLLAPSED STATE: ticker, current price, and a small status badge
           — tapping anywhere on this row toggles the expanded detail
-          below. */}
+          below. Ticker/price are LTR identifiers (same convention as
+          everywhere else in this app), so this row's own layout isn't
+          language-flipped; only the badge's translated label text is. */}
       <TouchableOpacity
         style={styles.collapsedRow}
         onPress={() => setIsExpanded((previous) => !previous)}
@@ -169,30 +197,32 @@ export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: Satellite
           <View style={styles.divider} />
 
           <View style={styles.orderTypeRow}>
-            <Text style={styles.orderTypeLabel}>Order Type</Text>
+            <Text style={styles.orderTypeLabel}>{t('protectionOrderType')}</Text>
             <Text style={styles.orderTypeValue}>{protectionState.orderType}</Text>
           </View>
 
           <CopyableValueRow
-            label="Stop Price"
+            label={t('protectionStopPrice')}
             value={stopPriceDisplay}
             fieldKey="stopPrice"
             copiedField={copiedField}
             onCopy={handleCopy}
             colors={colors}
             styles={styles}
+            t={t}
           />
 
           {protectionState.alertTriggerPrice !== null && (
             <View style={styles.alertInstructionBlock}>
               <CopyableValueRow
-                label={`Set Broker Price Alert at: ${formatUsd(protectionState.alertTriggerPrice)}`}
+                label={t('setBrokerPriceAlertAt', { price: formatUsd(protectionState.alertTriggerPrice) })}
                 value={formatUsd(protectionState.alertTriggerPrice)}
                 fieldKey="alertPrice"
                 copiedField={copiedField}
                 onCopy={handleCopy}
                 colors={colors}
                 styles={styles}
+                t={t}
               />
             </View>
           )}
@@ -202,23 +232,23 @@ export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: Satellite
   );
 }
 
-function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
+function createStyles(colors: PipelineColorScheme, language: Language) {
+  const isHebrew = language === 'he';
+
   return StyleSheet.create({
-    card: {
-      backgroundColor: colors.cardBackground,
-      borderRadius: 12,
-      paddingHorizontal: 16,
-      paddingVertical: 14,
-      marginBottom: 10,
-      ...(isDarkMode
-        ? null
-        : {
-            shadowColor: '#000',
-            shadowOpacity: 0.08,
-            shadowRadius: 6,
-            shadowOffset: { width: 0, height: 2 },
-            elevation: 2,
-          }),
+    // INTEGRATION NOTE: no backgroundColor/shadow/elevation/marginBottom
+    // here — this renders INSIDE PortfolioStockRow's own asset card
+    // (index.tsx), directly below its existing Satellite metrics, so it
+    // must never look like a second, nested card. A top border + marginTop
+    // (matching this app's standard ~6-10px inter-element spacing, e.g.
+    // macroContextText/trailingStopText/drawdownText's own marginTop: 6 in
+    // index.tsx) is enough to visually separate it from the metrics above
+    // without duplicating the parent's own card chrome.
+    wrapper: {
+      marginTop: 10,
+      paddingTop: 10,
+      borderTopWidth: 1,
+      borderTopColor: colors.background,
     },
     collapsedRow: {
       flexDirection: 'row',
@@ -231,14 +261,21 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       gap: 10,
     },
     ticker: {
+      // Ticker symbols stay LTR regardless of app language — identifiers,
+      // not translatable text (same convention as every other ticker
+      // display in this app).
       color: colors.textPrimary,
       fontSize: 16,
       fontWeight: '700',
+      writingDirection: 'ltr',
     },
     currentPrice: {
+      // Pure currency value — stays LTR regardless of app language, same
+      // reasoning as `ticker` above.
       color: colors.textSecondary,
       fontSize: 15,
       fontWeight: '500',
+      writingDirection: 'ltr',
     },
     collapsedRightGroup: {
       flexDirection: 'row',
@@ -253,10 +290,15 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
     // Fixed white text regardless of theme — both statusBadgeColor options
     // (colors.bullish / colors.warning) are saturated enough in both
     // light and dark mode for white to stay legible on top of either.
+    // textAlign/writingDirection DO follow the active language — this is
+    // translated label text ("Automated Tracking" / "Manual Setup
+    // Required"), unlike ticker/currentPrice above.
     statusBadgeText: {
       color: '#FFFFFF',
       fontSize: 11,
       fontWeight: '700',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     expandedSection: {
       marginTop: 12,
@@ -272,15 +314,27 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       justifyContent: 'space-between',
       marginBottom: 10,
     },
+    // Translated label ("Order Type") — RTL/LTR-aware, same convention as
+    // every other label text in this app (e.g. allocationText in
+    // index.tsx).
     orderTypeLabel: {
       color: colors.textSecondary,
       fontSize: 13,
       fontWeight: '600',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
+    // The order type VALUE ("Stop Market" / "Trailing Stop") is a fixed
+    // enum label from @/utils/protectionState, not translated content —
+    // the Protection State Tracker's spec deliberately only calls for
+    // translating the surrounding LABELS, not these literal order-type
+    // names a broker's own UI would show in English regardless, so this
+    // stays LTR.
     orderTypeValue: {
       color: colors.textPrimary,
       fontSize: 15,
       fontWeight: '700',
+      writingDirection: 'ltr',
     },
     valueRow: {
       flexDirection: 'row',
@@ -292,16 +346,36 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean) {
       flex: 1,
       marginRight: 12,
     },
+    // Translated label ("Stop Price" / "Set Broker Price Alert at: ...").
     valueLabel: {
       color: colors.textSecondary,
       fontSize: 13,
       fontWeight: '600',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
+    // The value itself (a USD amount or the literal "12%") — never
+    // translated, always LTR, exactly what the user types into/compares
+    // against their brokerage account.
     valueText: {
       color: colors.textPrimary,
       fontSize: 16,
       fontWeight: '700',
       marginTop: 2,
+      writingDirection: 'ltr',
+    },
+    copyButtonGroup: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+    },
+    // Translated "Copied!" feedback, shown briefly next to the icon.
+    copiedFeedbackText: {
+      color: colors.bullish,
+      fontSize: 12,
+      fontWeight: '600',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     copyButton: {
       padding: 6,

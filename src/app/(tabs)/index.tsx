@@ -28,6 +28,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar';
 
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
+import { SatelliteProtectionCard } from '@/components/SatelliteProtectionCard';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT, formatUnitsLabel } from '@/constants/labels';
@@ -2216,6 +2217,28 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             <Text style={styles.drawdownText}>
               {t('dropFromHwm')}: {hwmDropPct.toFixed(2)}%
             </Text>
+          )}
+
+          {/* PROTECTION STATE TRACKER: the exact manual Stop-Loss order
+              parameters for this position, rendered EXCLUSIVELY for
+              Satellite assets — see SatelliteProtectionCard's own
+              "INTEGRATION NOTE" for why it carries no card chrome of its
+              own (it's embedded directly below this card's own metrics
+              above, not a separate list item). currentPrice is this
+              row's live, already-calibrated/USD-normalized stock.price —
+              the same basis trailingStopPrice/hwmDropPct above already
+              use. hwm is this position's own highestWatermark (the
+              "database" High Water Mark this feature is specified
+              against); gated on it being non-null for the same reason
+              trailingStopPrice/sma200Display above are — no watermark yet
+              means no live price has been fetched for this position at
+              all. */}
+          {stock.highestWatermark !== null && (
+            <SatelliteProtectionCard
+              ticker={stock.ticker}
+              currentPrice={stock.price}
+              hwm={stock.highestWatermark}
+            />
           )}
         </>
       )}

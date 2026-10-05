@@ -58,6 +58,13 @@ export type TranslationKey =
   // Core Layer Internal Allocation
   | 'internalAllocation'
   | 'internalTargetPlaceholder'
+  // Satellite Protection State Tracker (SatelliteProtectionCard)
+  | 'automatedTracking'
+  | 'manualSetupRequired'
+  | 'protectionOrderType'
+  | 'protectionStopPrice'
+  | 'setBrokerPriceAlertAt'
+  | 'copied'
   // Loading states
   | 'loadingPortfolio'
   | 'loadingAmbush'
@@ -179,6 +186,12 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     roicPlaceholder: "תשואה על ההון המושקע % (איכות) - אופציונלי",
     internalAllocation: 'הקצאה פנימית',
     internalTargetPlaceholder: 'יעד פנימי % (ליבה) - אופציונלי',
+    automatedTracking: 'מעקב אוטומטי',
+    manualSetupRequired: 'נדרשת הגדרה ידנית',
+    protectionOrderType: 'סוג הוראה',
+    protectionStopPrice: 'מחיר עצירה',
+    setBrokerPriceAlertAt: 'הגדר התראת מחיר בברוקר ב: {{price}}',
+    copied: 'הועתק!',
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
     noPositionsYet: 'אין עדיין פוזיציות.',
@@ -287,6 +300,12 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     roicPlaceholder: 'ROIC % (Quality) - optional',
     internalAllocation: 'Internal Allocation',
     internalTargetPlaceholder: 'Internal Target % (Core) - optional',
+    automatedTracking: 'Automated Tracking',
+    manualSetupRequired: 'Manual Setup Required',
+    protectionOrderType: 'Order Type',
+    protectionStopPrice: 'Stop Price',
+    setBrokerPriceAlertAt: 'Set Broker Price Alert at: {{price}}',
+    copied: 'Copied!',
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
     noPositionsYet: 'No positions yet.',
