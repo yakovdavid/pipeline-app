@@ -3,6 +3,12 @@ uvicorn
 yfinance
 pandas
 curl_cffi
+# Israeli mutual fund prices are scraped from Bizportal (see
+# backend/main.py's _fetch_mutual_fund_snapshot_via_bizportal). Both already
+# arrive transitively via yfinance; listed explicitly because main.py now
+# imports them directly.
+requests
+beautifulsoup4
 # Optional Trailing Stop Engine / Quality Z-Score sync target (see
 # backend/main.py's _sync_high_water_mark_to_supabase and backend/sql/) —
 # imported behind a guarded try/except, so its absence never breaks the

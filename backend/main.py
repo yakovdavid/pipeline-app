@@ -69,8 +69,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, TypeVar
+from urllib.parse import urlparse
 
+import requests as _plain_requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -485,7 +488,11 @@ def _is_retryable_error(error: Exception) -> bool:
     # curl_cffi's requests-compatible exception hierarchy mirrors
     # `requests`' own — this is the "generic network error" case (a
     # ConnectionError, Timeout, etc. that never got as far as a response).
-    if isinstance(error, _http_backend.exceptions.RequestException):
+    # Plain `requests` exceptions are checked too: the Bizportal mutual-fund
+    # scraper (see _fetch_mutual_fund_snapshot_via_bizportal) deliberately
+    # uses plain `requests`, not the curl_cffi session, and its network
+    # errors are not curl_cffi exception instances.
+    if isinstance(error, (_http_backend.exceptions.RequestException, _plain_requests.exceptions.RequestException)):
         return True
 
     # Some yfinance failure paths re-raise as a plain Exception that loses
@@ -1042,6 +1049,229 @@ def _fetch_ticker_snapshot_with_fallback(symbol: str) -> TickerSnapshot:
     return max(candidates, key=lambda candidate: len(candidate.closes))
 
 
+# --- Israeli mutual funds (קרנות נאמנות / קרנות מחקות) via Bizportal -----
+# Yahoo Finance does not list Israeli mutual funds at all, so a fund's
+# 7-digit paper number (e.g. "5122510") 404s on both yfinance and the
+# chart API. Those funds are priced from Bizportal's public fund quote page
+# instead (see _fetch_mutual_fund_snapshot_via_bizportal).
+#
+# A 7-digit number is NOT proof of a mutual fund: TASE stocks (e.g.
+# 1081124) and TASE ETFs (e.g. 1159250) use 7-digit paper numbers too, and
+# Yahoo serves those fine as "<number>.TA". So 7-digit tickers try
+# Bizportal FIRST, and fall through to the existing Yahoo path whenever
+# Bizportal says the number isn't a mutual fund — see _fetch_ticker_snapshot.
+MUTUAL_FUND_TICKER_PATTERN = re.compile(r"^(\d{7})" + re.escape(TASE_TICKER_SUFFIX) + r"$")
+BIZPORTAL_FUND_URL = "https://www.bizportal.co.il/mutualfunds/quote/generalview/{fund_number}"
+# Verified live: a real mutual fund's page stays on this path. Any other
+# 7-digit paper number is REDIRECTED away from it (stocks to
+# /capitalmarket/, ETFs to /tradedfund/, unknown numbers to a paper list),
+# so the final URL path is the primary "is this a mutual fund" signal.
+BIZPORTAL_FUND_PATH_PREFIX = "/mutualfunds/quote/"
+BIZPORTAL_REQUEST_TIMEOUT_SECONDS = 10.0
+BIZPORTAL_FETCH_MAX_RETRIES = 2
+# Hebrew labels Bizportal renders on a fund page. The redemption price
+# (מחיר פדיון) is what a holding is actually worth if sold, so it's the
+# valuation price used here rather than the buy price (מחיר קנייה), which
+# can include a front-end load.
+BIZPORTAL_REDEMPTION_PRICE_LABEL = "מחיר פדיון"
+BIZPORTAL_CURRENCY_LABEL = "מטבע"
+BIZPORTAL_ILS_CURRENCY_VALUE = 'ש"ח'
+BIZPORTAL_52_WEEK_RANGE_LABEL = "טווח 52 שבועות"
+# Bizportal quotes ILS-denominated fund unit prices in Agorot — the same
+# unit Yahoo reports for ".TA" instruments — so the raw price is recorded
+# with this code and the existing Multi-Currency engine
+# (_resolve_currency_converters) applies its usual ÷100 and ÷USD/ILS math.
+BIZPORTAL_PRICE_CURRENCY_CODE = "ILA"
+BIZPORTAL_BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "keep-alive",
+}
+
+
+class NotAMutualFundError(Exception):
+    """Bizportal says this 7-digit paper number is not a mutual fund (it
+    redirected away from the fund page, or 404'd). The caller falls through
+    to the regular Yahoo path, since the number may be a TASE stock/ETF."""
+
+
+class UnsupportedFundCurrencyError(Exception):
+    """The fund exists on Bizportal but isn't ILS-denominated. Its price is
+    not in Agorot, so running it through the ".TA" Agorot conversion would
+    misprice it — this is surfaced as an explicit error instead."""
+
+
+class MutualFundSourceUnavailableError(Exception):
+    """Bizportal couldn't be reached/parsed AND the Yahoo fallback also
+    failed for the same 7-digit ticker."""
+
+
+def _extract_mutual_fund_number(symbol: str) -> str | None:
+    """Returns the 7-digit paper number if `symbol` (already normalized by
+    _normalize_ticker_symbol, so a bare "5122510" has become "5122510.TA")
+    is a candidate Israeli mutual fund ticker, else None."""
+    match = MUTUAL_FUND_TICKER_PATTERN.match(symbol.strip().upper())
+    return match.group(1) if match else None
+
+
+def _parse_bizportal_number(raw_text: str) -> float:
+    """Parses a Bizportal numeric cell ("301.7", "1,234.56") into a float.
+    Raises ValueError on anything unparseable, including an empty cell."""
+    cleaned = raw_text.strip().replace(",", "")
+    if not cleaned:
+        raise ValueError("empty numeric value")
+    return float(cleaned)
+
+
+def _parse_bizportal_fund_page(html: str | bytes, fund_number: str) -> TickerSnapshot:
+    """Extracts the redemption price, currency, and 52-week range from a
+    Bizportal mutual fund page into the same TickerSnapshot shape the Yahoo
+    paths produce. Raises NotAMutualFundError if the page has no redemption
+    price label, UnsupportedFundCurrencyError for a non-ILS fund, and
+    ValueError if the price itself can't be parsed (i.e. the markup
+    changed)."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # The redemption price lives in <div class="top-area-cube"> as a
+    # <div class="label">מחיר פדיון</div><div class="num">301.7</div> pair.
+    # Matching on the label text, not on the cube's position, so a buy
+    # price cube appearing first (or not at all) can't be misread as it.
+    price_label = soup.find("div", class_="label", string=lambda text: text and text.strip() == BIZPORTAL_REDEMPTION_PRICE_LABEL)
+    if price_label is None:
+        raise NotAMutualFundError(f"Bizportal page for '{fund_number}' has no redemption price.")
+    price_cell = price_label.find_next_sibling("div", class_="num")
+    if price_cell is None:
+        raise ValueError(f"Bizportal redemption price cell missing for fund '{fund_number}'.")
+    price_agorot = _parse_bizportal_number(price_cell.get_text())
+    if price_agorot <= 0:
+        raise ValueError(f"Bizportal returned a non-positive price ({price_agorot}) for fund '{fund_number}'.")
+
+    # The fund's details are <dt>label</dt><dd>value</dd> pairs. Only an
+    # explicit non-ILS currency is rejected; a missing currency row is
+    # treated as ILS, since every fund page checked carries one and ILS is
+    # by far the common case.
+    currency_label = soup.find("dt", string=lambda text: text and text.strip() == BIZPORTAL_CURRENCY_LABEL)
+    if currency_label is not None:
+        currency_value_cell = currency_label.find_next_sibling("dd")
+        currency_value = currency_value_cell.get_text(strip=True) if currency_value_cell else ""
+        if currency_value and currency_value != BIZPORTAL_ILS_CURRENCY_VALUE:
+            raise UnsupportedFundCurrencyError(
+                f"Fund '{fund_number}' is denominated in '{currency_value}', not ILS; "
+                "only ILS (Agorot-priced) mutual funds are supported."
+            )
+
+    # 52-week range: two <div class="num"> cells under the range graph.
+    # max() rather than relying on their order, which follows the page's
+    # RTL layout. Optional — a missing range just leaves high_52 as None,
+    # the same way the Yahoo paths degrade.
+    high_52: float | None = None
+    range_label = soup.find("dt", string=lambda text: text and text.strip() == BIZPORTAL_52_WEEK_RANGE_LABEL)
+    if range_label is not None:
+        range_value_cell = range_label.find_next_sibling("dd")
+        if range_value_cell is not None:
+            range_values: list[float] = []
+            for cell in range_value_cell.find_all("div", class_="num"):
+                try:
+                    range_values.append(_parse_bizportal_number(cell.get_text()))
+                except ValueError:
+                    continue
+            if range_values:
+                high_52 = max(range_values)
+
+    # Bizportal's general view has no daily price history, so there are no
+    # closes to compute SMA50/SMA200 from. Those stay None and the existing
+    # "can't be evaluated" handling applies (the same as a newly listed
+    # Yahoo ticker). `closes` holds just today's price, so every downstream
+    # history check (anomaly move, std dev, Z-Score) sees too little data
+    # and returns None rather than raising.
+    return TickerSnapshot(
+        price=price_agorot,
+        sma50=None,
+        sma200=None,
+        high_52=high_52,
+        closes=[price_agorot],
+        currency=BIZPORTAL_PRICE_CURRENCY_CODE,
+    )
+
+
+def _fetch_mutual_fund_snapshot_via_bizportal(fund_number: str) -> TickerSnapshot:
+    """Fetches one Israeli mutual fund's current unit price from Bizportal.
+
+    Uses plain `requests` with browser headers and a rotated User-Agent
+    (verified to be served normally by Bizportal), routed through
+    fetch_with_retry so it shares the app's process-wide request spacing and
+    retries 429/503/network errors with backoff. Results land in the same
+    15-minute TICKER_CACHE as Yahoo snapshots (see get_stock), so each fund
+    page is fetched at most once per 15 minutes.
+    """
+    url = BIZPORTAL_FUND_URL.format(fund_number=fund_number)
+
+    def do_fetch() -> _plain_requests.Response:
+        headers = {**BIZPORTAL_BROWSER_HEADERS, "User-Agent": random.choice(USER_AGENTS)}
+        response = _plain_requests.get(
+            url, headers=headers, timeout=BIZPORTAL_REQUEST_TIMEOUT_SECONDS, allow_redirects=True
+        )
+        # A 404 is a definitive "no such fund page", not a transient error,
+        # so it's returned for the caller to classify rather than raised
+        # (raising would make fetch_with_retry retry it pointlessly).
+        if response.status_code != 404:
+            response.raise_for_status()
+        return response
+
+    response = fetch_with_retry(
+        do_fetch,
+        description=f"Bizportal mutual fund fetch for '{fund_number}'",
+        max_retries=BIZPORTAL_FETCH_MAX_RETRIES,
+    )
+
+    if response.status_code == 404:
+        raise NotAMutualFundError(f"Bizportal returned 404 for paper number '{fund_number}'.")
+    if not urlparse(response.url).path.startswith(BIZPORTAL_FUND_PATH_PREFIX):
+        raise NotAMutualFundError(
+            f"Bizportal redirected paper number '{fund_number}' to '{response.url}' (not a mutual fund)."
+        )
+
+    # Raw bytes, not response.text: if a response ever lacks a charset
+    # header, `requests` decodes text/html as ISO-8859-1, which would
+    # garble the Hebrew labels the parser matches on. BeautifulSoup reads
+    # the page's own <meta charset> from the bytes instead.
+    return _parse_bizportal_fund_page(response.content, fund_number)
+
+
+def _fetch_ticker_snapshot(symbol: str) -> TickerSnapshot:
+    """Top-level data-source router for get_stock.
+
+    - Not a 7-digit ".TA" ticker: the existing Yahoo orchestration
+      (_fetch_ticker_snapshot_with_fallback), unchanged.
+    - A 7-digit ".TA" ticker: Bizportal first, bypassing Yahoo entirely
+      when it is a mutual fund. If Bizportal says it isn't one, the Yahoo
+      path runs as before, since 7-digit TASE stocks/ETFs live there.
+    - If Bizportal is unreachable or its page can't be parsed, there's no
+      way to know whether the number is a fund or a stock/ETF, so Yahoo is
+      still tried. Only if that ALSO fails is an error raised, carrying
+      both failures so a real fund's error doesn't read as "not found".
+    """
+    fund_number = _extract_mutual_fund_number(symbol)
+    if fund_number is None:
+        return _fetch_ticker_snapshot_with_fallback(symbol)
+
+    try:
+        return _fetch_mutual_fund_snapshot_via_bizportal(fund_number)
+    except NotAMutualFundError as not_a_fund:
+        print(f"[mutual-fund] {not_a_fund} Falling back to Yahoo for '{symbol}'.")
+        return _fetch_ticker_snapshot_with_fallback(symbol)
+    except UnsupportedFundCurrencyError:
+        raise
+    except Exception as bizportal_error:  # noqa: BLE001 - network/parse failures; fund-vs-stock is unknown
+        print(f"[mutual-fund] Bizportal failed for '{fund_number}' ({bizportal_error}); trying Yahoo for '{symbol}'.")
+        try:
+            return _fetch_ticker_snapshot_with_fallback(symbol)
+        except Exception as yahoo_error:  # noqa: BLE001 - combined into one explicit error below
+            raise MutualFundSourceUnavailableError(
+                f"Bizportal (mutual funds) failed: {bizportal_error}; Yahoo also failed: {yahoo_error}"
+            ) from yahoo_error
+
+
 def fetch_anomaly_news(
     ticker_symbol: str, closes: list[float], threshold: float = ANOMALY_THRESHOLD_DEFAULT
 ) -> str | None:
@@ -1577,13 +1807,19 @@ def get_stock(
         # that came back truncated (too few closes for SMA200) used to be
         # accepted as final here. That whole orchestration — including the
         # extended-window last resort — is now centralized there instead.
+        #
+        # ISRAELI MUTUAL FUNDS: _fetch_ticker_snapshot routes a 7-digit
+        # ".TA" ticker to Bizportal first (Yahoo doesn't list mutual funds)
+        # and every other ticker straight to the Yahoo orchestration above.
         try:
-            snapshot = _fetch_ticker_snapshot_with_fallback(symbol)
+            snapshot = _fetch_ticker_snapshot(symbol)
         except TickerNotFoundError as not_found_error:
             raise HTTPException(
                 status_code=404,
                 detail=f"No market data found for ticker '{symbol}'.",
             ) from not_found_error
+        except UnsupportedFundCurrencyError as currency_error:
+            raise HTTPException(status_code=422, detail=str(currency_error)) from currency_error
         except Exception as fetch_error:  # noqa: BLE001 - network/parse errors from every data source tried
             # Every data source/window failed outright: return a clean,
             # formatted JSON error instead of letting an unhandled
@@ -1591,10 +1827,7 @@ def get_stock(
             # (Render) itself.
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Failed to fetch data for ticker '{symbol}' from yfinance, the direct chart API "
-                    f"fallback, and the extended-window retry: {fetch_error}"
-                ),
+                detail=f"Failed to fetch data for ticker '{symbol}' from every available data source: {fetch_error}",
             ) from fetch_error
 
         _set_cached_ticker_snapshot(symbol, snapshot)
