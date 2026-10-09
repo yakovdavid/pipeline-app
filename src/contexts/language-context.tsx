@@ -68,6 +68,10 @@ export type TranslationKey =
   // Background/foreground sync-failure banner (AppState/hydration safety —
   // see PortfolioScreen/AmbushRadarScreen's syncWarning state)
   | 'syncFailedWarning'
+  // Ambush Radar section headers (grouped by Macro Trend)
+  | 'ambushSectionBullish'
+  | 'ambushSectionBearish'
+  | 'ambushSectionInsufficient'
   // Loading states
   | 'loadingPortfolio'
   | 'loadingAmbush'
@@ -196,6 +200,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     setBrokerPriceAlertAt: 'הגדר התראת מחיר בברוקר ב: {{price}}',
     copied: 'הועתק!',
     syncFailedWarning: '⚠ לא ניתן היה להסתנכרן עם השרת — מוצגים הנתונים האחרונים שנשמרו.',
+    ambushSectionBullish: 'מגמה עולה (הזדמנויות פעילות)',
+    ambushSectionBearish: 'מגמה יורדת (מבוטל)',
+    ambushSectionInsufficient: 'אין מספיק נתונים',
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
     noPositionsYet: 'אין עדיין פוזיציות.',
@@ -311,6 +318,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     setBrokerPriceAlertAt: 'Set Broker Price Alert at: {{price}}',
     copied: 'Copied!',
     syncFailedWarning: "⚠ Couldn't sync with the server — showing your last saved data.",
+    ambushSectionBullish: 'Bullish (Active Setups)',
+    ambushSectionBearish: 'Bearish (Invalidated)',
+    ambushSectionInsufficient: 'Insufficient Data',
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
     noPositionsYet: 'No positions yet.',

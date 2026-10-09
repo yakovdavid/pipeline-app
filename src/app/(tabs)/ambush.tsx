@@ -5,12 +5,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   RefreshControl,
+  SectionList,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
+  type SectionListData,
+  type SectionListRenderItem,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -22,16 +24,50 @@ import { assetTypeLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
-import { usePipelineLanguage, type Language } from '@/contexts/language-context';
+import { usePipelineLanguage, type Language, type TranslationKey } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import { fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
+import { AMBUSH_GROUP_ORDER, groupAmbushAssets, type AmbushGroupKey } from '@/utils/ambush-grouping';
 import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
 import { normalizeTickerInput } from '@/utils/ticker';
+
+// Per-section data SectionList carries alongside each section's `data`
+// rows: which group it is, its translated header title, and its accent
+// color.
+type AmbushSectionInfo = {
+  key: AmbushGroupKey;
+  title: string;
+  accentColor: string;
+};
+
+type AmbushSection = SectionListData<Stock, AmbushSectionInfo>;
+
+const AMBUSH_SECTION_TITLE_KEY: Record<AmbushGroupKey, TranslationKey> = {
+  bullish: 'ambushSectionBullish',
+  bearish: 'ambushSectionBearish',
+  insufficient: 'ambushSectionInsufficient',
+};
+
+function ambushSectionAccentColor(colors: PipelineColorScheme, key: AmbushGroupKey): string {
+  switch (key) {
+    case 'bullish':
+      return colors.bullish;
+    case 'bearish':
+      return colors.bearish;
+    case 'insufficient':
+    default:
+      return colors.textSecondary;
+  }
+}
+
+function extractAmbushItemKey(item: Stock): string {
+  return item.ticker;
+}
 
 const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
   { ticker: 'AAPL', assetType: 'Stock' },
@@ -374,9 +410,39 @@ export default function AmbushRadarScreen() {
     [setStocksTrusted],
   );
 
-  const renderStockCard = useCallback(
-    ({ item }: { item: Stock }) => <StockCard stock={item} onDelete={handleDeleteTicker} />,
+  const renderStockCard = useCallback<SectionListRenderItem<Stock, AmbushSectionInfo>>(
+    ({ item }) => <StockCard stock={item} onDelete={handleDeleteTicker} />,
     [handleDeleteTicker],
+  );
+
+  // MACRO TREND GROUPING: Bullish (sorted by pullback depth — see
+  // groupAmbushAssets), Bearish, then Insufficient Data. Empty groups are
+  // left out entirely, so an all-Bullish watchlist doesn't show two
+  // headers with nothing under them. Re-derived only when the watchlist,
+  // theme, or language changes; the stock objects themselves are passed
+  // through untouched, so StockCard's memo() still skips unchanged rows.
+  const sections = useMemo<AmbushSection[]>(() => {
+    const groups = groupAmbushAssets(stocks);
+    return AMBUSH_GROUP_ORDER.filter((key) => groups[key].length > 0).map((key) => ({
+      key,
+      title: t(AMBUSH_SECTION_TITLE_KEY[key]),
+      accentColor: ambushSectionAccentColor(colors, key),
+      data: groups[key],
+    }));
+  }, [stocks, colors, t]);
+
+  const renderSectionHeader = useCallback(
+    ({ section }: { section: AmbushSection }) => (
+      <View style={styles.sectionHeader}>
+        <View style={[styles.sectionHeaderAccent, { backgroundColor: section.accentColor }]} />
+        {/* Translated title first, count second: the same bidi-safe
+            word-first order Portfolio's section titles use. */}
+        <Text style={[styles.sectionHeaderTitle, { color: section.accentColor }]}>
+          {section.title} · {section.data.length}
+        </Text>
+      </View>
+    ),
+    [styles],
   );
 
   const handleCopyAmbushData = async () => {
@@ -468,10 +534,16 @@ export default function AmbushRadarScreen() {
       ) : (
         <View style={styles.listWrapper}>
           <PullToRefreshLogo isRefreshing={refreshing} />
-          <FlatList
-            data={stocks}
-            keyExtractor={(item) => item.ticker}
+          <SectionList<Stock, AmbushSectionInfo>
+            sections={sections}
+            keyExtractor={extractAmbushItemKey}
             renderItem={renderStockCard}
+            renderSectionHeader={renderSectionHeader}
+            // Sticky on both platforms (Android defaults to off): the
+            // header stays pinned while its group scrolls under it. Its
+            // opaque background (see sectionHeader) keeps cards from
+            // showing through.
+            stickySectionHeadersEnabled
             initialNumToRender={10}
             windowSize={5}
             contentContainerStyle={styles.listContent}
@@ -631,6 +703,33 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     },
     listContent: {
       paddingBottom: 24,
+    },
+    // MACRO TREND SECTION HEADER: a thin accent bar plus the section title in
+    // the same accent color (bullish/bearish/textSecondary). The opaque
+    // `background` fill matters because headers are sticky: cards scroll
+    // underneath, and a transparent header would let them show through.
+    // Horizontal padding matches StockCard's own 16px side margin, so the
+    // header lines up with the cards under it. The row flips for Hebrew so
+    // the accent bar always sits at the start of the reading direction.
+    sectionHeader: {
+      flexDirection: isHebrew ? 'row-reverse' : 'row',
+      alignItems: 'center',
+      gap: 8,
+      backgroundColor: colors.background,
+      paddingHorizontal: 16,
+      paddingTop: 12,
+      paddingBottom: 8,
+    },
+    sectionHeaderAccent: {
+      width: 4,
+      height: 16,
+      borderRadius: 2,
+    },
+    sectionHeaderTitle: {
+      fontSize: 15,
+      fontWeight: '700',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     initializingContainer: {
       flex: 1,
