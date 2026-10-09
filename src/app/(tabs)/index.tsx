@@ -37,6 +37,7 @@ import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { SATELLITE_TS_PCT } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
+import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import {
   fetchInChunks,
   fetchIntel,
@@ -251,6 +252,50 @@ function buildSectionTitle(
 // Quality positions.
 export default function PortfolioScreen() {
   const [stocks, setStocks] = useState<PortfolioStock[]>([]);
+  // CACHE INTEGRITY (AppState/hydration safety): the persistence effect
+  // below (which mirrors `stocks` into AsyncStorage) used to gate purely
+  // on `!isInitializing` — but `isInitializing` flips to false on EVERY
+  // exit path out of the initial load, including the "storage read
+  // failed" and "every live-quote fetch failed" bail-outs, which
+  // deliberately leave `stocks` untouched at its initial `[]`. The old
+  // gate couldn't tell "we loaded nothing because there's genuinely
+  // nothing saved" apart from "we loaded nothing because the fetch/read
+  // just failed" — and in that second case, the persistence effect would
+  // still fire once isInitializing went false, writing that empty `[]`
+  // straight over the real portfolio still sitting untouched in
+  // AsyncStorage. THIS was the actual data-loss bug (observed on Android:
+  // backgrounding the app mid-load lets the OS fail/suspend the in-flight
+  // fetch, which used to permanently wipe the saved portfolio on disk,
+  // not just the on-screen list).
+  //
+  // canPersistRef is the fix: it starts false and is flipped true ONLY by
+  // setStocksTrusted below, which every call site that has genuinely
+  // trustworthy data (a successful load/refresh, or a deliberate user
+  // edit) already uses instead of calling setStocks directly. A failed
+  // load that bails out without calling setStocksTrusted at all leaves
+  // this false, so the persistence effect keeps refusing to write —
+  // AsyncStorage is never overwritten with an empty array just because a
+  // fetch failed or was interrupted. A plain ref (not state) is
+  // deliberate: flipping it must never itself trigger a re-render/extra
+  // effect pass — it only needs to be read inside the SAME effect that
+  // `stocks`/`isInitializing` already re-run.
+  const canPersistRef = useRef(false);
+
+  const setStocksTrusted = useCallback(
+    (update: PortfolioStock[] | ((previous: PortfolioStock[]) => PortfolioStock[])) => {
+      canPersistRef.current = true;
+      setStocks(update);
+    },
+    [],
+  );
+
+  // STATE PROTECTION: a subtle, non-blocking banner (never a blocking
+  // Alert/modal) shown when a background/foreground resync or the initial
+  // load couldn't reach the server — the existing on-screen data (or, on
+  // a cold start that never even got that far, an empty list) stays
+  // exactly as it was; this is purely informational. Cleared the moment
+  // any subsequent load/refresh actually succeeds.
+  const [syncWarning, setSyncWarning] = useState(false);
   const [ticker, setTicker] = useState('');
   const [units, setUnits] = useState('1');
   // AUTO-CALIBRATION FOR BROKEN PRICES: optional — see handleAddTicker for
@@ -378,164 +423,346 @@ export default function PortfolioScreen() {
     }
   }, [isIntelModalVisible, intelSheetHeight]);
 
-  // Load the saved portfolio on mount: read the ticker/category pairs from
-  // AsyncStorage, then fetch a fresh live price for each from the Python API.
+  // Tracks whether this screen is still mounted — read (not just set) from
+  // loadPortfolioData below, which can now be invoked long after mount
+  // (from the AppState foreground hook), not only from the one-time mount
+  // effect that originally owned this flag.
+  const isMountedRef = useRef(true);
   useEffect(() => {
-    let isMounted = true;
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
-    async function loadInitialStocks() {
-      // Hydration hardening: a storage read/parse failure must NOT be
-      // treated the same as "the user has no saved positions" — the old
-      // code's `catch { entries = [] }` did exactly that, which then flowed
-      // straight into setStocks([]) and, via the persistence effect below,
-      // permanently overwrote real portfolio data in storage with an empty
-      // array on a mere transient AsyncStorage/JSON error.
-      let entries: PortfolioTickerEntry[];
-      try {
-        const stored = await AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY);
-        const parsed = stored ? (JSON.parse(stored) as Partial<PortfolioTickerEntry>[]) : [];
-        if (!Array.isArray(parsed)) {
-          throw new Error('Stored portfolio data is not an array.');
-        }
-        // Entries saved before "units", "assetType", "highestWatermark",
-        // "calibrationFactor", "roic", or "internalTargetPct" existed
-        // won't have valid values; backfill them rather than letting
-        // totals/trailing-stop math break on undefined/NaN.
-        // calibrationFactor is left undefined (not coerced to 1.0) for old
-        // entries so calibrateQuote's DEFAULT_CALIBRATION_FACTOR fast path
-        // still applies.
-        entries = parsed.map((entry) => ({
-          ticker: entry.ticker ?? '',
-          category: entry.category ?? 'Core',
-          units: typeof entry.units === 'number' && entry.units > 0 ? entry.units : 1,
-          assetType: entry.assetType === 'ETF' ? 'ETF' : 'Stock',
-          highestWatermark:
-            typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
-          calibrationFactor:
-            typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
-              ? entry.calibrationFactor
-              : undefined,
-          // QUALITY Z-SCORE MODULE: entries saved before this feature
-          // existed won't have a roic at all; backfill to null (never
-          // evaluated as "no ROIC entered") rather than 0 (which would
-          // read as a genuinely terrible ROIC).
-          roic: typeof entry.roic === 'number' ? entry.roic : null,
-          // CORE LAYER INTERNAL ALLOCATION: same backfill reasoning as
-          // roic above — null means "no internal target defined", not 0%.
-          internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
-        }));
-      } catch (error) {
-        console.error(
-          '[hydration] Failed to read the Portfolio from storage; retaining the previous ' +
-            'state instead of overwriting it with an empty portfolio.',
-          error,
+  // Loads the saved portfolio: reads the ticker/category pairs from
+  // AsyncStorage, then fetches a fresh live price for each from the Python
+  // API. Used both on mount AND re-triggered from the AppState foreground
+  // hook below (useAppForegroundRefresh) whenever the initial load never
+  // actually got real data into `stocks` (canPersistRef.current is still
+  // false) — e.g. the app was backgrounded mid-load on Android and the OS
+  // suspended/failed the in-flight fetch. A plain useCallback (not inlined
+  // in a useEffect) specifically so it has that second call site.
+  const loadPortfolioData = useCallback(async () => {
+    // Hydration hardening: a storage read/parse failure must NOT be
+    // treated the same as "the user has no saved positions" — the old
+    // code's `catch { entries = [] }` did exactly that, which then flowed
+    // straight into setStocks([]) and, via the persistence effect below,
+    // permanently overwrote real portfolio data in storage with an empty
+    // array on a mere transient AsyncStorage/JSON error.
+    let entries: PortfolioTickerEntry[];
+    try {
+      const stored = await AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY);
+      const parsed = stored ? (JSON.parse(stored) as Partial<PortfolioTickerEntry>[]) : [];
+      if (!Array.isArray(parsed)) {
+        throw new Error('Stored portfolio data is not an array.');
+      }
+      // Entries saved before "units", "assetType", "highestWatermark",
+      // "calibrationFactor", "roic", or "internalTargetPct" existed
+      // won't have valid values; backfill them rather than letting
+      // totals/trailing-stop math break on undefined/NaN.
+      // calibrationFactor is left undefined (not coerced to 1.0) for old
+      // entries so calibrateQuote's DEFAULT_CALIBRATION_FACTOR fast path
+      // still applies.
+      entries = parsed.map((entry) => ({
+        ticker: entry.ticker ?? '',
+        category: entry.category ?? 'Core',
+        units: typeof entry.units === 'number' && entry.units > 0 ? entry.units : 1,
+        assetType: entry.assetType === 'ETF' ? 'ETF' : 'Stock',
+        highestWatermark:
+          typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
+        calibrationFactor:
+          typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
+            ? entry.calibrationFactor
+            : undefined,
+        // QUALITY Z-SCORE MODULE: entries saved before this feature
+        // existed won't have a roic at all; backfill to null (never
+        // evaluated as "no ROIC entered") rather than 0 (which would
+        // read as a genuinely terrible ROIC).
+        roic: typeof entry.roic === 'number' ? entry.roic : null,
+        // CORE LAYER INTERNAL ALLOCATION: same backfill reasoning as
+        // roic above — null means "no internal target defined", not 0%.
+        internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
+      }));
+    } catch (error) {
+      console.error(
+        '[hydration] Failed to read the Portfolio from storage; retaining the previous ' +
+          'state instead of overwriting it with an empty portfolio.',
+        error,
+      );
+      // CACHE INTEGRITY: deliberately NOT setStocksTrusted — canPersistRef
+      // stays false, so the persistence effect below keeps refusing to
+      // write until a load actually succeeds. STATE PROTECTION: a subtle
+      // banner, never a cleared list.
+      if (isMountedRef.current) {
+        setSyncWarning(true);
+        setIsInitializing(false);
+      }
+      return;
+    }
+
+    if (entries.length === 0) {
+      // A genuinely empty, successfully-read portfolio (the user deleted
+      // every position) is valid state, not a failure — show it as-is,
+      // and this IS trustworthy enough to persist (storage was read
+      // successfully; it was just empty).
+      if (isMountedRef.current) {
+        setStocksTrusted([]);
+        setSyncWarning(false);
+        setIsInitializing(false);
+      }
+      return;
+    }
+
+    // CONCURRENCY LIMITING: fetched in small batches (not one giant
+    // Promise.allSettled over the whole portfolio at once) to avoid
+    // overwhelming the network with N simultaneous connections — this
+    // still awaits the full queue before moving on, so isInitializing
+    // below only flips to false once every batch has resolved.
+    const results = await fetchInChunks(entries, (entry) =>
+      // QUALITY Z-SCORE MODULE: roic is already known from the persisted
+      // entry at this point (unlike qualityWeightPct, which needs every
+      // position's price already loaded — see onRefresh for where that
+      // gets threaded through instead), so it's sent from the very first
+      // fetch. highWaterMark is intentionally omitted here: this is each
+      // position's FIRST fetch of the session, so there's nothing yet to
+      // compare against beyond what computeHighestWatermark below already
+      // does client-side.
+      fetchStockData(entry.ticker, entry.category, { roic: entry.roic }),
+    );
+
+    const loadedStocks: PortfolioStock[] = [];
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        const entry = entries[index];
+        // AUTO-CALIBRATION FOR BROKEN PRICES: apply this position's
+        // persisted correction (see @/utils/calibration) to the freshly
+        // fetched raw quote before it ever reaches state — every
+        // downstream consumer (this row, layer/portfolio totals,
+        // trailing stop, drawdown review) then just uses stock.price/
+        // localPrice/high52 normally, with no calibration awareness of
+        // its own needed.
+        const calibratedQuote = calibrateQuote(
+          result.value,
+          entry.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
         );
-        if (isMounted) {
-          setIsInitializing(false);
-        }
+        loadedStocks.push({
+          ...entry,
+          price: calibratedQuote.price,
+          localPrice: calibratedQuote.localPrice,
+          currencySymbol: calibratedQuote.currencySymbol,
+          anomalyReport: calibratedQuote.anomalyReport,
+          high52: calibratedQuote.high52,
+          drawdownPct: calibratedQuote.drawdownPct,
+          // Add SMA Visuals to Portfolio / Dashboard Trend Display:
+          // previously Ambush-Radar-only fields — see PortfolioStock's
+          // own field comments.
+          sma50: calibratedQuote.sma50,
+          sma200: calibratedQuote.sma200,
+          macroTrend: calibratedQuote.macroTrend,
+          tacticalMomentum: calibratedQuote.tacticalMomentum,
+          // Pullback Depth Indicator / Quality Z-Score Module: backend-
+          // computed, live/ephemeral like every other field above.
+          pullbackDepth: calibratedQuote.pullbackDepth,
+          qualityZScore: calibratedQuote.qualityZScore,
+          qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
+          highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
+        });
+      }
+    });
+
+    if (loadedStocks.length === 0) {
+      // Every single live-quote fetch failed — almost certainly a network
+      // outage, an OS-suspended background fetch, or similar — not "these
+      // positions don't exist". The storage read above succeeded and
+      // returned real entries, so replacing them with an empty list here
+      // would trigger the exact data-loss bug being fixed: canPersistRef
+      // stays false (no setStocksTrusted call), so the persistence effect
+      // below keeps refusing to overwrite AsyncStorage's real, untouched
+      // data with this empty in-memory list.
+      console.error(
+        `[hydration] All ${entries.length} position fetch(es) failed (network issue, or the ` +
+          'app was backgrounded mid-fetch); retaining the previous portfolio instead of clearing it.',
+      );
+      if (isMountedRef.current) {
+        setSyncWarning(true);
+        setIsInitializing(false);
+      }
+      return;
+    }
+
+    if (isMountedRef.current) {
+      setStocksTrusted(loadedStocks);
+      setSyncWarning(false);
+      setIsInitializing(false);
+    }
+  }, [setStocksTrusted]);
+
+  // Load the saved portfolio on mount.
+  useEffect(() => {
+    loadPortfolioData();
+  }, [loadPortfolioData]);
+
+  // Declared here (ABOVE the useAppForegroundRefresh call below, which
+  // reads it) rather than down near the other handleXxx functions where
+  // it used to live — a function used by a hook call must be declared
+  // before that call lexically, or React's own compiler/lint rules flag
+  // it as "accessed before declared," even though the actual runtime
+  // behavior is identical either way (the hook only ever invokes this
+  // asynchronously, long after the whole component body has finished
+  // executing for that render).
+  const onRefresh = async () => {
+    setRefreshing(true);
+    try {
+      // Refreshes from the live `stocks` array (not just a plain ticker
+      // string list) so each request can carry that position's own
+      // category — see fetchStockData's `category` param — for the
+      // Satellite/Quality-keyed Mean Reversion threshold, same as every
+      // other fetch site below.
+      const stocksToRefresh = stocks;
+
+      if (stocksToRefresh.length === 0) {
+        // Nothing to refresh — either a genuinely empty portfolio, or the
+        // initial load never got real data in (see loadPortfolioData's
+        // own canPersistRef comment). Either way, mapping an empty array
+        // is a pure no-op, so skip it entirely rather than calling
+        // setStocksTrusted with an empty result: that would wrongly mark
+        // canPersistRef as trustworthy and let the persistence effect
+        // below write this still-empty `[]` over whatever real data is
+        // (or isn't) actually sitting in AsyncStorage.
         return;
       }
-
-      if (entries.length === 0) {
-        // A genuinely empty, successfully-read portfolio (the user deleted
-        // every position) is valid state, not a failure — show it as-is.
-        if (isMounted) {
-          setStocks([]);
-          setIsInitializing(false);
-        }
-        return;
-      }
-
-      // CONCURRENCY LIMITING: fetched in small batches (not one giant
-      // Promise.allSettled over the whole portfolio at once) to avoid
-      // overwhelming the network with N simultaneous connections — this
-      // still awaits the full queue before moving on, so isInitializing
-      // below only flips to false once every batch has resolved.
-      const results = await fetchInChunks(entries, (entry) =>
-        // QUALITY Z-SCORE MODULE: roic is already known from the persisted
-        // entry at this point (unlike qualityWeightPct, which needs every
-        // position's price already loaded — see onRefresh for where that
-        // gets threaded through instead), so it's sent from the very first
-        // fetch. highWaterMark is intentionally omitted here: this is each
-        // position's FIRST fetch of the session, so there's nothing yet to
-        // compare against beyond what computeHighestWatermark below already
-        // does client-side.
-        fetchStockData(entry.ticker, entry.category, { roic: entry.roic }),
+      // QUALITY Z-SCORE MODULE: the Quality layer's weight from the
+      // portfolio composition just BEFORE this refresh (same
+      // computeLayerWeightPct/getEffectiveUnits math the render body uses
+      // for its own qualityWeightPct below) — the closest approximation
+      // available without a circular fetch-then-recompute-then-refetch
+      // dance. Every non-Quality stock simply omits qualityWeightPct
+      // entirely (see StockDataOptions), same as it omits roic gating that
+      // doesn't apply to it.
+      const previousTotalPortfolioValue = stocksToRefresh.reduce(
+        (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
+        0,
+      );
+      const previousQualityWeightPct = computeLayerWeightPct(
+        stocksToRefresh.filter((stock) => stock.category === 'Quality'),
+        previousTotalPortfolioValue,
+      );
+      // CONCURRENCY LIMITING: see loadInitialStocks above — small batches,
+      // not one Promise.allSettled over the whole list.
+      const results = await fetchInChunks(stocksToRefresh, (stock) =>
+        fetchStockData(stock.ticker, stock.category, {
+          roic: stock.roic,
+          qualityWeightPct: stock.category === 'Quality' ? previousQualityWeightPct : undefined,
+        }),
       );
 
-      const loadedStocks: PortfolioStock[] = [];
+      const freshQuotes = new Map<string, StockQuote>();
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
-          const entry = entries[index];
-          // AUTO-CALIBRATION FOR BROKEN PRICES: apply this position's
-          // persisted correction (see @/utils/calibration) to the freshly
-          // fetched raw quote before it ever reaches state — every
-          // downstream consumer (this row, layer/portfolio totals,
-          // trailing stop, drawdown review) then just uses stock.price/
-          // localPrice/high52 normally, with no calibration awareness of
-          // its own needed.
+          freshQuotes.set(stocksToRefresh[index].ticker, result.value);
+        }
+      });
+
+      // STATE PROTECTION: every single refresh attempt failed (network
+      // outage, or the app got backgrounded mid-refresh and the OS
+      // suspended the request) — every position below falls through to
+      // `return stock` unchanged, so nothing is lost, but the user should
+      // still see a subtle signal that this refresh didn't actually reach
+      // the server. A PARTIAL failure (some tickers refreshed, others
+      // didn't) is treated as success — that's normal, everyday flakiness
+      // for one ticker, not a sync-wide problem worth surfacing.
+      if (freshQuotes.size === 0) {
+        console.error(
+          '[sync] All position refresh(es) failed (network issue, or the app was backgrounded ' +
+            'mid-refresh); retaining the current portfolio instead of clearing it.',
+        );
+        setSyncWarning(true);
+        return;
+      }
+      setSyncWarning(false);
+
+      setStocksTrusted((prevStocks) =>
+        prevStocks.map((stock) => {
+          const freshQuote = freshQuotes.get(stock.ticker);
+          if (!freshQuote) {
+            return stock;
+          }
+          // AUTO-CALIBRATION FOR BROKEN PRICES: re-apply this position's
+          // persisted correction to the fresh raw quote — same as
+          // loadInitialStocks above, so a pull-to-refresh can never
+          // silently un-calibrate a position back to Yahoo's raw price.
           const calibratedQuote = calibrateQuote(
-            result.value,
-            entry.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
+            freshQuote,
+            stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
           );
-          loadedStocks.push({
-            ...entry,
+          return {
+            ...stock,
             price: calibratedQuote.price,
             localPrice: calibratedQuote.localPrice,
             currencySymbol: calibratedQuote.currencySymbol,
             anomalyReport: calibratedQuote.anomalyReport,
             high52: calibratedQuote.high52,
             drawdownPct: calibratedQuote.drawdownPct,
-            // Add SMA Visuals to Portfolio / Dashboard Trend Display:
-            // previously Ambush-Radar-only fields — see PortfolioStock's
-            // own field comments.
             sma50: calibratedQuote.sma50,
             sma200: calibratedQuote.sma200,
             macroTrend: calibratedQuote.macroTrend,
             tacticalMomentum: calibratedQuote.tacticalMomentum,
-            // Pullback Depth Indicator / Quality Z-Score Module: backend-
-            // computed, live/ephemeral like every other field above.
             pullbackDepth: calibratedQuote.pullbackDepth,
             qualityZScore: calibratedQuote.qualityZScore,
             qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
-            highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
-          });
-        }
-      });
-
-      if (loadedStocks.length === 0) {
-        // Every single live-quote fetch failed — almost certainly a
-        // network outage, not "these positions don't exist". The storage
-        // read above succeeded and returned real entries, so replacing
-        // them with an empty list here would trigger the exact data-loss
-        // bug being fixed via the persistence effect below.
-        console.error(
-          `[hydration] All ${entries.length} position fetch(es) failed (network issue?); ` +
-            'retaining the previous portfolio instead of clearing it.',
-        );
-        if (isMounted) {
-          setIsInitializing(false);
-        }
-        return;
-      }
-
-      if (isMounted) {
-        setStocks(loadedStocks);
-        setIsInitializing(false);
-      }
+            highestWatermark: computeHighestWatermark(stock.highestWatermark, calibratedQuote.price),
+          };
+        }),
+      );
+    } finally {
+      setRefreshing(false);
     }
+  };
 
-    loadInitialStocks();
+  // ANDROID BACKGROUND/FOREGROUND DATA HYDRATION FIX (requirement #2): once
+  // the app returns to the foreground after being backgrounded, re-sync
+  // with the server rather than silently trusting whatever (possibly
+  // nothing, if the initial load got interrupted) is currently on screen.
+  // Two different recoveries, depending on how far the app actually got:
+  //   - canPersistRef.current is false: the initial load never landed real
+  //     data (it was still in flight, or failed outright, when backgrounded
+  //     — see loadPortfolioData's own comments) — re-run the FULL load,
+  //     since a lightweight refresh would have nothing in `stocks` to
+  //     refresh in the first place.
+  //   - canPersistRef.current is true: there's already real data on
+  //     screen — a full reload would be wasteful and would flash the
+  //     big "Loading your portfolio..." spinner for no reason, so just
+  //     re-run the same lightweight onRefresh pull-to-refresh already uses
+  //     to re-sync prices for the positions already showing.
+  // Deliberately a plain inline function, NOT wrapped in useCallback:
+  // useAppForegroundRefresh already re-captures whatever function is
+  // passed to it on every single render (see its own "always points at
+  // the LATEST onForeground closure" comment) specifically so its callers
+  // never need to worry about memoizing this or listing onRefresh as a
+  // dependency — onRefresh itself is redefined fresh every render too.
+  useAppForegroundRefresh(() => {
+    if (canPersistRef.current) {
+      onRefresh();
+    } else {
+      loadPortfolioData();
+    }
+  });
 
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  // Keep AsyncStorage in sync with the current portfolio. Skipped while
-  // initializing so we don't overwrite storage before the saved list loads.
+  // CACHE INTEGRITY: keep AsyncStorage in sync with the current portfolio
+  // — but ONLY once there's trustworthy data to sync. Skipped while
+  // initializing so we don't overwrite storage before the saved list
+  // loads, AND skipped whenever canPersistRef is still false — see its
+  // own declaration above for exactly which failure paths that covers
+  // (a storage read failure, or every live-quote fetch failing, both of
+  // which flip isInitializing to false WITHOUT ever putting trustworthy
+  // data into `stocks`). Without this second check, `stocks` sitting at
+  // its untouched initial `[]` would get written straight over the real,
+  // still-intact AsyncStorage data the instant isInitializing goes false
+  // — which is the exact data-loss bug this whole mechanism exists to
+  // prevent.
   useEffect(() => {
-    if (isInitializing) {
+    if (isInitializing || !canPersistRef.current) {
       return;
     }
 
@@ -633,7 +860,7 @@ export default function PortfolioScreen() {
       const calibrationFactor = computeCalibrationFactor(parsedTotalValue, parsedUnits, quote.localPrice);
       const calibratedQuote = calibrateQuote(quote, calibrationFactor);
 
-      setStocks((prevStocks) => [
+      setStocksTrusted((prevStocks) => [
         ...prevStocks,
         {
           ticker: normalizedTicker,
@@ -677,9 +904,12 @@ export default function PortfolioScreen() {
   // PortfolioStockRow to actually skip re-renders — an inline function here
   // would be a new reference on every PortfolioScreen render, which would
   // defeat memo() by changing this prop for every row on every render.
-  const handleDeleteTicker = useCallback((tickerToDelete: string) => {
-    setStocks((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
-  }, []);
+  const handleDeleteTicker = useCallback(
+    (tickerToDelete: string) => {
+      setStocksTrusted((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
+    },
+    [setStocksTrusted],
+  );
 
   const handleSaveEdit = useCallback(
     (
@@ -690,7 +920,7 @@ export default function PortfolioScreen() {
       newRoicInput: string,
       newInternalTargetInput: string,
     ) => {
-      setStocks((prevStocks) =>
+      setStocksTrusted((prevStocks) =>
         prevStocks.map((stock) => {
           if (stock.ticker !== tickerToUpdate) {
             return stock;
@@ -790,7 +1020,7 @@ export default function PortfolioScreen() {
         }),
       );
     },
-    [],
+    [setStocksTrusted],
   );
 
   const renderPortfolioRow = useCallback(
@@ -809,85 +1039,6 @@ export default function PortfolioScreen() {
     ),
     [handleDeleteTicker, handleSaveEdit, colors, styles, language, t],
   );
-
-  const onRefresh = async () => {
-    setRefreshing(true);
-    try {
-      // Refreshes from the live `stocks` array (not just a plain ticker
-      // string list) so each request can carry that position's own
-      // category — see fetchStockData's `category` param — for the
-      // Satellite/Quality-keyed Mean Reversion threshold, same as every
-      // other fetch site below.
-      const stocksToRefresh = stocks;
-      // QUALITY Z-SCORE MODULE: the Quality layer's weight from the
-      // portfolio composition just BEFORE this refresh (same
-      // computeLayerWeightPct/getEffectiveUnits math the render body uses
-      // for its own qualityWeightPct below) — the closest approximation
-      // available without a circular fetch-then-recompute-then-refetch
-      // dance. Every non-Quality stock simply omits qualityWeightPct
-      // entirely (see StockDataOptions), same as it omits roic gating that
-      // doesn't apply to it.
-      const previousTotalPortfolioValue = stocksToRefresh.reduce(
-        (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
-        0,
-      );
-      const previousQualityWeightPct = computeLayerWeightPct(
-        stocksToRefresh.filter((stock) => stock.category === 'Quality'),
-        previousTotalPortfolioValue,
-      );
-      // CONCURRENCY LIMITING: see loadInitialStocks above — small batches,
-      // not one Promise.allSettled over the whole list.
-      const results = await fetchInChunks(stocksToRefresh, (stock) =>
-        fetchStockData(stock.ticker, stock.category, {
-          roic: stock.roic,
-          qualityWeightPct: stock.category === 'Quality' ? previousQualityWeightPct : undefined,
-        }),
-      );
-
-      const freshQuotes = new Map<string, StockQuote>();
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          freshQuotes.set(stocksToRefresh[index].ticker, result.value);
-        }
-      });
-
-      setStocks((prevStocks) =>
-        prevStocks.map((stock) => {
-          const freshQuote = freshQuotes.get(stock.ticker);
-          if (!freshQuote) {
-            return stock;
-          }
-          // AUTO-CALIBRATION FOR BROKEN PRICES: re-apply this position's
-          // persisted correction to the fresh raw quote — same as
-          // loadInitialStocks above, so a pull-to-refresh can never
-          // silently un-calibrate a position back to Yahoo's raw price.
-          const calibratedQuote = calibrateQuote(
-            freshQuote,
-            stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
-          );
-          return {
-            ...stock,
-            price: calibratedQuote.price,
-            localPrice: calibratedQuote.localPrice,
-            currencySymbol: calibratedQuote.currencySymbol,
-            anomalyReport: calibratedQuote.anomalyReport,
-            high52: calibratedQuote.high52,
-            drawdownPct: calibratedQuote.drawdownPct,
-            sma50: calibratedQuote.sma50,
-            sma200: calibratedQuote.sma200,
-            macroTrend: calibratedQuote.macroTrend,
-            tacticalMomentum: calibratedQuote.tacticalMomentum,
-            pullbackDepth: calibratedQuote.pullbackDepth,
-            qualityZScore: calibratedQuote.qualityZScore,
-            qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
-            highestWatermark: computeHighestWatermark(stock.highestWatermark, calibratedQuote.price),
-          };
-        }),
-      );
-    } finally {
-      setRefreshing(false);
-    }
-  };
 
   const handleCopyPortfolioData = async () => {
     const timestamp = new Date().toLocaleString();
@@ -1029,11 +1180,13 @@ export default function PortfolioScreen() {
           `[hydration] Backup restored to storage, but all ${payload.portfolio.length} ` +
             'live price fetch(es) failed; retaining the previously displayed portfolio.',
         );
+        setSyncWarning(true);
         Alert.alert(t('backupRestoredTitle'), t('backupRestoredPricesFailedMessage'));
         return;
       }
 
-      setStocks(hydratedStocks);
+      setStocksTrusted(hydratedStocks);
+      setSyncWarning(false);
       Alert.alert(t('backupRestoredTitle'), t('backupRestoredMessage'));
     } catch (error) {
       const message = error instanceof Error ? error.message : t('backupRestoreFailedMessage');
@@ -1240,6 +1393,20 @@ export default function PortfolioScreen() {
           </TouchableOpacity>
         ))}
       </ScrollView>
+
+      {/* STATE PROTECTION: a subtle, non-blocking banner — never a
+          cleared list, never a blocking Alert — shown whenever the most
+          recent sync attempt (initial load, pull-to-refresh, or an
+          AppState-triggered background resync) couldn't actually reach
+          the server. Whatever was already on screen (or, on a cold start
+          that never got that far, an empty list) is left exactly as-is;
+          this is purely informational, and disappears the moment any
+          later sync actually succeeds. */}
+      {syncWarning && (
+        <View style={styles.syncWarningBanner}>
+          <Text style={styles.syncWarningBannerText}>{t('syncFailedWarning')}</Text>
+        </View>
+      )}
 
       {isInitializing ? (
         <View style={styles.initializingContainer}>
@@ -2598,6 +2765,26 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   filterRow: {
     paddingHorizontal: 16,
     gap: 8,
+  },
+  // STATE PROTECTION: a subtle, screen-level warning banner — same
+  // warning/warningText color tokens as StockCard.tsx's own per-card
+  // structural-stop banner, for visual consistency, but normal (not
+  // negative) margins since this one sits at the screen level, not nested
+  // inside a card.
+  syncWarningBanner: {
+    backgroundColor: colors.warning,
+    marginHorizontal: 16,
+    marginTop: 10,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  syncWarningBannerText: {
+    color: colors.warningText,
+    fontSize: 12,
+    fontWeight: '700',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   filterButton: {
     backgroundColor: colors.cardBackground,

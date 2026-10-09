@@ -65,6 +65,9 @@ export type TranslationKey =
   | 'protectionStopPrice'
   | 'setBrokerPriceAlertAt'
   | 'copied'
+  // Background/foreground sync-failure banner (AppState/hydration safety —
+  // see PortfolioScreen/AmbushRadarScreen's syncWarning state)
+  | 'syncFailedWarning'
   // Loading states
   | 'loadingPortfolio'
   | 'loadingAmbush'
@@ -192,6 +195,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     protectionStopPrice: 'מחיר עצירה',
     setBrokerPriceAlertAt: 'הגדר התראת מחיר בברוקר ב: {{price}}',
     copied: 'הועתק!',
+    syncFailedWarning: '⚠ לא ניתן היה להסתנכרן עם השרת — מוצגים הנתונים האחרונים שנשמרו.',
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
     noPositionsYet: 'אין עדיין פוזיציות.',
@@ -306,6 +310,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     protectionStopPrice: 'Stop Price',
     setBrokerPriceAlertAt: 'Set Broker Price Alert at: {{price}}',
     copied: 'Copied!',
+    syncFailedWarning: "⚠ Couldn't sync with the server — showing your last saved data.",
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
     noPositionsYet: 'No positions yet.',

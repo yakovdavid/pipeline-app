@@ -24,6 +24,7 @@ import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
+import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import { fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
@@ -49,6 +50,34 @@ export default function AmbushRadarScreen() {
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
   const [stocks, setStocks] = useState<Stock[]>([]);
+  // CACHE INTEGRITY (AppState/hydration safety): see the identical
+  // canPersistRef in PortfolioScreen (index.tsx) for the full rationale —
+  // the short version is that the persistence effect below used to gate
+  // purely on `!isInitializing`, which flips to false on every exit path
+  // out of loadAmbushData, including the two bail-outs that deliberately
+  // leave `stocks` untouched. That let a failed/interrupted load (e.g.
+  // the OS suspending an in-flight fetch while this app was backgrounded
+  // on Android) permanently overwrite the real, still-intact
+  // AsyncStorage watchlist with an empty array the instant isInitializing
+  // went false. canPersistRef starts false and is flipped true ONLY by
+  // setStocksTrusted, which every call site with genuinely trustworthy
+  // data already uses instead of calling setStocks directly.
+  const canPersistRef = useRef(false);
+
+  const setStocksTrusted = useCallback(
+    (update: Stock[] | ((previous: Stock[]) => Stock[])) => {
+      canPersistRef.current = true;
+      setStocks(update);
+    },
+    [],
+  );
+
+  // STATE PROTECTION: a subtle, non-blocking banner (never a blocking
+  // Alert/modal) shown when a load/refresh/background resync couldn't
+  // reach the server — the existing on-screen watchlist (or, on a cold
+  // start that never even got that far, an empty list) stays exactly as
+  // it was. Cleared the moment any subsequent load/refresh succeeds.
+  const [syncWarning, setSyncWarning] = useState(false);
   const [ticker, setTicker] = useState('');
   const [selectedAssetType, setSelectedAssetType] = useState<AssetType>('Stock');
   const [isAdding, setIsAdding] = useState(false);
@@ -60,6 +89,99 @@ export default function AmbushRadarScreen() {
   // render while the price stays inside the warning zone.
   const notifiedTickersRef = useRef<Set<string>>(new Set());
 
+  // Loads the saved watchlist: reads it from AsyncStorage, then fetches a
+  // fresh live quote for each ticker. Used both by the focus effect below
+  // (every tab focus, including the initial mount) AND by the AppState
+  // foreground hook further down (whenever the load never actually landed
+  // real data — see that hook's own comment). `isStillRelevant` lets each
+  // caller supply its own cancellation check: the focus effect needs
+  // "still the same focus session" (its own per-focus `isActive` flag,
+  // since this screen never unmounts on blur); the AppState hook just
+  // needs "still mounted at all".
+  const loadAmbushData = useCallback(
+    async (isStillRelevant: () => boolean) => {
+      // Hydration hardening: a storage read/parse failure is NOT the
+      // same thing as "the user has no saved tickers" — those must be
+      // told apart. Falling back to DEFAULT_ENTRIES here (as this code
+      // used to) would silently overwrite a real watchlist with
+      // AAPL/TSLA on a mere transient AsyncStorage hiccup, and this can
+      // re-run on every tab focus (not just app startup), so that could
+      // happen repeatedly during normal use.
+      let entries: AmbushTickerEntry[];
+      try {
+        entries = (await loadAmbushTickerEntries()) ?? DEFAULT_ENTRIES;
+      } catch (error) {
+        console.error(
+          '[hydration] Failed to read the Ambush watchlist from storage; retaining the ' +
+            'previous state instead of falling back to defaults.',
+          error,
+        );
+        // CACHE INTEGRITY: deliberately NOT setStocksTrusted — canPersistRef
+        // stays false, so the persistence effect below keeps refusing to
+        // write until a load actually succeeds.
+        if (isStillRelevant()) {
+          setSyncWarning(true);
+          setIsInitializing(false);
+        }
+        return;
+      }
+
+      if (entries.length === 0) {
+        // A genuinely empty, successfully-read list (the user deleted
+        // every ticker) is valid state, not a failure — show it as-is,
+        // and this IS trustworthy enough to persist.
+        if (isStillRelevant()) {
+          setStocksTrusted([]);
+          setSyncWarning(false);
+          setIsInitializing(false);
+        }
+        return;
+      }
+
+      // CONCURRENCY LIMITING: fetched in small batches (not one giant
+      // Promise.allSettled over the whole watchlist at once) to avoid
+      // overwhelming the network with N simultaneous connections — this
+      // still awaits the full queue before moving on, so isInitializing
+      // below only flips to false once every batch has resolved.
+      const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
+
+      const loadedStocks: Stock[] = [];
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          loadedStocks.push({ ...entries[index], ...result.value });
+        }
+      });
+
+      if (loadedStocks.length === 0) {
+        // Every single live-quote fetch failed — almost certainly a
+        // network outage, an OS-suspended background fetch, or similar —
+        // not "these tickers don't exist". The storage read above
+        // succeeded and returned real tickers, so replacing them with an
+        // empty list here would trigger the exact data-loss bug being
+        // fixed: canPersistRef stays false (no setStocksTrusted call), so
+        // the persistence effect below keeps refusing to overwrite
+        // AsyncStorage's real, untouched data with this empty in-memory
+        // list.
+        console.error(
+          `[hydration] All ${entries.length} ticker fetch(es) failed (network issue, or the app ` +
+            'was backgrounded mid-fetch); retaining the previous watchlist instead of clearing it.',
+        );
+        if (isStillRelevant()) {
+          setSyncWarning(true);
+          setIsInitializing(false);
+        }
+        return;
+      }
+
+      if (isStillRelevant()) {
+        setStocksTrusted(loadedStocks);
+        setSyncWarning(false);
+        setIsInitializing(false);
+      }
+    },
+    [setStocksTrusted],
+  );
+
   // Load the saved watchlist every time this tab gains focus (including the
   // initial mount) — not just once on mount — so a backup restored from the
   // Portfolio tab's Import menu (a separate mounted screen this one has no
@@ -68,89 +190,120 @@ export default function AmbushRadarScreen() {
   useFocusEffect(
     useCallback(() => {
       let isActive = true;
-
-      async function loadStocks() {
-        // Hydration hardening: a storage read/parse failure is NOT the
-        // same thing as "the user has no saved tickers" — those must be
-        // told apart. Falling back to DEFAULT_ENTRIES here (as this code
-        // used to) would silently overwrite a real watchlist with
-        // AAPL/TSLA on a mere transient AsyncStorage hiccup, and this
-        // effect re-runs on every tab focus (not just app startup), so
-        // that could happen repeatedly during normal use.
-        let entries: AmbushTickerEntry[];
-        try {
-          entries = (await loadAmbushTickerEntries()) ?? DEFAULT_ENTRIES;
-        } catch (error) {
-          console.error(
-            '[hydration] Failed to read the Ambush watchlist from storage; retaining the ' +
-              'previous state instead of falling back to defaults.',
-            error,
-          );
-          if (isActive) {
-            setIsInitializing(false);
-          }
-          return;
-        }
-
-        if (entries.length === 0) {
-          // A genuinely empty, successfully-read list (the user deleted
-          // every ticker) is valid state, not a failure — show it as-is.
-          if (isActive) {
-            setStocks([]);
-            setIsInitializing(false);
-          }
-          return;
-        }
-
-        // CONCURRENCY LIMITING: fetched in small batches (not one giant
-        // Promise.allSettled over the whole watchlist at once) to avoid
-        // overwhelming the network with N simultaneous connections — this
-        // still awaits the full queue before moving on, so isInitializing
-        // below only flips to false once every batch has resolved.
-        const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
-
-        const loadedStocks: Stock[] = [];
-        results.forEach((result, index) => {
-          if (result.status === 'fulfilled') {
-            loadedStocks.push({ ...entries[index], ...result.value });
-          }
-        });
-
-        if (loadedStocks.length === 0) {
-          // Every single live-quote fetch failed — almost certainly a
-          // network outage, not "these tickers don't exist". The storage
-          // read above succeeded and returned real tickers, so silently
-          // replacing them with an empty list here would be exactly the
-          // data-loss bug being fixed: the persistence effect below would
-          // then immediately overwrite the real saved watchlist with [].
-          console.error(
-            `[hydration] All ${entries.length} ticker fetch(es) failed (network issue?); ` +
-              'retaining the previous watchlist instead of clearing it.',
-          );
-          if (isActive) {
-            setIsInitializing(false);
-          }
-          return;
-        }
-
-        if (isActive) {
-          setStocks(loadedStocks);
-          setIsInitializing(false);
-        }
-      }
-
-      loadStocks();
-
+      loadAmbushData(() => isActive);
       return () => {
         isActive = false;
       };
-    }, []),
+    }, [loadAmbushData]),
   );
 
-  // Keep AsyncStorage in sync with the current watchlist. Skipped while
-  // initializing so we don't overwrite storage before the saved list loads.
+  // Tracks whether this screen is still mounted — read from the AppState
+  // foreground hook below, which (unlike the focus effect above) isn't
+  // itself tied to a per-focus cancellation session: an OS-level
+  // background/foreground cycle doesn't blur/refocus this tab.
+  const isMountedRef = useRef(true);
   useEffect(() => {
-    if (isInitializing) {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Declared here (ABOVE the useAppForegroundRefresh call below, which
+  // reads it) rather than down near handleCopyAmbushData where it used to
+  // live — a function used by a hook call must be declared before that
+  // call lexically, or React's own compiler/lint rules flag it as
+  // "accessed before declared," even though the actual runtime behavior
+  // is identical either way (the hook only ever invokes this
+  // asynchronously, long after the whole component body has finished
+  // executing for that render).
+  const onRefresh = async () => {
+    setRefreshing(true);
+    try {
+      const tickersToRefresh = stocks.map((stock) => stock.ticker);
+
+      if (tickersToRefresh.length === 0) {
+        // Nothing to refresh — either a genuinely empty watchlist, or the
+        // initial load never got real data in. Skip entirely rather than
+        // calling setStocksTrusted with a no-op empty result, which would
+        // wrongly mark canPersistRef as trustworthy and let the
+        // persistence effect below write this still-empty `[]` over
+        // whatever real data is (or isn't) actually sitting in
+        // AsyncStorage.
+        return;
+      }
+
+      // CONCURRENCY LIMITING: see loadAmbushData above — small batches,
+      // not one Promise.allSettled over the whole list. Parameter
+      // deliberately not named `t` here (unlike elsewhere in this file)
+      // to avoid shadowing the translation function from
+      // usePipelineLanguage.
+      const results = await fetchInChunks(tickersToRefresh, (tickerSymbol) => fetchStockData(tickerSymbol));
+
+      // Map successful results back by ticker (rather than by index) so a
+      // concurrent add/delete during the fetch can't misalign the data.
+      const freshQuotes = new Map<string, StockQuote>();
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          freshQuotes.set(tickersToRefresh[index], result.value);
+        }
+      });
+
+      // STATE PROTECTION: every single refresh attempt failed (network
+      // outage, or the app got backgrounded mid-refresh and the OS
+      // suspended the request) — every position below falls through to
+      // `return stock` unchanged, so nothing is lost, but the user should
+      // still see a subtle signal that this refresh didn't actually reach
+      // the server. A PARTIAL failure is treated as success — normal,
+      // everyday flakiness for one ticker, not a sync-wide problem.
+      if (freshQuotes.size === 0) {
+        console.error(
+          '[sync] All ticker refresh(es) failed (network issue, or the app was backgrounded ' +
+            'mid-refresh); retaining the current watchlist instead of clearing it.',
+        );
+        setSyncWarning(true);
+        return;
+      }
+      setSyncWarning(false);
+
+      setStocksTrusted((prevStocks) =>
+        prevStocks.map((stock) => {
+          const freshQuote = freshQuotes.get(stock.ticker);
+          return freshQuote ? { ...stock, ...freshQuote } : stock;
+        }),
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // ANDROID BACKGROUND/FOREGROUND DATA HYDRATION FIX (requirement #2): once
+  // the app returns to the foreground after being backgrounded, re-sync
+  // with the server. Same two-tier recovery as PortfolioScreen
+  // (index.tsx): re-run the FULL load if it never actually landed real
+  // data (canPersistRef.current still false — the load was still in
+  // flight, or failed outright, when backgrounded), otherwise just a
+  // lightweight pull-to-refresh-equivalent resync of the tickers already
+  // on screen.
+  //
+  // Deliberately a plain inline function, NOT wrapped in useCallback: see
+  // useAppForegroundRefresh's own comment — it always re-captures whatever
+  // function is passed to it on every render, so callers never need to
+  // memoize this.
+  useAppForegroundRefresh(() => {
+    if (canPersistRef.current) {
+      onRefresh();
+    } else {
+      loadAmbushData(() => isMountedRef.current);
+    }
+  });
+
+  // CACHE INTEGRITY: keep AsyncStorage in sync with the current watchlist
+  // — but ONLY once there's trustworthy data to sync. Skipped while
+  // initializing, AND skipped whenever canPersistRef is still false — see
+  // its own declaration above for exactly which failure paths that covers.
+  useEffect(() => {
+    if (isInitializing || !canPersistRef.current) {
       return;
     }
 
@@ -197,7 +350,7 @@ export default function AmbushRadarScreen() {
     setIsAdding(true);
     try {
       const quote = await fetchStockData(normalizedTicker);
-      setStocks((prevStocks) => [
+      setStocksTrusted((prevStocks) => [
         ...prevStocks,
         { ticker: normalizedTicker, assetType: selectedAssetType, ...quote },
       ]);
@@ -214,44 +367,17 @@ export default function AmbushRadarScreen() {
   // StockCard to actually skip re-renders — an inline function here would
   // be a new reference on every AmbushRadarScreen render, which would
   // defeat memo() by changing this prop for every row on every render.
-  const handleDeleteTicker = useCallback((tickerToDelete: string) => {
-    setStocks((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
-  }, []);
+  const handleDeleteTicker = useCallback(
+    (tickerToDelete: string) => {
+      setStocksTrusted((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
+    },
+    [setStocksTrusted],
+  );
 
   const renderStockCard = useCallback(
     ({ item }: { item: Stock }) => <StockCard stock={item} onDelete={handleDeleteTicker} />,
     [handleDeleteTicker],
   );
-
-  const onRefresh = async () => {
-    setRefreshing(true);
-    try {
-      const tickersToRefresh = stocks.map((stock) => stock.ticker);
-      // CONCURRENCY LIMITING: see loadStocks above — small batches, not one
-      // Promise.allSettled over the whole list. Parameter deliberately not
-      // named `t` here (unlike elsewhere in this file) to avoid shadowing
-      // the translation function from usePipelineLanguage.
-      const results = await fetchInChunks(tickersToRefresh, (tickerSymbol) => fetchStockData(tickerSymbol));
-
-      // Map successful results back by ticker (rather than by index) so a
-      // concurrent add/delete during the fetch can't misalign the data.
-      const freshQuotes = new Map<string, StockQuote>();
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          freshQuotes.set(tickersToRefresh[index], result.value);
-        }
-      });
-
-      setStocks((prevStocks) =>
-        prevStocks.map((stock) => {
-          const freshQuote = freshQuotes.get(stock.ticker);
-          return freshQuote ? { ...stock, ...freshQuote } : stock;
-        }),
-      );
-    } finally {
-      setRefreshing(false);
-    }
-  };
 
   const handleCopyAmbushData = async () => {
     const timestamp = new Date().toLocaleString();
@@ -321,6 +447,18 @@ export default function AmbushRadarScreen() {
           )}
         </TouchableOpacity>
       </View>
+
+      {/* STATE PROTECTION: a subtle, non-blocking banner — never a
+          cleared list, never a blocking Alert — shown whenever the most
+          recent sync attempt (initial load, pull-to-refresh, or an
+          AppState-triggered background resync) couldn't actually reach
+          the server. Whatever was already on screen is left exactly
+          as-is; this disappears the moment any later sync succeeds. */}
+      {syncWarning && (
+        <View style={styles.syncWarningBanner}>
+          <Text style={styles.syncWarningBannerText}>{t('syncFailedWarning')}</Text>
+        </View>
+      )}
 
       {isInitializing ? (
         <View style={styles.initializingContainer}>
@@ -426,6 +564,26 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       marginBottom: 8,
       gap: 8,
       zIndex: 10,
+    },
+    // STATE PROTECTION: same warning/warningText color tokens as
+    // StockCard.tsx's own per-card structural-stop banner, for visual
+    // consistency, but normal (not negative) margins since this one sits
+    // at the screen level, not nested inside a card — matches
+    // PortfolioScreen's identical syncWarningBanner in index.tsx.
+    syncWarningBanner: {
+      backgroundColor: colors.warning,
+      marginHorizontal: 16,
+      marginBottom: 12,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+    },
+    syncWarningBannerText: {
+      color: colors.warningText,
+      fontSize: 12,
+      fontWeight: '700',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     assetTypeRow: {
       flexDirection: 'row',
