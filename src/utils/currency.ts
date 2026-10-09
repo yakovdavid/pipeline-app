@@ -17,6 +17,16 @@ export function isTaseTicker(ticker: string): boolean {
   return ticker.trim().toUpperCase().endsWith(TASE_TICKER_SUFFIX);
 }
 
+// ISRAELI MUTUAL FUNDS: a 7-digit paper number, bare ("5122510") or
+// ".TA"-suffixed ("5122510.TA", the form normalizeTickerInput stores).
+// Mirrors backend/main.py's MUTUAL_FUND_TICKER_PATTERN, which routes these
+// tickers to Bizportal because Yahoo doesn't list Israeli mutual funds.
+const MUTUAL_FUND_TICKER_PATTERN = /^\d{7}(\.TA)?$/;
+
+export function isIsraeliMutualFundTicker(ticker: string): boolean {
+  return MUTUAL_FUND_TICKER_PATTERN.test(ticker.trim().toUpperCase());
+}
+
 // TASE ETF MATH FIX: a held quantity of a TASE (".TA") ETF/mutual fund is
 // reported in Nominal Value — e.g. "1433 units" held actually represents
 // 1433 / 100 = 14.33 real pricing units of the fund. Ordinary TASE STOCKS
@@ -24,10 +34,23 @@ export function isTaseTicker(ticker: string): boolean {
 // fund/bond-market convention, not an equity one), and non-TASE tickers
 // don't either, so this only fires for the ".TA" + 'ETF' combination.
 //
+// MUTUAL FUND EXCEPTION: Israeli mutual fund holdings (7-digit tickers —
+// see isIsraeliMutualFundTicker) are real unit counts, never Nominal
+// Value, so they are always valued 1:1 (units × unit price), even when the
+// position was saved with assetType 'ETF'. Without this, a fund saved as
+// 'ETF' was valued 100x too low. Caveat: TASE ETFs also have 7-digit paper
+// numbers and DO need the ÷100. Yahoo doesn't resolve numeric TASE codes,
+// so such an ETF can't currently be added by number; if numeric ETF
+// support is ever added, this check must tell funds and ETFs apart (e.g.
+// from a backend flag) instead of relying on digit count alone.
+//
 // Used ONLY for value math (position totals, layer/portfolio allocation
 // sums) — the raw `units` the user actually entered/holds is still what's
 // displayed in the quantity row itself; see PortfolioStockRow in index.tsx.
 export function getEffectiveUnits(ticker: string, assetType: AssetType, units: number): number {
+  if (isIsraeliMutualFundTicker(ticker)) {
+    return units;
+  }
   if (assetType === 'ETF' && isTaseTicker(ticker)) {
     return units / NOMINAL_VALUE_UNITS_PER_PRICING_UNIT;
   }
