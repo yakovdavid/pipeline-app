@@ -68,7 +68,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, TypeVar
+from typing import Callable, Literal, TypeVar
 from urllib.parse import urlparse
 
 import requests as _plain_requests
@@ -1989,6 +1989,68 @@ def get_stock(
     final_result = _with_request_scoped_fields(result, normalized_category, high_water_mark, roic, quality_weight_pct)
     _sync_high_water_mark_to_supabase(symbol, final_result["high_water_mark"], roic)
     return final_result
+
+
+LIQUIDATE_PORTFOLIO_ASSET_RPC = "liquidate_portfolio_asset"
+
+
+@app.delete("/api/portfolio/{ticker}")
+def liquidate_portfolio_asset(
+    ticker: str,
+    # portfolio_assets has no asset-type column, so the caller supplies it
+    # for the ambush_radar row. FastAPI rejects anything other than these
+    # two values with a 422 before this function runs.
+    asset_type: Literal["Stock", "ETF"] = "Stock",
+) -> dict[str, str | bool | None]:
+    """CLOSED-LOOP WATCHLIST: fully liquidates one portfolio position and,
+    if it belonged to the Satellite or Quality layer, moves its ticker to
+    the Ambush Radar for re-entry monitoring.
+
+    The check, the insert, and the delete all happen inside one Postgres
+    function (liquidate_portfolio_asset, see backend/sql/
+    003_ambush_radar_liquidation.sql), so they commit or roll back
+    together: a failed radar insert can never leave the position deleted
+    but untracked. A ticker that's already on the radar is not an error;
+    the response reports it as already_tracked.
+
+    Responses:
+      200 with {"ticker", "layer", "moved_to_ambush", "already_tracked"}
+      404 if the ticker isn't in the portfolio
+      503 if Supabase isn't configured (the case today, see
+          _supabase_client), so callers can tell "not set up" apart from
+          a real failure
+      502 if the database call itself fails
+    """
+    symbol = _normalize_ticker_symbol(ticker)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Ticker symbol is required.")
+
+    if _supabase_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Portfolio persistence is not configured (SUPABASE_URL/SUPABASE_SERVICE_KEY unset).",
+        )
+
+    try:
+        response = _supabase_client.rpc(
+            LIQUIDATE_PORTFOLIO_ASSET_RPC, {"p_ticker": symbol, "p_asset_type": asset_type}
+        ).execute()
+    except Exception as error:  # noqa: BLE001 - PostgREST/network errors all surface as one clean 502
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to liquidate '{symbol}': {error}",
+        ) from error
+
+    result = response.data
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=404, detail=f"Ticker '{symbol}' is not in the portfolio.")
+
+    return {
+        "ticker": str(result.get("ticker", symbol)),
+        "layer": result.get("layer"),
+        "moved_to_ambush": bool(result.get("moved_to_ambush")),
+        "already_tracked": bool(result.get("already_tracked")),
+    }
 
 
 @app.get("/api/search/{query}")

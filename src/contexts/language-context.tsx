@@ -72,6 +72,18 @@ export type TranslationKey =
   | 'ambushSectionBullish'
   | 'ambushSectionBearish'
   | 'ambushSectionInsufficient'
+  // Closed-loop watchlist: Satellite/Quality liquidation feedback toast
+  | 'liquidatedMovedToAmbush'
+  | 'liquidatedAlreadyOnAmbush'
+  | 'liquidatedAmbushFailed'
+  // Unavailable-price fallback (a fetch failed; the position is kept)
+  | 'priceUnavailable'
+  | 'priceFetchFailedHint'
+  // Liquidation confirmation dialog
+  | 'liquidateConfirmTitle'
+  | 'liquidateConfirmMessage'
+  | 'yesLiquidate'
+  | 'cancel'
   // Loading states
   | 'loadingPortfolio'
   | 'loadingAmbush'
@@ -203,6 +215,15 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     ambushSectionBullish: 'מגמה עולה (הזדמנויות פעילות)',
     ambushSectionBearish: 'מגמה יורדת (מבוטל)',
     ambushSectionInsufficient: 'אין מספיק נתונים',
+    liquidatedMovedToAmbush: '{{ticker}} מומש והועבר למכ״ם המארבים',
+    liquidatedAlreadyOnAmbush: '{{ticker}} מומש — כבר נמצא במכ״ם המארבים',
+    liquidatedAmbushFailed: '{{ticker}} מומש, אך לא ניתן היה להוסיף אותו למכ״ם המארבים',
+    priceUnavailable: 'המחיר אינו זמין',
+    priceFetchFailedHint: '⚠ שליפת המחיר נכשלה — משוך למטה לניסיון חוזר. נתוני הפוזיציה שמורים.',
+    liquidateConfirmTitle: 'לממש את הפוזיציה?',
+    liquidateConfirmMessage: 'לסגור את הפוזיציה ב-{{ticker}}?',
+    yesLiquidate: 'כן, לממש',
+    cancel: 'ביטול',
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
     noPositionsYet: 'אין עדיין פוזיציות.',
@@ -321,6 +342,15 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     ambushSectionBullish: 'Bullish (Active Setups)',
     ambushSectionBearish: 'Bearish (Invalidated)',
     ambushSectionInsufficient: 'Insufficient Data',
+    liquidatedMovedToAmbush: '{{ticker}} liquidated and moved to Ambush Radar',
+    liquidatedAlreadyOnAmbush: '{{ticker}} liquidated — already on Ambush Radar',
+    liquidatedAmbushFailed: "{{ticker}} liquidated, but couldn't be added to Ambush Radar",
+    priceUnavailable: 'Price unavailable',
+    priceFetchFailedHint: '⚠ Price fetch failed — pull down to retry. Your position data is safe.',
+    liquidateConfirmTitle: 'Liquidate Position?',
+    liquidateConfirmMessage: 'Are you sure you want to close your position in {{ticker}}?',
+    yesLiquidate: 'Yes, Liquidate',
+    cancel: 'Cancel',
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
     noPositionsYet: 'No positions yet.',

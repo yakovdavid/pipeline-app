@@ -39,15 +39,17 @@ import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/l
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import {
+  createUnavailableQuote,
   fetchInChunks,
   fetchIntel,
   fetchStockData,
+  liquidatePortfolioAsset,
   type IntelBatchResponse,
   type StockQuote,
 } from '@/services/api';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
-import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
+import { addTickerToAmbushRadar, loadAmbushTickerEntries, notifyAmbushAddition } from '@/utils/ambush-storage';
 import { createBackupPayload, parseBackupPayload, restoreBackupPayload, type BackupPayload } from '@/utils/backup';
 import {
   applyCalibration,
@@ -63,6 +65,7 @@ import {
   getEffectiveUnits,
 } from '@/utils/currency';
 import { formatAmbushLines, formatPortfolioLines } from '@/utils/report-formatters';
+import { buildPortfolioStock, computeHighestWatermark, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
 import { normalizeTickerInput } from '@/utils/ticker';
 
 type FilterOption = 'All' | PortfolioCategory;
@@ -120,15 +123,45 @@ function extractPortfolioItemKey(item: PortfolioStock): string {
   return item.ticker;
 }
 
-// Tracks the "Highest Watermark" (highest price seen since a position was
-// added) that drives the Satellite trailing-stop trigger price (see
-// SATELLITE_TS_PCT in PortfolioStockRow below). Tracked for every position
-// regardless of category/assetType — category isn't available here, and
-// it's harmless to also track it for Core/Quality positions that never
-// actually use it for a TS calculation.
-function computeHighestWatermark(previousWatermark: number | null, latestPrice: number): number | null {
-  return previousWatermark === null ? latestPrice : Math.max(previousWatermark, latestPrice);
+// CLOSED-LOOP WATCHLIST: only these layers move to the Ambush Radar when
+// liquidated. Core is a long-term holding, not a tactical re-entry
+// candidate.
+const AMBUSH_MIGRATING_CATEGORIES: readonly PortfolioCategory[] = ['Satellite', 'Quality'];
+
+// How long the liquidation toast stays fully visible before fading out.
+const TOAST_DURATION_MS = 2500;
+
+// Builds the Ambush Radar row for a liquidated position from data the
+// Portfolio already has, so a mounted Ambush screen can show it at once
+// without a network fetch that could fail. Price-like fields have this
+// position's calibrationFactor stripped back off (see @/utils/calibration),
+// because the Ambush Radar has no calibration concept and works on the
+// API's raw values, the same ones its own next refresh will return.
+// Ratio fields (drawdownPct, pullbackDepth) and trend labels don't change
+// under calibration, so they're copied as-is.
+function toAmbushStock(stock: PortfolioStock): Stock {
+  const factor = stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR;
+  const strip = (value: number | null): number | null => (value === null ? null : stripCalibration(value, factor));
+  return {
+    ticker: stock.ticker,
+    assetType: stock.assetType,
+    price: stripCalibration(stock.price, factor),
+    localPrice: stripCalibration(stock.localPrice, factor),
+    currencySymbol: stock.currencySymbol,
+    sma50: strip(stock.sma50),
+    sma200: strip(stock.sma200),
+    macroTrend: stock.macroTrend,
+    tacticalMomentum: stock.tacticalMomentum,
+    anomalyReport: stock.anomalyReport,
+    high52: strip(stock.high52),
+    drawdownPct: stock.drawdownPct,
+    pullbackDepth: stock.pullbackDepth,
+    // An 'unavailable' position stays unavailable on the radar, so its
+    // placeholder zeros never render there as a $0.00 price.
+    priceStatus: stock.priceStatus,
+  };
 }
+
 
 // TRAILING STOP DEFENSE CONSTRAINTS: a hardcoded architectural guard, not
 // just a UI convenience gate — this is the ONLY function in the codebase
@@ -531,69 +564,33 @@ export default function PortfolioScreen() {
       fetchStockData(entry.ticker, entry.category, { roic: entry.roic }),
     );
 
-    const loadedStocks: PortfolioStock[] = [];
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        const entry = entries[index];
-        // AUTO-CALIBRATION FOR BROKEN PRICES: apply this position's
-        // persisted correction (see @/utils/calibration) to the freshly
-        // fetched raw quote before it ever reaches state — every
-        // downstream consumer (this row, layer/portfolio totals,
-        // trailing stop, drawdown review) then just uses stock.price/
-        // localPrice/high52 normally, with no calibration awareness of
-        // its own needed.
-        const calibratedQuote = calibrateQuote(
-          result.value,
-          entry.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
-        );
-        loadedStocks.push({
-          ...entry,
-          price: calibratedQuote.price,
-          localPrice: calibratedQuote.localPrice,
-          currencySymbol: calibratedQuote.currencySymbol,
-          anomalyReport: calibratedQuote.anomalyReport,
-          high52: calibratedQuote.high52,
-          drawdownPct: calibratedQuote.drawdownPct,
-          // Add SMA Visuals to Portfolio / Dashboard Trend Display:
-          // previously Ambush-Radar-only fields — see PortfolioStock's
-          // own field comments.
-          sma50: calibratedQuote.sma50,
-          sma200: calibratedQuote.sma200,
-          macroTrend: calibratedQuote.macroTrend,
-          tacticalMomentum: calibratedQuote.tacticalMomentum,
-          // Pullback Depth Indicator / Quality Z-Score Module: backend-
-          // computed, live/ephemeral like every other field above.
-          pullbackDepth: calibratedQuote.pullbackDepth,
-          qualityZScore: calibratedQuote.qualityZScore,
-          qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
-          highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
-        });
-      }
+    // DATA-LOSS FIX: one row per stored entry, ALWAYS, in storage order. A
+    // ticker whose fetch failed (network error, timeout, the OS suspending
+    // the request while backgrounded, a ticker the API can't find) becomes
+    // an 'unavailable' row instead of being dropped. The old code kept only
+    // the fulfilled results, so the persistence effect then saved that
+    // shorter list and permanently deleted every position whose fetch
+    // happened to fail. Because this list now matches storage entry for
+    // entry, it is safe to mark trusted and persist even when EVERY fetch
+    // failed: saving it writes back exactly what was read.
+    const loadedStocks = entries.map((entry, index) => {
+      const result = results[index];
+      return buildPortfolioStock(entry, result.status === 'fulfilled' ? result.value : null);
     });
 
-    if (loadedStocks.length === 0) {
-      // Every single live-quote fetch failed — almost certainly a network
-      // outage, an OS-suspended background fetch, or similar — not "these
-      // positions don't exist". The storage read above succeeded and
-      // returned real entries, so replacing them with an empty list here
-      // would trigger the exact data-loss bug being fixed: canPersistRef
-      // stays false (no setStocksTrusted call), so the persistence effect
-      // below keeps refusing to overwrite AsyncStorage's real, untouched
-      // data with this empty in-memory list.
+    const failedCount = results.filter((result) => result.status === 'rejected').length;
+    if (failedCount > 0) {
       console.error(
-        `[hydration] All ${entries.length} position fetch(es) failed (network issue, or the ` +
-          'app was backgrounded mid-fetch); retaining the previous portfolio instead of clearing it.',
+        `[hydration] ${failedCount} of ${entries.length} position fetch(es) failed; keeping ` +
+          'those positions with an unavailable price instead of dropping them.',
       );
-      if (isMountedRef.current) {
-        setSyncWarning(true);
-        setIsInitializing(false);
-      }
-      return;
     }
 
     if (isMountedRef.current) {
       setStocksTrusted(loadedStocks);
-      setSyncWarning(false);
+      // The screen-level banner is for a sync-wide failure (nothing came
+      // back at all). A partial failure shows on the affected rows only.
+      setSyncWarning(failedCount === entries.length);
       setIsInitializing(false);
     }
   }, [setStocksTrusted]);
@@ -682,37 +679,15 @@ export default function PortfolioScreen() {
       }
       setSyncWarning(false);
 
+      // A ticker whose refresh failed keeps its current row unchanged (last
+      // good price, or still 'unavailable'). A successful one goes through
+      // buildPortfolioStock, which re-applies this position's calibration
+      // and sets priceStatus back to 'live', so a row that failed on load
+      // recovers on the next successful refresh.
       setStocksTrusted((prevStocks) =>
         prevStocks.map((stock) => {
           const freshQuote = freshQuotes.get(stock.ticker);
-          if (!freshQuote) {
-            return stock;
-          }
-          // AUTO-CALIBRATION FOR BROKEN PRICES: re-apply this position's
-          // persisted correction to the fresh raw quote — same as
-          // loadInitialStocks above, so a pull-to-refresh can never
-          // silently un-calibrate a position back to Yahoo's raw price.
-          const calibratedQuote = calibrateQuote(
-            freshQuote,
-            stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
-          );
-          return {
-            ...stock,
-            price: calibratedQuote.price,
-            localPrice: calibratedQuote.localPrice,
-            currencySymbol: calibratedQuote.currencySymbol,
-            anomalyReport: calibratedQuote.anomalyReport,
-            high52: calibratedQuote.high52,
-            drawdownPct: calibratedQuote.drawdownPct,
-            sma50: calibratedQuote.sma50,
-            sma200: calibratedQuote.sma200,
-            macroTrend: calibratedQuote.macroTrend,
-            tacticalMomentum: calibratedQuote.tacticalMomentum,
-            pullbackDepth: calibratedQuote.pullbackDepth,
-            qualityZScore: calibratedQuote.qualityZScore,
-            qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
-            highestWatermark: computeHighestWatermark(stock.highestWatermark, calibratedQuote.price),
-          };
+          return freshQuote ? buildPortfolioStock(stock, freshQuote) : stock;
         }),
       );
     } finally {
@@ -766,38 +741,10 @@ export default function PortfolioScreen() {
       return;
     }
 
-    const entries: PortfolioTickerEntry[] = stocks.map(
-      ({
-        ticker: symbol,
-        category,
-        assetType,
-        units: unitCount,
-        highestWatermark,
-        calibrationFactor,
-        roic,
-        internalTargetPct,
-      }) => ({
-        ticker: symbol,
-        category,
-        assetType,
-        units: unitCount,
-        highestWatermark,
-        // AUTO-CALIBRATION FOR BROKEN PRICES: must be persisted like every
-        // other per-position field — dropping it here would silently
-        // un-calibrate a position (back to Yahoo's raw, possibly wildly
-        // wrong price) the next time the app restarts.
-        calibrationFactor,
-        // QUALITY Z-SCORE MODULE: must be persisted like every other
-        // per-position field — dropping it here would silently wipe out a
-        // user-entered ROIC the next time the app restarts.
-        roic,
-        // CORE LAYER INTERNAL ALLOCATION: must be persisted like every
-        // other per-position field — dropping it here would silently wipe
-        // out a user-defined internal target the next time the app
-        // restarts.
-        internalTargetPct,
-      }),
-    );
+    // Persisted fields only (see toPortfolioTickerEntry). Every row is
+    // included, 'unavailable' ones too, so this list is never shorter than
+    // what was loaded.
+    const entries: PortfolioTickerEntry[] = stocks.map(toPortfolioTickerEntry);
     AsyncStorage.setItem(PORTFOLIO_TICKERS_STORAGE_KEY, JSON.stringify(entries)).catch((error) => {
       console.warn('Failed to save portfolio to storage:', error);
     });
@@ -880,6 +827,8 @@ export default function PortfolioScreen() {
           pullbackDepth: calibratedQuote.pullbackDepth,
           qualityZScore: calibratedQuote.qualityZScore,
           qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
+          // Always 'live': a ticker is only added after its fetch succeeds.
+          priceStatus: calibratedQuote.priceStatus,
           highestWatermark: computeHighestWatermark(null, calibratedQuote.price),
           calibrationFactor,
           roic,
@@ -904,11 +853,105 @@ export default function PortfolioScreen() {
   // PortfolioStockRow to actually skip re-renders — an inline function here
   // would be a new reference on every PortfolioScreen render, which would
   // defeat memo() by changing this prop for every row on every render.
-  const handleDeleteTicker = useCallback(
-    (tickerToDelete: string) => {
-      setStocksTrusted((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
+  // Subtle, non-blocking feedback toast (never an Alert), used for the
+  // liquidation message below. Fades in, stays TOAST_DURATION_MS, fades
+  // out. A new message replaces the current one and restarts the timer.
+  // Starting the fade-in stops any fade-out in progress, so that fade-out's
+  // `finished` is false and it doesn't clear the new message.
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastOpacity] = useState(() => new Animated.Value(0));
+  const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current !== null) {
+        clearTimeout(toastTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const showToast = useCallback(
+    (message: string) => {
+      if (toastTimeoutRef.current !== null) {
+        clearTimeout(toastTimeoutRef.current);
+      }
+      setToastMessage(message);
+      Animated.timing(toastOpacity, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+      toastTimeoutRef.current = setTimeout(() => {
+        toastTimeoutRef.current = null;
+        Animated.timing(toastOpacity, { toValue: 0, duration: 220, useNativeDriver: true }).start(({ finished }) => {
+          if (finished) {
+            setToastMessage(null);
+          }
+        });
+      }, TOAST_DURATION_MS);
     },
-    [setStocksTrusted],
+    [toastOpacity],
+  );
+
+  // CLOSED-LOOP WATCHLIST: deleting a position is a full liquidation.
+  //   1. The row leaves the portfolio immediately, so the UI never waits
+  //      on storage or the network.
+  //   2. The deletion is mirrored to the backend (DELETE /api/portfolio/
+  //      {ticker}) as fire-and-forget. That endpoint answers 503 until a
+  //      database is configured, which is expected and ignored here.
+  //   3. Satellite/Quality positions are added to the on-device Ambush
+  //      Radar list (the actual source of truth today), skipping
+  //      duplicates. A mounted Ambush screen is told directly (see
+  //      notifyAmbushAddition), and a toast confirms the result.
+  // A storage failure in step 3 does NOT undo the deletion: removing the
+  // position is what the user asked for, and the radar entry is a follow-
+  // on. The toast says plainly that the radar step failed.
+  const liquidatePosition = useCallback(
+    (stockToDelete: PortfolioStock) => {
+      const { ticker: deletedTicker, assetType, category } = stockToDelete;
+      setStocksTrusted((prevStocks) => prevStocks.filter((stock) => stock.ticker !== deletedTicker));
+
+      liquidatePortfolioAsset(deletedTicker, assetType).catch(() => {
+        // Expected today (503: no database configured). The on-device
+        // storage below is what the app actually reads.
+      });
+
+      if (!AMBUSH_MIGRATING_CATEGORIES.includes(category)) {
+        return;
+      }
+
+      addTickerToAmbushRadar({ ticker: deletedTicker, assetType })
+        .then((result) => {
+          notifyAmbushAddition(toAmbushStock(stockToDelete));
+          showToast(
+            t(result === 'added' ? 'liquidatedMovedToAmbush' : 'liquidatedAlreadyOnAmbush', {
+              ticker: deletedTicker,
+            }),
+          );
+        })
+        .catch((error) => {
+          console.error(`[ambush] Failed to add liquidated ${deletedTicker} to the Ambush Radar:`, error);
+          showToast(t('liquidatedAmbushFailed', { ticker: deletedTicker }));
+        });
+    },
+    [setStocksTrusted, showToast, t],
+  );
+
+  // DELETE CONFIRMATION: the row's ✕ never deletes directly. Liquidation
+  // removes the position and (for Satellite/Quality) moves it to the Ambush
+  // Radar, so it only runs after a deliberate "Yes, Liquidate". Cancel,
+  // the Android back button, or tapping outside the dialog
+  // (cancelable: true) all leave the position untouched. Stable identity
+  // (useCallback) keeps PortfolioStockRow's memo() effective.
+  const handleDeleteTicker = useCallback(
+    (stockToDelete: PortfolioStock) => {
+      Alert.alert(
+        t('liquidateConfirmTitle'),
+        t('liquidateConfirmMessage', { ticker: stockToDelete.ticker }),
+        [
+          { text: t('cancel'), style: 'cancel' },
+          { text: t('yesLiquidate'), style: 'destructive', onPress: () => liquidatePosition(stockToDelete) },
+        ],
+        { cancelable: true },
+      );
+    },
+    [liquidatePosition, t],
   );
 
   const handleSaveEdit = useCallback(
@@ -931,7 +974,10 @@ export default function PortfolioScreen() {
           // SATELLITE_ETF_TS_PCT), so switching between Stock and ETF no
           // longer resets it: keep whatever was already being tracked, or
           // seed it from the current price if this position never had one.
-          const highestWatermark = stock.highestWatermark ?? stock.price;
+          // DATA-LOSS FIX: an 'unavailable' row's price is only a placeholder
+          // 0, so it never seeds a missing watermark.
+          const highestWatermark =
+            stock.highestWatermark ?? (stock.priceStatus === 'live' ? stock.price : null);
 
           // QUALITY Z-SCORE MODULE: a BLANK ROIC field here PRESERVES this
           // position's existing roic unchanged — same "blank means leave
@@ -964,7 +1010,13 @@ export default function PortfolioScreen() {
           // made earlier. A calibrationFactor is only ever REPLACED when
           // the user explicitly enters a new Total Value.
           const parsedTotalValue = newTotalValueInput.trim() === '' ? null : Number(newTotalValueInput);
+          // DATA-LOSS FIX: recalibrating needs the real fetched price. On
+          // an 'unavailable' row it would compute against the placeholder
+          // 0, reset calibrationFactor to 1.0, and set the watermark to 0,
+          // destroying both. So a Total Value entered while the price is
+          // unavailable is ignored; units/type/roic/target still save.
           if (
+            stock.priceStatus === 'unavailable' ||
             parsedTotalValue === null ||
             !Number.isFinite(parsedTotalValue) ||
             parsedTotalValue <= 0
@@ -1062,11 +1114,11 @@ export default function PortfolioScreen() {
       // CONCURRENCY LIMITING: see loadInitialStocks above.
       const ambushResults = await fetchInChunks(ambushEntries, (entry) => fetchStockData(entry.ticker));
 
-      const ambushStocks: Stock[] = [];
-      ambushResults.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          ambushStocks.push({ ...ambushEntries[index], ...result.value });
-        }
+      // Every watched ticker appears in the export; one whose fetch failed
+      // is listed as price-unavailable rather than silently left out.
+      const ambushStocks: Stock[] = ambushEntries.map((entry, index) => {
+        const result = ambushResults[index];
+        return { ...entry, ...(result.status === 'fulfilled' ? result.value : createUnavailableQuote()) };
       });
 
       const timestamp = new Date().toLocaleString();
@@ -1134,59 +1186,34 @@ export default function PortfolioScreen() {
         fetchStockData(entry.ticker, entry.category, { roic: entry.roic }),
       );
 
-      const hydratedStocks: PortfolioStock[] = [];
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          const entry = payload.portfolio[index];
-          // AUTO-CALIBRATION FOR BROKEN PRICES: apply this entry's
-          // calibrationFactor (round-tripped through the backup JSON by
-          // coercePortfolioEntry — see @/utils/backup) to the freshly
-          // fetched raw quote, same as loadInitialStocks above.
-          const calibratedQuote = calibrateQuote(
-            result.value,
-            entry.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR,
-          );
-          hydratedStocks.push({
-            ...entry,
-            price: calibratedQuote.price,
-            localPrice: calibratedQuote.localPrice,
-            currencySymbol: calibratedQuote.currencySymbol,
-            anomalyReport: calibratedQuote.anomalyReport,
-            high52: calibratedQuote.high52,
-            drawdownPct: calibratedQuote.drawdownPct,
-            sma50: calibratedQuote.sma50,
-            sma200: calibratedQuote.sma200,
-            macroTrend: calibratedQuote.macroTrend,
-            tacticalMomentum: calibratedQuote.tacticalMomentum,
-            pullbackDepth: calibratedQuote.pullbackDepth,
-            qualityZScore: calibratedQuote.qualityZScore,
-            qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
-            highestWatermark: computeHighestWatermark(entry.highestWatermark, calibratedQuote.price),
-          });
-        }
+      // DATA-LOSS FIX: one row per restored entry, ALWAYS; a failed fetch
+      // becomes an 'unavailable' row. The old code kept only fulfilled
+      // results, so a partial failure saved a shorter list over the
+      // just-restored storage. A total failure was worse: it kept showing
+      // the OLD portfolio while storage held the restored one, and the next
+      // save wrote the old list back over the restore. Now the screen
+      // always matches what was just written to storage.
+      const hydratedStocks = payload.portfolio.map((entry, index) => {
+        const result = results[index];
+        return buildPortfolioStock(entry, result.status === 'fulfilled' ? result.value : null);
       });
+      const allFetchesFailed =
+        payload.portfolio.length > 0 && results.every((result) => result.status === 'rejected');
 
       setIsImportModalVisible(false);
       setImportText('');
+      setStocksTrusted(hydratedStocks);
+      setSyncWarning(allFetchesFailed);
 
-      if (hydratedStocks.length === 0 && payload.portfolio.length > 0) {
-        // Hydration hardening applies here too: storage was already
-        // successfully overwritten with the restored data above, but if
-        // every live-price fetch for it just failed (network issue right
-        // after import), don't also blank out whatever was on screen —
-        // that would be the exact same "wipe on failure" bug, just
-        // triggered from the import flow instead of app startup.
+      if (allFetchesFailed) {
         console.error(
-          `[hydration] Backup restored to storage, but all ${payload.portfolio.length} ` +
-            'live price fetch(es) failed; retaining the previously displayed portfolio.',
+          `[hydration] Backup restored, but all ${payload.portfolio.length} live price fetch(es) ` +
+            'failed; showing the restored positions with unavailable prices.',
         );
-        setSyncWarning(true);
         Alert.alert(t('backupRestoredTitle'), t('backupRestoredPricesFailedMessage'));
         return;
       }
 
-      setStocksTrusted(hydratedStocks);
-      setSyncWarning(false);
       Alert.alert(t('backupRestoredTitle'), t('backupRestoredMessage'));
     } catch (error) {
       const message = error instanceof Error ? error.message : t('backupRestoreFailedMessage');
@@ -1446,6 +1473,14 @@ export default function PortfolioScreen() {
             }
           />
         </View>
+      )}
+
+      {/* Liquidation toast (see showToast). pointerEvents="none" so it can
+          never block a tap on the list or the add button underneath. */}
+      {toastMessage !== null && (
+        <Animated.View pointerEvents="none" style={[styles.toast, { opacity: toastOpacity }]}>
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </Animated.View>
       )}
 
       <TouchableOpacity
@@ -1970,7 +2005,10 @@ type PortfolioStockRowProps = {
   // itself lives on PortfolioListSection still, for the section HEADER,
   // which legitimately does want the layer's whole-portfolio share.
   layerTotalValue: number;
-  onDelete: (ticker: string) => void;
+  // Receives the whole position, not just its ticker: the delete handler
+  // needs its category (does it move to the Ambush Radar?) and its quote
+  // data (the Ambush row it hands over).
+  onDelete: (stock: PortfolioStock) => void;
   onSaveEdit: (
     ticker: string,
     units: number,
@@ -2065,7 +2103,16 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // Israeli banks quote unit prices vs. position values differently.
   const agorotSuffix = t('ag');
   const unitPriceDisplay = formatUnitPrice(stock.ticker, stock.localPrice, stock.currencySymbol, agorotSuffix);
-  const totalValueDisplay = formatTotalValue(localTotalValue, stock.currencySymbol);
+
+  // DATA-LOSS FIX: this position's price fetch failed. It stays in the list
+  // (so storage stays complete), but its price fields are placeholders, so
+  // the row shows "N/A" for the total and hides every price-derived signal
+  // below. A placeholder price of 0 would otherwise read as a triggered
+  // trailing stop or a -100% drop.
+  const isPriceUnavailable = stock.priceStatus === 'unavailable';
+  const totalValueDisplay = isPriceUnavailable
+    ? t('notAvailable')
+    : formatTotalValue(localTotalValue, stock.currencySymbol);
 
   // LAYER 1: SATELLITE — Trailing Stop Reversion: a single hard 12% for
   // EVERY Satellite position, Stock or ETF alike (the old ETF-specific 7%
@@ -2169,7 +2216,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             <Text style={styles.categoryBadgeText}>{categoryLabel(t, stock.category)}</Text>
           </View>
           <TouchableOpacity
-            onPress={() => onDelete(stock.ticker)}
+            onPress={() => onDelete(stock)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             accessibilityLabel={`הסר את ${stock.ticker} מהתיק`}>
             <Text style={styles.deleteButtonText}>✕</Text>
@@ -2289,10 +2336,21 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 `stock.units` the user entered/holds (Nominal Value, for a
                 TASE ETF) — only the VALUE math (totalValueDisplay) uses
                 effectiveUnits; see the TASE ETF MATH FIX note above. */}
+            {/* DATA-LOSS FIX: an 'unavailable' row still shows the units
+                actually held (those are real, persisted data), but no
+                "@ price". "Price unavailable" is translated text, so it
+                gets its own language-aligned Text node rather than the
+                LTR-only value style. */}
             <View style={styles.unitsPriceRow}>
               <Text style={styles.stockDetailText}>{formatUnitsLabel(t, stock.units)}</Text>
-              <Text style={styles.stockDetailText}>{t('atPrice')}</Text>
-              <Text style={styles.stockDetailValueText}>{unitPriceDisplay}</Text>
+              {isPriceUnavailable ? (
+                <Text style={styles.priceUnavailableText}>{t('priceUnavailable')}</Text>
+              ) : (
+                <>
+                  <Text style={styles.stockDetailText}>{t('atPrice')}</Text>
+                  <Text style={styles.stockDetailValueText}>{unitPriceDisplay}</Text>
+                </>
+              )}
             </View>
             {/* EDIT ICON HITBOX FIX: this used to be a bare 14px icon with
                 only hitSlop padding the touch target — on a real device
@@ -2328,7 +2386,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           calls for; nothing here is shared across layers any more (no
           MomentumBar/TrendBadges — those stay Ambush-Radar-only, see
           StockCard.tsx). All three blocks are gated on !isEditing, same as
-          the rest of this row's live-data display. */}
+          the rest of this row's live-data display, and on a live price:
+          their inputs are only placeholders while isPriceUnavailable. */}
+
+      {/* DATA-LOSS FIX: shown in place of the layer signals below when this
+          position's price fetch failed. The position itself is safe in
+          storage; pulling to refresh retries the fetch. */}
+      {!isEditing && isPriceUnavailable && (
+        <Text style={styles.priceFetchFailedHint}>{t('priceFetchFailedHint')}</Text>
+      )}
 
       {/* LAYER 1: SATELLITE — SMA200 read-only, grayed out, no color
           coding ("macro-context only" — SMA50 is not shown at all, per the
@@ -2337,7 +2403,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           from THAT watermark (not the 52-week high — see hwmDropPct's own
           comment for why those are different numbers and why this one is
           the one that actually explains the trailing stop's state). */}
-      {!isEditing && stock.category === 'Satellite' && (
+      {!isEditing && !isPriceUnavailable && stock.category === 'Satellite' && (
         <>
           {sma200Display !== null && (
             <Text style={styles.macroContextText}>
@@ -2414,7 +2480,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           no SMA200 at all. Kill Switch Tracker: 52-Week Drawdown + a
           RED "[FUNDAMENTAL AUDIT REQUIRED]" block when triggered, else a
           neutral/green "[HOLD]". */}
-      {!isEditing && stock.category === 'Quality' && stock.drawdownPct !== null && (
+      {!isEditing && !isPriceUnavailable && stock.category === 'Quality' && stock.drawdownPct !== null && (
         <View
           style={[
             styles.killSwitchBlock,
@@ -2447,7 +2513,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           its own comment above). Independent of stock.drawdownPct's
           nullity so it still shows even in the rare case the Kill Switch
           block above doesn't (e.g. a missing 52-week high). */}
-      {!isEditing && stock.category === 'Quality' && stock.qualityZScore !== null && (
+      {!isEditing && !isPriceUnavailable && stock.category === 'Quality' && stock.qualityZScore !== null && (
         <View style={styles.zScoreBlock}>
           <Text style={styles.zScoreText}>
             {t('qualityZScore')}: {stock.qualityZScore.toFixed(2)}
@@ -2475,7 +2541,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           yield/cash-flow placeholder rendered — that data doesn't exist
           anywhere in this app's pipeline yet, and a fabricated placeholder
           would violate "no placeholders" more than simply omitting it. */}
-      {!isEditing && stock.category === 'Core' && (
+      {!isEditing && !isPriceUnavailable && stock.category === 'Core' && (
         <Text style={styles.allocationText}>
           {t('internalAllocation')}: {internalWeightPct.toFixed(1)}%
           {stock.internalTargetPct !== null &&
@@ -2925,6 +2991,23 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fontSize: 13,
     writingDirection: 'ltr',
   },
+  // DATA-LOSS FIX fallbacks for a position whose price fetch failed: the
+  // amber warning color marks the missing price, while the hint stays in
+  // muted secondary text because nothing is wrong with the position itself.
+  priceUnavailableText: {
+    color: colors.warning,
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  priceFetchFailedHint: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginTop: 6,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
   stockTotalValue: {
     // Pure currency value (symbol + number), no Hebrew words — stays LTR.
     color: colors.textPrimary,
@@ -3115,6 +3198,34 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   initializingText: {
     color: colors.textSecondary,
     fontSize: 14,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  // Liquidation toast: a compact card floating above the add button (which
+  // is 56px tall at bottom 24, so 96 clears it), themed with the card
+  // background and primary text so it reads as a calm notice rather than a
+  // warning.
+  toast: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 96,
+    backgroundColor: colors.cardBackground,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: colors.satellite,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+  toastText: {
+    color: colors.textPrimary,
+    fontSize: 13,
+    fontWeight: '600',
     textAlign: isHebrew ? 'right' : 'left',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },

@@ -1,3 +1,4 @@
+import type { PriceStatus } from '@/services/api';
 import type { AssetType, TrendLabel } from '@/types/asset';
 
 export type PortfolioCategory = 'Core' | 'Satellite' | 'Quality';
@@ -100,4 +101,10 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // ever showing this, so a stale/mis-set value from a future bug can't
   // surface an alert on the wrong layer.
   qualityZScoreAlert: boolean;
+  // DATA-LOSS FIX: see StockQuote.priceStatus in @/services/api. An
+  // 'unavailable' position keeps every persisted field (units, watermark,
+  // calibration, roic, ...) exactly as loaded, so saving it writes the same
+  // entry back. Its price fields are placeholders, and PortfolioStockRow
+  // shows a "price unavailable" fallback instead of any signal.
+  priceStatus: PriceStatus;
 };

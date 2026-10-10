@@ -1,4 +1,4 @@
-import type { TrendLabel } from '@/types/asset';
+import type { AssetType, TrendLabel } from '@/types/asset';
 import type { PortfolioCategory } from '@/types/portfolio';
 
 export type StockQuote = {
@@ -57,7 +57,42 @@ export type StockQuote = {
   // request supplied (see fetchStockData's options param below) — always
   // false when those weren't supplied, never a guessed default.
   qualityZScoreAlert: boolean;
+  // DATA-LOSS FIX: 'live' for every quote fetchStockData returns;
+  // 'unavailable' only for the placeholder createUnavailableQuote builds
+  // when a fetch failed. A ticker whose fetch failed stays in the list as
+  // 'unavailable' instead of being dropped, so the list the app saves back
+  // to storage is never shorter than what it loaded. Merging a later
+  // successful quote over a row ({ ...row, ...quote }) flips it back to
+  // 'live' automatically. When 'unavailable', every numeric field below is
+  // a placeholder (0 or null) and must not be shown or used for signals.
+  priceStatus: PriceStatus;
 };
+
+export type PriceStatus = 'live' | 'unavailable';
+
+// Placeholder quote for a ticker whose price fetch failed. price/localPrice
+// are 0 rather than null so totals math stays numeric and an unpriced
+// position simply contributes nothing. Every signal display (trailing
+// stop, protection card, momentum bar, trend badges) checks priceStatus
+// first and never sees these zeros.
+export function createUnavailableQuote(): StockQuote {
+  return {
+    price: 0,
+    localPrice: 0,
+    currencySymbol: '$',
+    sma50: null,
+    sma200: null,
+    macroTrend: null,
+    tacticalMomentum: null,
+    anomalyReport: null,
+    high52: null,
+    drawdownPct: null,
+    pullbackDepth: null,
+    qualityZScore: null,
+    qualityZScoreAlert: false,
+    priceStatus: 'unavailable',
+  };
+}
 
 export type TickerSearchResult = {
   symbol: string;
@@ -233,6 +268,7 @@ export async function fetchStockData(
     pullbackDepth: typeof data.pullback_depth === 'number' ? data.pullback_depth : null,
     qualityZScore: typeof data.quality_z_score === 'number' ? data.quality_z_score : null,
     qualityZScoreAlert: data.quality_z_score_alert === true,
+    priceStatus: 'live',
   };
 }
 
@@ -243,6 +279,41 @@ export async function fetchStockData(
 // null ("can't be evaluated"), never a guessed default.
 function parseTrendLabel(value: string | null | undefined): TrendLabel {
   return value === 'Bullish' || value === 'Bearish' ? value : null;
+}
+
+export type LiquidationResult = {
+  ticker: string;
+  layer: string | null;
+  movedToAmbush: boolean;
+  alreadyTracked: boolean;
+};
+
+// CLOSED-LOOP WATCHLIST: mirrors a portfolio deletion to the backend's
+// database (DELETE /api/portfolio/{ticker} — see backend/main.py), which
+// moves Satellite/Quality tickers into its ambush_radar table. The app's
+// own source of truth is still on-device storage, so callers must treat
+// this as best-effort: today the backend answers 503 (no database
+// configured), and that rejection is expected and harmless.
+export async function liquidatePortfolioAsset(ticker: string, assetType: AssetType): Promise<LiquidationResult> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/portfolio/${encodeURIComponent(ticker.trim())}?asset_type=${encodeURIComponent(assetType)}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok) {
+    throw new Error(`Liquidation sync failed for ${ticker} (HTTP ${response.status}).`);
+  }
+  const data = (await response.json()) as {
+    ticker?: string;
+    layer?: string | null;
+    moved_to_ambush?: boolean;
+    already_tracked?: boolean;
+  };
+  return {
+    ticker: typeof data.ticker === 'string' ? data.ticker : ticker,
+    layer: typeof data.layer === 'string' ? data.layer : null,
+    movedToAmbush: data.moved_to_ambush === true,
+    alreadyTracked: data.already_tracked === true,
+  };
 }
 
 // On-Demand Intel V3.1: latest news for one or more comma-separated

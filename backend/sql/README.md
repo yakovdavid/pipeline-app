@@ -46,3 +46,10 @@ Once a Supabase project exists and you have its connection details:
   See the file's own header for its Quality Z-Score known limitation (the
   score itself stays backend-only; this view only supplies the layer-
   weight half of that feature's alert gate).
+- `003_ambush_radar_liquidation.sql` — run after 002. Creates the
+  `ambush_radar` table (ticker primary key, so re-adding a tracked ticker
+  is a no-op) and the `liquidate_portfolio_asset(ticker, asset_type)`
+  function, which in one transaction moves a Satellite/Quality position's
+  ticker to the radar and deletes the position. Called by `backend/main.py`'s
+  `DELETE /api/portfolio/{ticker}`, which returns 503 until Supabase is
+  configured.

@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import type { Stock } from '@/components/StockCard';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import type { AmbushTickerEntry } from '@/types/ambush';
 
@@ -22,4 +23,46 @@ export async function loadAmbushTickerEntries(): Promise<AmbushTickerEntry[] | n
   }
 
   return normalizeAmbushEntries(JSON.parse(stored) as (string | AmbushTickerEntry)[]);
+}
+
+export type AddToAmbushResult = 'added' | 'alreadyTracked';
+
+// CLOSED-LOOP WATCHLIST: appends one ticker to the persisted Ambush Radar
+// list, skipping it if it's already there (case-insensitive). Read-modify-
+// write on the same storage key the Ambush screen loads from. If the read
+// fails, this throws WITHOUT writing: writing a fresh list on top of an
+// unreadable one could wipe the user's real watchlist. A never-saved list
+// (null) starts as [].
+export async function addTickerToAmbushRadar(entry: AmbushTickerEntry): Promise<AddToAmbushResult> {
+  const existing = (await loadAmbushTickerEntries()) ?? [];
+  const normalizedTicker = entry.ticker.trim().toUpperCase();
+  if (existing.some((tracked) => tracked.ticker.trim().toUpperCase() === normalizedTicker)) {
+    return 'alreadyTracked';
+  }
+  const updated: AmbushTickerEntry[] = [...existing, { ticker: entry.ticker, assetType: entry.assetType }];
+  await AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(updated));
+  return 'added';
+}
+
+// In-memory notification for an already-mounted Ambush Radar screen. Tab
+// screens stay mounted after their first visit, and the Ambush screen
+// mirrors its own in-memory list back into storage whenever that list
+// changes. A ticker written only to storage could therefore be overwritten
+// by that screen's next write before it ever reloads. Subscribers merge
+// the delivered row into their state, so it can't be lost. If the screen
+// has never been mounted, nobody is subscribed and the storage write above
+// is what it loads on first visit.
+type AmbushAdditionListener = (stock: Stock) => void;
+
+const ambushAdditionListeners = new Set<AmbushAdditionListener>();
+
+export function subscribeToAmbushAdditions(listener: AmbushAdditionListener): () => void {
+  ambushAdditionListeners.add(listener);
+  return () => {
+    ambushAdditionListeners.delete(listener);
+  };
+}
+
+export function notifyAmbushAddition(stock: Stock): void {
+  ambushAdditionListeners.forEach((listener) => listener(stock));
 }

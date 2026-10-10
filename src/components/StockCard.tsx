@@ -9,6 +9,7 @@ import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { AssetType, TrendLabel } from '@/types/asset';
+import type { PriceStatus } from '@/services/api';
 import { formatUnitPrice } from '@/utils/currency';
 
 export type Stock = {
@@ -46,6 +47,11 @@ export type Stock = {
   // PULLBACK DEPTH INDICATOR: replaces the old binary Tactical Momentum
   // badge in TrendBadges below — see that component's own comment.
   pullbackDepth: number | null;
+  // DATA-LOSS FIX: see StockQuote.priceStatus in @/services/api. When
+  // 'unavailable' the card shows a "price unavailable" fallback and skips
+  // the price, momentum bar, trend badges, and structural-stop banner,
+  // whose inputs are only placeholders.
+  priceStatus: PriceStatus;
 };
 
 export type StockCardProps = {
@@ -80,10 +86,17 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
     macroTrend,
     tacticalMomentum,
     pullbackDepth,
+    priceStatus,
   } = stock;
 
+  // DATA-LOSS FIX: this ticker's price fetch failed. It stays on the radar
+  // (so storage stays complete), but its price fields are placeholders, so
+  // the card shows "Price unavailable" and skips every price-derived piece:
+  // the structural-stop banner, the momentum bar, and the trend badges.
+  const isPriceUnavailable = priceStatus === 'unavailable';
+
   const isNearStructuralStop =
-    assetType === 'ETF' && sma200 !== null && price <= sma200 * STRUCTURAL_STOP_THRESHOLD;
+    !isPriceUnavailable && assetType === 'ETF' && sma200 !== null && price <= sma200 * STRUCTURAL_STOP_THRESHOLD;
 
   // TASE AGOROT DISPLAY: the current UNIT price — see formatUnitPrice.
   const agorotSuffix = t('ag');
@@ -112,7 +125,11 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
               math — see the Stock type above. TASE AGOROT DISPLAY: for a
               ".TA" ticker this instead reads e.g. "3985 אג'" — see
               formatUnitPrice. Numeric, so left as LTR either way. */}
-          <Text style={styles.price}>{priceDisplay}</Text>
+          {isPriceUnavailable ? (
+            <Text style={styles.priceUnavailable}>{t('priceUnavailable')}</Text>
+          ) : (
+            <Text style={styles.price}>{priceDisplay}</Text>
+          )}
           <TouchableOpacity
             onPress={() => onDelete(ticker)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -125,23 +142,29 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
       {/* Add SMA Visuals to Portfolio: this MomentumBar is the exact same
           shared component PortfolioStockRow (index.tsx) renders — see
           @/components/MomentumBar. */}
-      <View style={styles.bottomRow}>
-        <MomentumBar
-          ticker={ticker}
-          price={price}
-          sma50={sma50}
-          sma200={sma200}
-          localPrice={localPrice}
-          currencySymbol={currencySymbol}
-          tacticalMomentum={tacticalMomentum}
-        />
-      </View>
+      {isPriceUnavailable ? (
+        <Text style={styles.priceFetchFailedHint}>{t('priceFetchFailedHint')}</Text>
+      ) : (
+        <>
+          <View style={styles.bottomRow}>
+            <MomentumBar
+              ticker={ticker}
+              price={price}
+              sma50={sma50}
+              sma200={sma200}
+              localPrice={localPrice}
+              currencySymbol={currencySymbol}
+              tacticalMomentum={tacticalMomentum}
+            />
+          </View>
 
-      {/* Dashboard Trend Display: Macro Trend + Pullback Depth Indicator
-          (replacing the old binary Tactical Momentum badge), replacing the
-          even older single Bullish/Bearish badge — shared component, see
-          @/components/TrendBadges. */}
-      <TrendBadges macroTrend={macroTrend} pullbackDepth={pullbackDepth} />
+          {/* Dashboard Trend Display: Macro Trend + Pullback Depth Indicator
+              (replacing the old binary Tactical Momentum badge), replacing the
+              even older single Bullish/Bearish badge — shared component, see
+              @/components/TrendBadges. */}
+          <TrendBadges macroTrend={macroTrend} pullbackDepth={pullbackDepth} />
+        </>
+      )}
     </View>
   );
 });
@@ -249,6 +272,22 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       fontSize: 18,
       fontWeight: '600',
       writingDirection: 'ltr',
+    },
+    // DATA-LOSS FIX fallbacks (see isPriceUnavailable above). Translated
+    // text, so aligned with the active language, unlike the LTR price.
+    priceUnavailable: {
+      color: colors.warning,
+      fontSize: 14,
+      fontWeight: '600',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
+    },
+    priceFetchFailedHint: {
+      color: colors.textSecondary,
+      fontSize: 12,
+      marginTop: 10,
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     deleteButtonText: {
       color: colors.bearish,

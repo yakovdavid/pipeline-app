@@ -27,11 +27,11 @@ import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language, type TranslationKey } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
-import { fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
+import { createUnavailableQuote, fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import { AMBUSH_GROUP_ORDER, groupAmbushAssets, type AmbushGroupKey } from '@/utils/ambush-grouping';
-import { loadAmbushTickerEntries } from '@/utils/ambush-storage';
+import { loadAmbushTickerEntries, subscribeToAmbushAdditions } from '@/utils/ambush-storage';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
 import { normalizeTickerInput } from '@/utils/ticker';
@@ -181,37 +181,32 @@ export default function AmbushRadarScreen() {
       // below only flips to false once every batch has resolved.
       const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
 
-      const loadedStocks: Stock[] = [];
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          loadedStocks.push({ ...entries[index], ...result.value });
-        }
+      // DATA-LOSS FIX: one row per stored ticker, ALWAYS, in storage order.
+      // A ticker whose fetch failed becomes an 'unavailable' row (see
+      // createUnavailableQuote) instead of being dropped. The old code kept
+      // only the fulfilled results, so the persistence effect then saved
+      // that shorter list and permanently removed every ticker whose fetch
+      // happened to fail. Because this list now matches storage entry for
+      // entry, it is safe to mark trusted and persist even when EVERY fetch
+      // failed: saving it writes back exactly what was read.
+      const loadedStocks: Stock[] = entries.map((entry, index) => {
+        const result = results[index];
+        return { ...entry, ...(result.status === 'fulfilled' ? result.value : createUnavailableQuote()) };
       });
 
-      if (loadedStocks.length === 0) {
-        // Every single live-quote fetch failed — almost certainly a
-        // network outage, an OS-suspended background fetch, or similar —
-        // not "these tickers don't exist". The storage read above
-        // succeeded and returned real tickers, so replacing them with an
-        // empty list here would trigger the exact data-loss bug being
-        // fixed: canPersistRef stays false (no setStocksTrusted call), so
-        // the persistence effect below keeps refusing to overwrite
-        // AsyncStorage's real, untouched data with this empty in-memory
-        // list.
+      const failedCount = results.filter((result) => result.status === 'rejected').length;
+      if (failedCount > 0) {
         console.error(
-          `[hydration] All ${entries.length} ticker fetch(es) failed (network issue, or the app ` +
-            'was backgrounded mid-fetch); retaining the previous watchlist instead of clearing it.',
+          `[hydration] ${failedCount} of ${entries.length} ticker fetch(es) failed; keeping those ` +
+            'tickers with an unavailable price instead of dropping them.',
         );
-        if (isStillRelevant()) {
-          setSyncWarning(true);
-          setIsInitializing(false);
-        }
-        return;
       }
 
       if (isStillRelevant()) {
         setStocksTrusted(loadedStocks);
-        setSyncWarning(false);
+        // Screen-level banner only for a sync-wide failure; a partial
+        // failure shows on the affected cards.
+        setSyncWarning(failedCount === entries.length);
         setIsInitializing(false);
       }
     },
@@ -231,6 +226,34 @@ export default function AmbushRadarScreen() {
         isActive = false;
       };
     }, [loadAmbushData]),
+  );
+
+  // CLOSED-LOOP WATCHLIST: a Satellite/Quality position liquidated on the
+  // Portfolio tab arrives here directly (see notifyAmbushAddition), so it
+  // joins this screen's in-memory list right away. Without this, the
+  // ticker would only be in storage, and this screen's own persistence
+  // effect could overwrite storage with its older list before the next
+  // focus reload picked the ticker up.
+  //
+  // Skipped while canPersistRef is false (this screen's load never got
+  // trustworthy data). Merging into that untrusted list would mark it
+  // trustworthy and let the persistence effect write the near-empty result
+  // over the real watchlist. Storage already holds the ticker in that case,
+  // so the next successful load shows it.
+  useEffect(
+    () =>
+      subscribeToAmbushAdditions((addedStock) => {
+        if (!canPersistRef.current) {
+          return;
+        }
+        const addedTicker = addedStock.ticker.trim().toUpperCase();
+        setStocksTrusted((prevStocks) =>
+          prevStocks.some((stock) => stock.ticker.trim().toUpperCase() === addedTicker)
+            ? prevStocks
+            : [...prevStocks, addedStock],
+        );
+      }),
+    [setStocksTrusted],
   );
 
   // Tracks whether this screen is still mounted — read from the AppState
@@ -357,7 +380,10 @@ export default function AmbushRadarScreen() {
   // the price later moves back out, so a later re-entry notifies again.
   useEffect(() => {
     stocks.forEach((stock) => {
+      // A placeholder price (priceStatus 'unavailable') must never fire a
+      // notification.
       const isNearStructuralStop =
+        stock.priceStatus === 'live' &&
         stock.assetType === 'ETF' &&
         stock.sma200 !== null &&
         stock.price <= stock.sma200 * STRUCTURAL_STOP_THRESHOLD;

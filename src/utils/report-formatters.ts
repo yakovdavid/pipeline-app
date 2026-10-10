@@ -10,6 +10,11 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
     return ['  (none)'];
   }
   return stocks.flatMap((stock) => {
+    // DATA-LOSS FIX: a ticker whose fetch failed is still listed, but its
+    // placeholder numbers are never printed as real prices.
+    if (stock.priceStatus === 'unavailable') {
+      return [`  ${stock.ticker} (${stock.assetType}): PRICE UNAVAILABLE (fetch failed)`];
+    }
     // TREND CLASSIFICATION: both backend-computed signals (see
     // backend/main.py's _classify_trend), replacing the old single,
     // asset-type-dependent Bullish/Bearish verdict this export used to
@@ -53,6 +58,12 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
       lines.push('  (none)');
     } else {
       sectionStocks.forEach((stock) => {
+        // DATA-LOSS FIX: listed with its real unit count, but no price or
+        // value, since those are placeholders while the fetch has failed.
+        if (stock.priceStatus === 'unavailable') {
+          lines.push(`  ${stock.ticker}: ${stock.units} units @ PRICE UNAVAILABLE (fetch failed)`);
+          return;
+        }
         // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): see
         // getEffectiveUnits — a TASE ETF's raw `units` is a Nominal Value
         // quantity (100 nominal units = 1 real pricing unit), so it's
