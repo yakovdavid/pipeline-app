@@ -6,21 +6,24 @@ GET /api/quality/{ticker} returns, for one ticker:
   - Statistics, from the last 2 years of daily closes:
       z_score = (current_price - mean_price) / std_dev
     current_price is the most recent close in the series. Refreshed after 24h.
-  - Fundamentals, from Ticker(symbol).info (current trailing figures):
-      roic: a ROIC PROXY, as a percent (28 = 28%): Return on Equity, or
-            Return on Assets when Yahoo has no ROE. Yahoo doesn't publish
-            ROIC itself. The response key stays `roic` so the app and the
-            cache table keep working unchanged.
-      moat: Wide   if ROE >= 15% AND operating margin >= 15%
-            Narrow if ROE >= 10% AND operating margin >= 10% (and not Wide)
-            None   otherwise, or if either figure is missing
+  - Fundamentals, self-calculated from up to 4 fiscal years of raw annual
+    statements (Ticker.financials and Ticker.balance_sheet):
+      per year: ROE              = Net Income / Stockholders' Equity
+                operating margin = Operating Income / Total Revenue
+      A year is viable only when both ratios can be computed (no missing
+      figure, equity > 0, revenue > 0); other years are skipped, never
+      counted as zero.
+      roic: the AVERAGE ROE across viable years, as a percent (28 = 28%).
+            A ROIC proxy: Yahoo doesn't publish ROIC. The response key stays
+            `roic` so the app and the cache table keep working unchanged.
+      moat: Wide   if average ROE >= 15% AND average operating margin >= 15%
+            Narrow if both averages >= 10% (and not Wide)
+            None   otherwise, or with fewer than 2 viable years
     Refreshed after 30 days.
 
 Each half is cached with its own timestamp (see backend/sql/
 004_quality_metrics_cache.sql), so a daily price refresh never refetches
-fundamentals. That matters most for .info: it hits Yahoo's heaviest,
-most rate-limited endpoint (main.py avoids it for quotes for that reason),
-so it runs at most once per ticker per 30 days.
+financial statements.
 
 Caching: Supabase when it is configured (main.py passes its client in),
 otherwise an in-memory cache with the same lifetimes.
@@ -39,6 +42,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Literal
 
+import pandas as pd
 import yfinance as yf
 from fastapi import APIRouter, HTTPException
 from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
@@ -56,10 +60,24 @@ YF_MAX_ATTEMPTS = 2
 YF_RETRY_BACKOFF_SECONDS = 1.5
 YF_TIMEOUT_SECONDS = 15
 
-# Moat thresholds, as ratios (0.15 = 15%), applied to ROE and the operating
+# Fundamentals window and moat thresholds. Thresholds are ratios
+# (0.15 = 15%), applied to the multi-year average ROE and average operating
 # margin together.
+FUNDAMENTALS_MAX_YEARS = 4
+MOAT_MIN_VIABLE_YEARS = 2
 WIDE_MOAT_MIN_RATIO = 0.15
 NARROW_MOAT_MIN_RATIO = 0.10
+
+# Statement row labels, tried in order for each fiscal year. The first name
+# in each tuple is the one the PRD specifies; the others are the labels
+# yfinance actually uses for the same line where they differ (for example,
+# it has no plain "Total Equity" or "Total Liabilities" row).
+NET_INCOME_LABELS = ("Net Income", "Net Income Common Stockholders")
+OPERATING_INCOME_LABELS = ("Operating Income", "Total Operating Income As Reported")
+TOTAL_REVENUE_LABELS = ("Total Revenue", "Operating Revenue")
+EQUITY_LABELS = ("Stockholders Equity", "Total Equity", "Total Equity Gross Minority Interest")
+TOTAL_ASSETS_LABELS = ("Total Assets",)
+TOTAL_LIABILITIES_LABELS = ("Total Liabilities", "Total Liabilities Net Minority Interest")
 
 QUALITY_METRICS_TABLE = "quality_metrics"
 
@@ -87,7 +105,7 @@ class PriceHistoryError(QualityDataError):
 
 
 class FundamentalsError(QualityDataError):
-    """Fetching Ticker.info failed."""
+    """Fetching the annual financial statements failed."""
 
 
 class QualityTickerNotFoundError(Exception):
@@ -169,40 +187,145 @@ def fetch_daily_closes(symbol: str, today: date) -> list[float]:
 
 
 @dataclass(frozen=True)
-class ProfitabilityMetrics:
-    """Current trailing ratios from Ticker.info (0.28 = 28%). Each is None
-    when Yahoo doesn't report it, e.g. for an ETF."""
+class FinancialStatements:
+    """Annual statements as yfinance returns them: rows are line items,
+    columns are fiscal year-end dates. Either may be empty, e.g. for an
+    ETF, which files no statements."""
 
-    return_on_equity: float | None
-    return_on_assets: float | None
-    operating_margin: float | None
+    income_statement: pd.DataFrame
+    balance_sheet: pd.DataFrame
+
+    @property
+    def is_empty(self) -> bool:
+        return self.income_statement.empty and self.balance_sheet.empty
 
 
-def _info_ratio(info: dict[str, Any], key: str) -> float | None:
-    value = info.get(key)
-    if isinstance(value, bool):  # bool is an int subclass; never a ratio
+def _as_frame(value: Any) -> pd.DataFrame:
+    return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+
+
+def fetch_financial_statements(symbol: str) -> FinancialStatements:
+    """Ticker.financials (income statement) and Ticker.balance_sheet, both
+    annual. Anything that isn't a DataFrame is treated as empty."""
+
+    def load() -> FinancialStatements:
+        ticker = yf.Ticker(symbol)
+        return FinancialStatements(_as_frame(ticker.financials), _as_frame(ticker.balance_sheet))
+
+    try:
+        return _with_retries(load, FundamentalsError, f"financial statements request for '{symbol}'")
+    except YFTickerMissingError:
+        return FinancialStatements(pd.DataFrame(), pd.DataFrame())
+
+
+# --- Statement parsing ----------------------------------------------------
+
+
+def _finite_float(value: Any) -> float | None:
+    """A finite float, or None for NaN, infinity, bool or non-numbers."""
+    if isinstance(value, bool):  # bool is an int subclass; never a figure
         return None
     try:
-        ratio = float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
-    return ratio if math.isfinite(ratio) else None
+    return number if math.isfinite(number) else None
 
 
-def fetch_profitability(symbol: str) -> ProfitabilityMetrics:
-    """ROE, ROA and operating margin from Ticker(symbol).info. Missing
-    figures are a valid result (all None for an ETF), not an error."""
+def _cell(frame: pd.DataFrame, label: str, column: Any) -> float | None:
+    """One figure, safely: None when the label is absent or the value is
+    unusable. A label that appears more than once yields a Series, of which
+    the first usable value is taken."""
     try:
-        info = _with_retries(lambda: yf.Ticker(symbol).info, FundamentalsError, f"fundamentals request for '{symbol}'")
-    except YFTickerMissingError:
-        info = {}
-    if not isinstance(info, dict):
-        info = {}
-    return ProfitabilityMetrics(
-        return_on_equity=_info_ratio(info, "returnOnEquity"),
-        return_on_assets=_info_ratio(info, "returnOnAssets"),
-        operating_margin=_info_ratio(info, "operatingMargins"),
-    )
+        if label not in frame.index:
+            return None
+        value = frame.loc[label, column]
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    if isinstance(value, (pd.Series, pd.DataFrame)):
+        for item in pd.Series(value.to_numpy().ravel()):
+            number = _finite_float(item)
+            if number is not None:
+                return number
+        return None
+    return _finite_float(value)
+
+
+def _first_figure(frame: pd.DataFrame, labels: tuple[str, ...], column: Any) -> float | None:
+    for label in labels:
+        number = _cell(frame, label, column)
+        if number is not None:
+            return number
+    return None
+
+
+def _columns_by_fiscal_year(frame: pd.DataFrame) -> dict[int, Any]:
+    """Maps each fiscal year to its column, keeping the latest column when
+    a year appears twice (e.g. after a fiscal-year-end change). Keyed by
+    year rather than exact date, so the income statement and balance sheet
+    still line up if their dates differ by a few days."""
+    dated: list[tuple[pd.Timestamp, Any]] = []
+    for column in frame.columns:
+        try:
+            dated.append((pd.Timestamp(column), column))
+        except (TypeError, ValueError):
+            continue
+    columns: dict[int, Any] = {}
+    for timestamp, column in sorted(dated, key=lambda pair: pair[0], reverse=True):
+        columns.setdefault(timestamp.year, column)
+    return columns
+
+
+def _equity(balance_sheet: pd.DataFrame, column: Any) -> float | None:
+    """Stockholders' equity, falling back to Total Assets - Total
+    Liabilities when no equity row has a value."""
+    equity = _first_figure(balance_sheet, EQUITY_LABELS, column)
+    if equity is not None:
+        return equity
+    assets = _first_figure(balance_sheet, TOTAL_ASSETS_LABELS, column)
+    liabilities = _first_figure(balance_sheet, TOTAL_LIABILITIES_LABELS, column)
+    if assets is None or liabilities is None:
+        return None
+    return assets - liabilities
+
+
+@dataclass(frozen=True)
+class FiscalYearRatios:
+    fiscal_year: int
+    roe: float  # ratio, 0.28 = 28%
+    operating_margin: float  # ratio
+
+
+def compute_yearly_ratios(statements: FinancialStatements) -> list[FiscalYearRatios]:
+    """ROE and operating margin for each viable year among the most recent
+    FUNDAMENTALS_MAX_YEARS fiscal years, newest first.
+
+    A year is skipped (never counted as zero) when a figure is missing, or
+    equity or revenue is zero or negative. ROE on negative equity is
+    meaningless (losses would show as positive returns), as is a margin on
+    no revenue."""
+    income_columns = _columns_by_fiscal_year(statements.income_statement)
+    balance_columns = _columns_by_fiscal_year(statements.balance_sheet)
+
+    ratios: list[FiscalYearRatios] = []
+    for year in sorted(income_columns, reverse=True)[:FUNDAMENTALS_MAX_YEARS]:
+        if year not in balance_columns:
+            continue
+        try:
+            income_column = income_columns[year]
+            net_income = _first_figure(statements.income_statement, NET_INCOME_LABELS, income_column)
+            operating_income = _first_figure(statements.income_statement, OPERATING_INCOME_LABELS, income_column)
+            revenue = _first_figure(statements.income_statement, TOTAL_REVENUE_LABELS, income_column)
+            equity = _equity(statements.balance_sheet, balance_columns[year])
+        except Exception as error:  # noqa: BLE001 - one malformed year must not sink the others
+            print(f"[quality] Skipping fiscal year {year}: unreadable statements ({type(error).__name__}).")
+            continue
+        if net_income is None or operating_income is None or revenue is None or equity is None:
+            continue
+        if equity <= 0 or revenue <= 0:
+            continue
+        ratios.append(FiscalYearRatios(year, net_income / equity, operating_income / revenue))
+    return ratios
 
 
 # --- Calculations ---------------------------------------------------------
@@ -231,25 +354,26 @@ def compute_price_statistics(closes: list[float]) -> PriceStatistics:
     return PriceStatistics(current_price, mean_price, std_dev, z_score)
 
 
-def compute_roic_proxy_pct(metrics: ProfitabilityMetrics) -> float | None:
-    """ROE as a percent, falling back to ROA; None when neither exists."""
-    ratio = metrics.return_on_equity if metrics.return_on_equity is not None else metrics.return_on_assets
-    return ratio * 100 if ratio is not None else None
+def compute_moat(yearly: list[FiscalYearRatios]) -> tuple[float | None, Moat]:
+    """Returns (roic, moat) from the viable years.
 
-
-def compute_moat(metrics: ProfitabilityMetrics) -> Moat:
-    """Wide / Narrow / None from ROE and the operating margin together. If
-    either is missing the moat is 'None', even when the ROIC proxy fell
-    back to ROA."""
-    roe = metrics.return_on_equity
-    margin = metrics.operating_margin
-    if roe is None or margin is None:
-        return "None"
-    if roe >= WIDE_MOAT_MIN_RATIO and margin >= WIDE_MOAT_MIN_RATIO:
-        return "Wide"
-    if roe >= NARROW_MOAT_MIN_RATIO and margin >= NARROW_MOAT_MIN_RATIO:
-        return "Narrow"
-    return "None"
+    roic is the average ROE as a percent, reported whenever at least one
+    viable year exists. The moat is judged on the average ROE and average
+    operating margin over the same years, and is 'None' with fewer than
+    MOAT_MIN_VIABLE_YEARS of them.
+    """
+    if not yearly:
+        return None, "None"
+    average_roe = statistics.fmean(year.roe for year in yearly)
+    average_margin = statistics.fmean(year.operating_margin for year in yearly)
+    roic = average_roe * 100
+    if len(yearly) < MOAT_MIN_VIABLE_YEARS:
+        return roic, "None"
+    if average_roe >= WIDE_MOAT_MIN_RATIO and average_margin >= WIDE_MOAT_MIN_RATIO:
+        return roic, "Wide"
+    if average_roe >= NARROW_MOAT_MIN_RATIO and average_margin >= NARROW_MOAT_MIN_RATIO:
+        return roic, "Narrow"
+    return roic, "None"
 
 
 # --- Cache ----------------------------------------------------------------
@@ -348,8 +472,8 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
       4. Save the row if anything was refreshed, then return the payload.
     A failed refresh falls back to the expired cached half (flagged stale);
     with nothing cached for that half, the error is raised. Statistics are
-    refreshed first, so an unknown ticker stops before the heavier .info
-    call is made.
+    refreshed first, so an unknown ticker stops before the heavier
+    financial statements requests are made.
     """
     now = now or datetime.now(timezone.utc)
     with _symbol_lock(symbol):
@@ -384,11 +508,18 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
 
         if not (_has_fundamentals(row) and _is_fresh(row.get("last_updated_fundamentals"), FUNDAMENTALS_TTL, now)):
             try:
-                metrics = fetch_profitability(symbol)
-                roic_proxy = compute_roic_proxy_pct(metrics)
+                statements = fetch_financial_statements(symbol)
+                # yfinance's statement properties swallow request errors and
+                # return empty tables, so "no statements at all" for a ticker
+                # that HAD real figures is treated as a failed refresh, not
+                # cached as "no moat" for 30 days. A ticker that never had
+                # any (an ETF) is simply re-confirmed as having none.
+                if statements.is_empty and row.get("roic") is not None:
+                    raise FundamentalsError(f"Yahoo Finance returned no financial statements for '{symbol}'.")
+                roic, moat = compute_moat(compute_yearly_ratios(statements))
                 row.update(
-                    roic=round(roic_proxy, 2) if roic_proxy is not None else None,
-                    moat=compute_moat(metrics),
+                    roic=round(roic, 2) if roic is not None else None,
+                    moat=moat,
                     last_updated_fundamentals=now.isoformat(),
                 )
                 refreshed = True
