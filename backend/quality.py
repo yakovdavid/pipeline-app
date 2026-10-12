@@ -1,12 +1,17 @@
-"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets, sourced from
-Financial Modeling Prep (FMP) and cached so the free tier (250 requests/day)
-is enough.
+"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets, cached so
+Financial Modeling Prep's (FMP) free tier (250 requests/day) is enough.
+
+Two data sources:
+  - Prices: Yahoo Finance, via the `yfinance` library (the same library
+    main.py uses for quotes). FMP's free tier paywalls historical prices:
+    /stable/historical-price-eod/full answers HTTP 402.
+  - Fundamentals: FMP key-metrics, which the free tier does include.
 
 GET /api/quality/{ticker} returns, for one ticker:
-  - Statistics, from the last 2 years of daily closes:
+  - Statistics, from the last 2 years of daily closes (Yahoo Finance):
       z_score = (current_price - mean_price) / std_dev
     current_price is the most recent close in the series. Refreshed after 24h.
-  - Fundamentals, from up to 5 years of annual key metrics:
+  - Fundamentals, from up to 5 years of FMP annual key metrics:
       roic: the most recent year's ROIC, as a percent (28 = 28%)
       moat: Wide   if the average ROIC >= 15% and no year is below 10%
             Narrow if the average ROIC >= 10% (and not Wide)
@@ -19,11 +24,11 @@ financial statements.
 
 Caching: Supabase when it is configured (main.py passes its client in),
 otherwise an in-memory cache with the same lifetimes. Without either, every
-request would cost FMP calls.
+request would cost an FMP call and a Yahoo call.
 
-Failure policy: if a refresh fails (rate limit, network, FMP down) and an
-expired cached value exists, that value is served and flagged *_stale in the
-response, rather than failing the request.
+Failure policy: if a refresh fails (rate limit, network, FMP or Yahoo down)
+and an expired cached value exists, that value is served and flagged
+*_stale in the response, rather than failing the request.
 
 Security: FMP takes the API key as a URL query parameter, and `requests`
 puts the full URL into its exception messages. So this module never
@@ -32,6 +37,7 @@ its own exceptions `from None`, which keeps the URL out of traceback
 context too.
 """
 
+import math
 import os
 import re
 import statistics
@@ -43,7 +49,9 @@ from typing import Any, Callable, Literal
 from urllib.parse import quote
 
 import requests
+import yfinance as yf
 from fastapi import APIRouter, HTTPException
+from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
 
 # --- Configuration --------------------------------------------------------
 
@@ -60,6 +68,11 @@ STATS_TTL = timedelta(hours=24)
 FUNDAMENTALS_TTL = timedelta(days=30)
 
 PRICE_HISTORY_DAYS = 730  # "the last 2 years of daily closing prices"
+# Yahoo Finance (yfinance) price history. Retried once on a transient
+# failure; a rate limit is not retried, same reasoning as FMP's 429.
+YF_MAX_ATTEMPTS = 2
+YF_RETRY_BACKOFF_SECONDS = 1.5
+YF_TIMEOUT_SECONDS = 15
 
 MOAT_MAX_YEARS = 5
 MOAT_MIN_YEARS = 3
@@ -70,8 +83,8 @@ NARROW_MOAT_MIN_AVG_ROIC_PCT = 10.0
 QUALITY_METRICS_TABLE = "quality_metrics"
 
 # Accepted ticker shape: US-style symbols plus dot or dash classes and
-# exchange suffixes (BRK-B, RY.TO). Validated before the symbol is put into
-# an FMP URL path.
+# exchange suffixes (BRK-B, RY.TO). Validated before the symbol is sent to
+# Yahoo Finance or put into an FMP URL path.
 TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
 
 Moat = Literal["Wide", "Narrow", "None"]
@@ -96,13 +109,22 @@ class FmpRateLimitError(FmpError):
     """FMP's request quota is used up (HTTP 429)."""
 
 
+class FmpPaymentRequiredError(FmpError):
+    """The FMP plan doesn't include this endpoint (HTTP 402)."""
+
+
 class FmpLegacyEndpointError(FmpError):
     """FMP refused a /api/v3/ endpoint as legacy. FMP keeps v3 working only
     for subscriptions that existed before August 31, 2025."""
 
 
+class PriceHistoryError(Exception):
+    """Fetching daily closes from Yahoo Finance (yfinance) failed."""
+
+
 class QualityTickerNotFoundError(Exception):
-    """FMP has no price history for this ticker and nothing is cached."""
+    """Yahoo Finance has no price history for this ticker and nothing is
+    cached."""
 
 
 # --- FMP client -----------------------------------------------------------
@@ -141,6 +163,10 @@ def _parse_fmp_response(response: requests.Response, path: str) -> Any:
 
     if response.status_code == 429 or "limit reach" in lowered:
         raise FmpRateLimitError("FMP request limit reached for today.")
+    # Checked before the generic message branch: a 402 carries an error body
+    # too, but naming the cause (the plan) is what makes it actionable.
+    if response.status_code == 402:
+        raise FmpPaymentRequiredError(f"FMP's current plan does not include {path} (HTTP 402).")
     # Checked before the auth branch: FMP sends the legacy refusal as a 403.
     if "legacy endpoint" in lowered:
         raise FmpLegacyEndpointError(f"FMP refused {path} as a legacy endpoint.")
@@ -192,33 +218,59 @@ def _fmp_get_with_fallback(
 
 
 def fetch_daily_closes(symbol: str, today: date) -> list[float]:
-    """Daily closes for the last PRICE_HISTORY_DAYS, oldest first.
+    """Daily closes for the last PRICE_HISTORY_DAYS, oldest first, from
+    Yahoo Finance via yfinance.
 
-    v3 answers {"symbol": ..., "historical": [rows]}; /stable/ answers a
-    plain list of rows. Rows are {"date": "YYYY-MM-DD", "close": number, ...},
-    newest first in both. Rows are sorted and filtered here rather than
-    relying on FMP's order or on it honoring `from`.
+    Uses the unadjusted-for-dividends "Close" column (auto_adjust=False):
+    Yahoo still adjusts it for splits, so a split can't fake a crash in the
+    Z-Score, and the latest close matches the quoted price the app shows.
+
+    An unknown ticker (yfinance raises a YFTickerMissingError subclass)
+    returns [], which the caller reports as "not found". Any other failure
+    raises PriceHistoryError. raise_errors=True is what tells the two
+    apart: by default yfinance logs errors and returns an empty table, so a
+    Yahoo outage would look like a ticker with no history.
     """
     start = today - timedelta(days=PRICE_HISTORY_DAYS)
-    path_symbol = quote(symbol, safe="")
-    payload = _fmp_get_with_fallback(
-        (f"/api/v3/historical-price-full/{path_symbol}", {"from": start.isoformat()}),
-        ("/stable/historical-price-eod/full", {"symbol": symbol, "from": start.isoformat()}),
-    )
-    rows = payload.get("historical") if isinstance(payload, dict) else payload
-    if not isinstance(rows, list):
+    end = today + timedelta(days=1)  # yfinance's `end` is exclusive
+
+    history = None
+    for attempt in range(YF_MAX_ATTEMPTS):
+        try:
+            history = yf.Ticker(symbol).history(
+                start=start.isoformat(),
+                end=end.isoformat(),
+                interval="1d",
+                auto_adjust=False,
+                actions=False,
+                timeout=YF_TIMEOUT_SECONDS,
+                raise_errors=True,
+            )
+            break
+        except YFTickerMissingError:
+            return []
+        except YFRateLimitError:
+            raise PriceHistoryError(f"Yahoo Finance rate-limited the price history request for '{symbol}'.") from None
+        except Exception as error:  # noqa: BLE001 - yfinance surfaces network/parse failures as many types
+            if attempt < YF_MAX_ATTEMPTS - 1:
+                time.sleep(YF_RETRY_BACKOFF_SECONDS)
+                continue
+            raise PriceHistoryError(
+                f"Yahoo Finance price history request for '{symbol}' failed ({type(error).__name__})."
+            ) from None
+
+    if history is None or history.empty or "Close" not in history.columns:
         return []
 
     dated_closes: list[tuple[date, float]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
+    for timestamp, raw_close in history["Close"].items():
         try:
-            row_date = date.fromisoformat(str(row.get("date"))[:10])
-            close = float(row["close"])
-        except (KeyError, TypeError, ValueError):
+            row_date = timestamp.date()
+            close = float(raw_close)
+        except (AttributeError, TypeError, ValueError):
             continue
-        if row_date >= start and close > 0:
+        # NaN rows (e.g. a trading halt) fail isfinite and are skipped.
+        if row_date >= start and math.isfinite(close) and close > 0:
             dated_closes.append((row_date, close))
     dated_closes.sort(key=lambda pair: pair[0])
     return [close for _, close in dated_closes]
@@ -364,7 +416,7 @@ class QualityMetricsStore:
 
 
 # One lock per ticker, so concurrent requests for the same ticker refresh
-# from FMP once instead of each spending quota on the same data.
+# once instead of each spending FMP quota (and Yahoo calls) on the same data.
 _symbol_locks: dict[str, threading.Lock] = {}
 _symbol_locks_guard = threading.Lock()
 
@@ -390,15 +442,15 @@ def _to_float(value: Any) -> float | None:
 
 
 def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime | None = None) -> dict[str, Any]:
-    """The full cache-then-FMP flow for one already-validated symbol:
+    """The full cache-then-fetch flow for one already-validated symbol:
       1. Load the cached row.
-      2. Refresh statistics if older than 24h or missing.
-      3. Refresh fundamentals if older than 30 days or missing.
+      2. Refresh statistics (Yahoo Finance) if older than 24h or missing.
+      3. Refresh fundamentals (FMP) if older than 30 days or missing.
       4. Save the row if anything was refreshed, then return the payload.
     A failed refresh falls back to the expired cached half (flagged stale);
     with nothing cached for that half, the error is raised. Statistics are
     refreshed first, so an unknown ticker stops before the fundamentals
-    call spends quota.
+    call spends FMP quota.
     """
     now = now or datetime.now(timezone.utc)
     with _symbol_lock(symbol):
@@ -413,7 +465,7 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
                 closes = fetch_daily_closes(symbol, now.date())
                 if not closes:
                     if not _has_stats(row):
-                        raise QualityTickerNotFoundError(f"FMP has no price history for '{symbol}'.")
+                        raise QualityTickerNotFoundError(f"Yahoo Finance has no price history for '{symbol}'.")
                     stats_stale = True
                 else:
                     stats = compute_price_statistics(closes)
@@ -425,7 +477,7 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
                         last_updated_stats=now.isoformat(),
                     )
                     refreshed = True
-            except FmpError as error:
+            except PriceHistoryError as error:
                 if not _has_stats(row):
                     raise
                 print(f"[quality] Statistics refresh failed for '{symbol}' ({error}); serving cached values.")
@@ -490,11 +542,11 @@ def create_quality_router(get_supabase_client: Callable[[], Any]) -> APIRouter:
             return get_quality_metrics(symbol, store)
         except QualityTickerNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from None
-        except (FmpNotConfiguredError, FmpAuthError) as error:
+        except (FmpNotConfiguredError, FmpAuthError, FmpPaymentRequiredError) as error:
             raise HTTPException(status_code=503, detail=f"Quality data source unavailable: {error}") from None
         except FmpRateLimitError as error:
             raise HTTPException(status_code=429, detail=str(error)) from None
-        except FmpError as error:
+        except (FmpError, PriceHistoryError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from None
 
     return router
