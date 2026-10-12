@@ -1,59 +1,107 @@
-import type { TrendLabel } from '@/types/asset';
+import type { AmbushAsset, QualityAmbushAsset, SatelliteAmbushAsset } from '@/types/ambush';
 import { classifyPullbackZone } from '@/utils/ambush-zone';
 
-// The three Ambush Radar list sections, in display order.
-export type AmbushGroupKey = 'bullish' | 'bearish' | 'insufficient';
+// UNIFIED RADAR: assets are grouped by operational readiness, not by layer,
+// so Satellite and Quality assets in the same state share a section.
+export type AmbushReadinessZone = 'valueZone' | 'watch' | 'invalidated';
 
-export const AMBUSH_GROUP_ORDER: readonly AmbushGroupKey[] = ['bullish', 'bearish', 'insufficient'];
+// Display order of the radar's sections.
+export const AMBUSH_READINESS_ORDER: readonly AmbushReadinessZone[] = ['valueZone', 'watch', 'invalidated'];
 
-// The minimal shape grouping needs. Structural rather than importing the
-// StockCard `Stock` type, so this module stays independent of any component.
-export interface AmbushGroupable {
-  macroTrend: TrendLabel;
-  sma200: number | null;
-  pullbackDepth: number | null;
-}
+// A Quality asset must clear both fundamental gates to be considered at all.
+export const QUALITY_MIN_ROIC_PCT = 15;
+// At or below this Z-Score, a fundamentally sound Quality asset is actionable.
+export const QUALITY_VALUE_ZONE_MAX_ZSCORE = -1.0;
 
-export type AmbushGroups<T extends AmbushGroupable> = Record<AmbushGroupKey, T[]>;
+export type AmbushReadinessGroups = Record<AmbushReadinessZone, AmbushAsset[]>;
 
-// Which section an asset belongs to. "Insufficient Data" means no SMA200:
-// the backend's macro_trend is null exactly when SMA200 is, but both are
-// checked so neither field alone can misfile an asset into Bullish/Bearish.
-export function getAmbushGroupKey(asset: AmbushGroupable): AmbushGroupKey {
-  if (asset.sma200 === null || asset.macroTrend === null) {
-    return 'insufficient';
+// Satellite (technical):
+//   Invalidated: Macro Trend is not Bullish. Checked FIRST, so a Bearish
+//     asset with a deep pullback is Invalidated, not Value Zone. This is the
+//     app's Macro Override (see ambush-zone.ts): a pullback only counts
+//     inside a long-term uptrend. A null Macro Trend (no SMA200 history, or
+//     a failed price fetch) is treated like Bearish, as it is there.
+//     A null pullback depth (no SMA50 history) can't be judged and is also
+//     Invalidated.
+//   Invalidated (CRASH RULE): pullback depth <= -7.00%. That is a crash,
+//     not a pullback, even in an uptrend. Exactly -7.00% counts as a crash.
+//   Value Zone: pullback depth from -3.00% down to -6.99%.
+//   Watch:      pullback depth  > -3.00%.
+// All boundaries come from classifyPullbackZone (ambush-zone.ts), the same
+// function behind the card's Pullback Depth badge, so a row's section and
+// its badge always agree: Value Zone rows read "Kill Zone", crash rows read
+// "Overshot". It classifies on the 2-decimal value the card prints, so a
+// displayed "-3.00%" or "-7.00%" can't land in the wrong zone because of
+// float noise.
+function classifySatellite(asset: SatelliteAmbushAsset): AmbushReadinessZone {
+  if (asset.macroTrend !== 'Bullish' || asset.pullbackDepth === null) {
+    return 'invalidated';
   }
-  return asset.macroTrend === 'Bullish' ? 'bullish' : 'bearish';
+  switch (classifyPullbackZone(asset.pullbackDepth)) {
+    case 'killZone':
+      return 'valueZone';
+    case 'overshot':
+      return 'invalidated';
+    case 'premium':
+    case 'watch':
+    default:
+      return 'watch';
+  }
 }
 
-// Bullish ordering: ascending pullback depth, so the deepest valid pullbacks
-// (Kill Zone, -3.00% to -7.00%) come first, then Watch, then Premium. One
-// exception: Overshot assets (below -7.00%) go after all of those. They are
-// "a crash, not an entry" (see ambush-zone.ts), and a plain ascending sort
-// would otherwise put them ABOVE the Kill Zone. Assets with no pullback depth
-// at all (no SMA50 history) go last.
-function compareBullish(a: AmbushGroupable, b: AmbushGroupable): number {
+// Quality (fundamental + statistical):
+//   Invalidated: ROIC < 15% or no moat.
+//   Value Zone:  passes both gates and Z-Score <= -1.0.
+//   Watch:       passes both gates and Z-Score  > -1.0.
+// These three conditions are mutually exclusive and cover every asset.
+function classifyQuality(asset: QualityAmbushAsset): AmbushReadinessZone {
+  if (asset.roic < QUALITY_MIN_ROIC_PCT || asset.moat === 'None') {
+    return 'invalidated';
+  }
+  return asset.zScore <= QUALITY_VALUE_ZONE_MAX_ZSCORE ? 'valueZone' : 'watch';
+}
+
+export function classifyAmbushReadiness(asset: AmbushAsset): AmbushReadinessZone {
+  return asset.layer === 'Quality' ? classifyQuality(asset) : classifySatellite(asset);
+}
+
+// Within Value Zone and Watch, the most stretched assets come first:
+//   Satellites by ascending pullback depth (crashes never get here; the
+//     crash rule sends them to Invalidated).
+//   Quality by ascending Z-Score.
+// Satellite rows are listed before Quality rows. Invalidated keeps
+// watchlist order.
+function compareSatellite(a: SatelliteAmbushAsset, b: SatelliteAmbushAsset): number {
+  // Rows without a pullback depth are always Invalidated, so this guard
+  // only narrows the type; it never decides an order in practice.
   if (a.pullbackDepth === null || b.pullbackDepth === null) {
-    if (a.pullbackDepth === b.pullbackDepth) return 0;
-    return a.pullbackDepth === null ? 1 : -1;
-  }
-  const aOvershot = classifyPullbackZone(a.pullbackDepth) === 'overshot';
-  const bOvershot = classifyPullbackZone(b.pullbackDepth) === 'overshot';
-  if (aOvershot !== bOvershot) {
-    return aOvershot ? 1 : -1;
+    return 0;
   }
   return a.pullbackDepth - b.pullbackDepth;
 }
 
-// Splits assets into the three sections. Bullish is sorted (see
-// compareBullish); Bearish and Insufficient Data keep the user's watchlist
-// order. Array.prototype.sort is stable, so equal depths keep watchlist
-// order too. Returns new arrays and never mutates the input.
-export function groupAmbushAssets<T extends AmbushGroupable>(assets: readonly T[]): AmbushGroups<T> {
-  const groups: AmbushGroups<T> = { bullish: [], bearish: [], insufficient: [] };
-  for (const asset of assets) {
-    groups[getAmbushGroupKey(asset)].push(asset);
+function compareReadiness(a: AmbushAsset, b: AmbushAsset): number {
+  if (a.layer !== b.layer) {
+    return a.layer === 'Satellite' ? -1 : 1;
   }
-  groups.bullish.sort(compareBullish);
+  if (a.layer === 'Satellite' && b.layer === 'Satellite') {
+    return compareSatellite(a, b);
+  }
+  if (a.layer === 'Quality' && b.layer === 'Quality') {
+    return a.zScore - b.zScore;
+  }
+  return 0;
+}
+
+// Splits the combined list into the three readiness zones. Returns new
+// arrays and never mutates the input. Array.prototype.sort is stable, so
+// ties keep watchlist order.
+export function groupAmbushByReadiness(assets: readonly AmbushAsset[]): AmbushReadinessGroups {
+  const groups: AmbushReadinessGroups = { valueZone: [], watch: [], invalidated: [] };
+  for (const asset of assets) {
+    groups[classifyAmbushReadiness(asset)].push(asset);
+  }
+  groups.valueZone.sort(compareReadiness);
+  groups.watch.sort(compareReadiness);
   return groups;
 }

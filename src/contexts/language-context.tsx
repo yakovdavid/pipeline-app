@@ -69,9 +69,20 @@ export type TranslationKey =
   // see PortfolioScreen/AmbushRadarScreen's syncWarning state)
   | 'syncFailedWarning'
   // Ambush Radar section headers (grouped by Macro Trend)
-  | 'ambushSectionBullish'
-  | 'ambushSectionBearish'
-  | 'ambushSectionInsufficient'
+  | 'ambushZoneValueTitle'
+  | 'ambushZoneWatchTitle'
+  | 'ambushZoneInvalidatedTitle'
+  // Unified radar: zone badge labels and QualityAmbushCard fields
+  | 'ambushZoneValue'
+  | 'ambushZoneWatch'
+  | 'ambushZoneInvalidated'
+  | 'roicLabel'
+  | 'moatLabel'
+  | 'moatWide'
+  | 'moatNarrow'
+  | 'moatNone'
+  | 'zScoreLabel'
+  | 'demoTag'
   // Closed-loop watchlist: Satellite/Quality liquidation feedback toast
   | 'liquidatedMovedToAmbush'
   | 'liquidatedAlreadyOnAmbush'
@@ -212,9 +223,19 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     setBrokerPriceAlertAt: 'הגדר התראת מחיר בברוקר ב: {{price}}',
     copied: 'הועתק!',
     syncFailedWarning: '⚠ לא ניתן היה להסתנכרן עם השרת — מוצגים הנתונים האחרונים שנשמרו.',
-    ambushSectionBullish: 'מגמה עולה (הזדמנויות פעילות)',
-    ambushSectionBearish: 'מגמה יורדת (מבוטל)',
-    ambushSectionInsufficient: 'אין מספיק נתונים',
+    ambushZoneValueTitle: '🎯 אזור ערך (לפעולה)',
+    ambushZoneWatchTitle: '👀 מעקב (המתנה)',
+    ambushZoneInvalidatedTitle: '🔒 מבוטל',
+    ambushZoneValue: 'אזור ערך',
+    ambushZoneWatch: 'מעקב',
+    ambushZoneInvalidated: 'מבוטל',
+    roicLabel: 'ROIC',
+    moatLabel: 'חפיר כלכלי',
+    moatWide: 'רחב',
+    moatNarrow: 'צר',
+    moatNone: 'אין',
+    zScoreLabel: 'ציון Z',
+    demoTag: 'הדגמה',
     liquidatedMovedToAmbush: '{{ticker}} מומש והועבר למכ״ם המארבים',
     liquidatedAlreadyOnAmbush: '{{ticker}} מומש — כבר נמצא במכ״ם המארבים',
     liquidatedAmbushFailed: '{{ticker}} מומש, אך לא ניתן היה להוסיף אותו למכ״ם המארבים',
@@ -339,9 +360,19 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     setBrokerPriceAlertAt: 'Set Broker Price Alert at: {{price}}',
     copied: 'Copied!',
     syncFailedWarning: "⚠ Couldn't sync with the server — showing your last saved data.",
-    ambushSectionBullish: 'Bullish (Active Setups)',
-    ambushSectionBearish: 'Bearish (Invalidated)',
-    ambushSectionInsufficient: 'Insufficient Data',
+    ambushZoneValueTitle: '🎯 Value Zone (Actionable)',
+    ambushZoneWatchTitle: '👀 Watch (Standby)',
+    ambushZoneInvalidatedTitle: '🔒 Invalidated',
+    ambushZoneValue: 'Value Zone',
+    ambushZoneWatch: 'Watch',
+    ambushZoneInvalidated: 'Invalidated',
+    roicLabel: 'ROIC',
+    moatLabel: 'Moat',
+    moatWide: 'Wide',
+    moatNarrow: 'Narrow',
+    moatNone: 'None',
+    zScoreLabel: 'Z-Score',
+    demoTag: 'DEMO',
     liquidatedMovedToAmbush: '{{ticker}} liquidated and moved to Ambush Radar',
     liquidatedAlreadyOnAmbush: '{{ticker}} liquidated — already on Ambush Radar',
     liquidatedAmbushFailed: "{{ticker}} liquidated, but couldn't be added to Ambush Radar",

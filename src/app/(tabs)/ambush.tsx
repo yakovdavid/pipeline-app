@@ -15,58 +15,57 @@ import {
   type SectionListRenderItem,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
 
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
-import { StockCard, type Stock } from '@/components/StockCard';
+import { QualityAmbushCard } from '@/components/QualityAmbushCard';
+import { StockCard } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
+import { DEMO_QUALITY_AMBUSH_ASSETS } from '@/constants/ambush-demo-data';
+import { AMBUSH_ZONE_TITLE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
 import { assetTypeLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
-import { usePipelineLanguage, type Language, type TranslationKey } from '@/contexts/language-context';
+import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import { createUnavailableQuote, fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
-import type { AmbushTickerEntry } from '@/types/ambush';
+import type { AmbushAsset, AmbushTickerEntry, SatelliteAmbushAsset } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
-import { AMBUSH_GROUP_ORDER, groupAmbushAssets, type AmbushGroupKey } from '@/utils/ambush-grouping';
+import { AMBUSH_READINESS_ORDER, groupAmbushByReadiness, type AmbushReadinessZone } from '@/utils/ambush-grouping';
 import { loadAmbushTickerEntries, subscribeToAmbushAdditions } from '@/utils/ambush-storage';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
 import { normalizeTickerInput } from '@/utils/ticker';
 
-// Per-section data SectionList carries alongside each section's `data`
-// rows: which group it is, its translated header title, and its accent
-// color.
+// Per-section data SectionList carries alongside each section's rows:
+// which readiness zone it is, its translated title and accent color, the
+// zone's full asset count (shown even while collapsed, when `data` is
+// empty), and whether it's collapsed.
 type AmbushSectionInfo = {
-  key: AmbushGroupKey;
+  key: AmbushReadinessZone;
   title: string;
   accentColor: string;
+  count: number;
+  isCollapsed: boolean;
 };
 
-type AmbushSection = SectionListData<Stock, AmbushSectionInfo>;
+type AmbushSection = SectionListData<AmbushAsset, AmbushSectionInfo>;
 
-const AMBUSH_SECTION_TITLE_KEY: Record<AmbushGroupKey, TranslationKey> = {
-  bullish: 'ambushSectionBullish',
-  bearish: 'ambushSectionBearish',
-  insufficient: 'ambushSectionInsufficient',
+// Every section starts expanded.
+const INITIAL_COLLAPSED_SECTIONS: Record<AmbushReadinessZone, boolean> = {
+  valueZone: false,
+  watch: false,
+  invalidated: false,
 };
 
-function ambushSectionAccentColor(colors: PipelineColorScheme, key: AmbushGroupKey): string {
-  switch (key) {
-    case 'bullish':
-      return colors.bullish;
-    case 'bearish':
-      return colors.bearish;
-    case 'insufficient':
-    default:
-      return colors.textSecondary;
-  }
-}
-
-function extractAmbushItemKey(item: Stock): string {
-  return item.ticker;
+// Keyed by layer AND ticker: the same ticker can be on the radar as both a
+// Satellite and a Quality asset (the AAPL demo row alongside a watched
+// AAPL, for instance), and React keys must be unique.
+function extractAmbushItemKey(item: AmbushAsset): string {
+  return `${item.layer}:${item.ticker}`;
 }
 
 const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
@@ -85,7 +84,11 @@ export default function AmbushRadarScreen() {
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
-  const [stocks, setStocks] = useState<Stock[]>([]);
+  // The real, persisted watchlist. Every row is a Satellite asset, tagged
+  // `layer: 'Satellite'` when it is created (load, add, liquidation
+  // handover) rather than at render time, so unchanged rows keep their
+  // object identity and StockCard's memo() keeps working.
+  const [stocks, setStocks] = useState<SatelliteAmbushAsset[]>([]);
   // CACHE INTEGRITY (AppState/hydration safety): see the identical
   // canPersistRef in PortfolioScreen (index.tsx) for the full rationale —
   // the short version is that the persistence effect below used to gate
@@ -101,7 +104,7 @@ export default function AmbushRadarScreen() {
   const canPersistRef = useRef(false);
 
   const setStocksTrusted = useCallback(
-    (update: Stock[] | ((previous: Stock[]) => Stock[])) => {
+    (update: SatelliteAmbushAsset[] | ((previous: SatelliteAmbushAsset[]) => SatelliteAmbushAsset[])) => {
       canPersistRef.current = true;
       setStocks(update);
     },
@@ -189,9 +192,13 @@ export default function AmbushRadarScreen() {
       // happened to fail. Because this list now matches storage entry for
       // entry, it is safe to mark trusted and persist even when EVERY fetch
       // failed: saving it writes back exactly what was read.
-      const loadedStocks: Stock[] = entries.map((entry, index) => {
+      const loadedStocks: SatelliteAmbushAsset[] = entries.map((entry, index) => {
         const result = results[index];
-        return { ...entry, ...(result.status === 'fulfilled' ? result.value : createUnavailableQuote()) };
+        return {
+          ...entry,
+          ...(result.status === 'fulfilled' ? result.value : createUnavailableQuote()),
+          layer: 'Satellite',
+        };
       });
 
       const failedCount = results.filter((result) => result.status === 'rejected').length;
@@ -250,7 +257,7 @@ export default function AmbushRadarScreen() {
         setStocksTrusted((prevStocks) =>
           prevStocks.some((stock) => stock.ticker.trim().toUpperCase() === addedTicker)
             ? prevStocks
-            : [...prevStocks, addedStock],
+            : [...prevStocks, { ...addedStock, layer: 'Satellite' }],
         );
       }),
     [setStocksTrusted],
@@ -414,7 +421,7 @@ export default function AmbushRadarScreen() {
       const quote = await fetchStockData(normalizedTicker);
       setStocksTrusted((prevStocks) => [
         ...prevStocks,
-        { ticker: normalizedTicker, assetType: selectedAssetType, ...quote },
+        { ticker: normalizedTicker, assetType: selectedAssetType, ...quote, layer: 'Satellite' },
       ]);
       setTicker('');
     } catch (error) {
@@ -436,39 +443,83 @@ export default function AmbushRadarScreen() {
     [setStocksTrusted],
   );
 
-  const renderStockCard = useCallback<SectionListRenderItem<Stock, AmbushSectionInfo>>(
-    ({ item }) => <StockCard stock={item} onDelete={handleDeleteTicker} />,
+  // UNIFIED RADAR: Satellite assets (the real, persisted watchlist) plus,
+  // in development builds only, the demo Quality assets. The demo rows are
+  // merged here, into what's DISPLAYED, never into `stocks`. `stocks` is
+  // what the persistence effect saves, so putting them there would write
+  // them into the user's real watchlist. Release builds (__DEV__ false)
+  // show only real assets.
+  const radarAssets = useMemo<AmbushAsset[]>(
+    () => (__DEV__ ? [...stocks, ...DEMO_QUALITY_AMBUSH_ASSETS] : stocks),
+    [stocks],
+  );
+
+  // COLLAPSIBLE SECTIONS: one flag per readiness zone; true means
+  // collapsed. In-memory only, so every section starts expanded again
+  // after an app restart.
+  const [collapsedSections, setCollapsedSections] =
+    useState<Record<AmbushReadinessZone, boolean>>(INITIAL_COLLAPSED_SECTIONS);
+
+  const toggleSection = useCallback((zone: AmbushReadinessZone) => {
+    setCollapsedSections((previous) => ({ ...previous, [zone]: !previous[zone] }));
+  }, []);
+
+  // READINESS GROUPING: Value Zone, Watch, Invalidated (see
+  // groupAmbushByReadiness for the rules and in-zone ordering). A zone with
+  // no assets is left out, so there's never an empty header. A collapsed
+  // zone keeps its header (with its full count) but passes no rows. The
+  // asset objects are passed through unchanged, so StockCard's and
+  // QualityAmbushCard's memo() still skip rows that didn't change.
+  const sections = useMemo<AmbushSection[]>(() => {
+    const groups = groupAmbushByReadiness(radarAssets);
+    return AMBUSH_READINESS_ORDER.filter((zone) => groups[zone].length > 0).map((zone) => ({
+      key: zone,
+      title: t(AMBUSH_ZONE_TITLE_KEY[zone]),
+      accentColor: ambushZoneColors(colors, zone).accent,
+      count: groups[zone].length,
+      isCollapsed: collapsedSections[zone],
+      data: collapsedSections[zone] ? [] : groups[zone],
+    }));
+  }, [radarAssets, collapsedSections, colors, t]);
+
+  // Picks the card by layer. A Quality card gets its section's zone for
+  // its status strip. Quality rows have no delete button: today they are
+  // only demo rows, which aren't part of the saved watchlist.
+  const renderRadarItem = useCallback<SectionListRenderItem<AmbushAsset, AmbushSectionInfo>>(
+    ({ item, section }) =>
+      item.layer === 'Quality' ? (
+        <QualityAmbushCard asset={item} zone={section.key} />
+      ) : (
+        <StockCard stock={item} onDelete={handleDeleteTicker} />
+      ),
     [handleDeleteTicker],
   );
 
-  // MACRO TREND GROUPING: Bullish (sorted by pullback depth — see
-  // groupAmbushAssets), Bearish, then Insufficient Data. Empty groups are
-  // left out entirely, so an all-Bullish watchlist doesn't show two
-  // headers with nothing under them. Re-derived only when the watchlist,
-  // theme, or language changes; the stock objects themselves are passed
-  // through untouched, so StockCard's memo() still skips unchanged rows.
-  const sections = useMemo<AmbushSection[]>(() => {
-    const groups = groupAmbushAssets(stocks);
-    return AMBUSH_GROUP_ORDER.filter((key) => groups[key].length > 0).map((key) => ({
-      key,
-      title: t(AMBUSH_SECTION_TITLE_KEY[key]),
-      accentColor: ambushSectionAccentColor(colors, key),
-      data: groups[key],
-    }));
-  }, [stocks, colors, t]);
-
   const renderSectionHeader = useCallback(
     ({ section }: { section: AmbushSection }) => (
-      <View style={styles.sectionHeader}>
+      <TouchableOpacity
+        style={styles.sectionHeader}
+        onPress={() => toggleSection(section.key)}
+        activeOpacity={0.7}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: !section.isCollapsed }}
+        accessibilityLabel={`${section.title} · ${section.count}`}>
         <View style={[styles.sectionHeaderAccent, { backgroundColor: section.accentColor }]} />
         {/* Translated title first, count second: the same bidi-safe
-            word-first order Portfolio's section titles use. */}
+            word-first order Portfolio's section titles use. The count is
+            the zone's full size, so it stays accurate while collapsed. */}
         <Text style={[styles.sectionHeaderTitle, { color: section.accentColor }]}>
-          {section.title} · {section.data.length}
+          {section.title} · {section.count}
         </Text>
-      </View>
+        <Ionicons
+          name={section.isCollapsed ? 'chevron-down' : 'chevron-up'}
+          size={18}
+          color={section.accentColor}
+          style={styles.sectionHeaderChevron}
+        />
+      </TouchableOpacity>
     ),
-    [styles],
+    [styles, toggleSection],
   );
 
   const handleCopyAmbushData = async () => {
@@ -560,10 +611,10 @@ export default function AmbushRadarScreen() {
       ) : (
         <View style={styles.listWrapper}>
           <PullToRefreshLogo isRefreshing={refreshing} />
-          <SectionList<Stock, AmbushSectionInfo>
+          <SectionList<AmbushAsset, AmbushSectionInfo>
             sections={sections}
             keyExtractor={extractAmbushItemKey}
-            renderItem={renderStockCard}
+            renderItem={renderRadarItem}
             renderSectionHeader={renderSectionHeader}
             // Sticky on both platforms (Android defaults to off): the
             // header stays pinned while its group scrolls under it. Its
@@ -751,11 +802,17 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       height: 16,
       borderRadius: 2,
     },
+    // flex: 1 pushes the chevron to the far end of the header row (the
+    // right in English, the left in Hebrew, since the row flips).
     sectionHeaderTitle: {
+      flex: 1,
       fontSize: 15,
       fontWeight: '700',
       textAlign: isHebrew ? 'right' : 'left',
       writingDirection: isHebrew ? 'rtl' : 'ltr',
+    },
+    sectionHeaderChevron: {
+      marginHorizontal: 4,
     },
     initializingContainer: {
       flex: 1,

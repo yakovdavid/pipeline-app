@@ -339,8 +339,11 @@ QUALITY_ZSCORE_MIN_HISTORY = SMA_50_WINDOW + QUALITY_ZSCORE_WINDOW
 # Z-SCORE CONSTRAINTS: the alert (not the raw z_score value, which is
 # always returned for a Quality asset whenever there's enough history to
 # compute one) MUST ONLY be evaluated as active when ALL THREE hold:
-#   1. the z_score itself falls in [-2.0, -1.5] (a moderate-to-strong
-#      mean-reversion-below-SMA50 reading);
+#   1. the z_score is <= -1.0, the Fortress-wide Margin of Safety. This is
+#      the same threshold the Ambush Radar uses for a Quality asset's Value
+#      Zone (QUALITY_VALUE_ZONE_MAX_ZSCORE in src/utils/ambush-grouping.ts),
+#      so the Portfolio alert and the Radar agree. It replaced the old
+#      [-2.0, -1.5] band, so a deeper reading like -2.5 now alerts too;
 #   2. the asset's own roic (Return on Invested Capital) is >= 15 — a
 #      quality-screen gate: don't flag a statistical dip on a
 #      fundamentally weak business as a buying opportunity;
@@ -350,8 +353,7 @@ QUALITY_ZSCORE_MIN_HISTORY = SMA_50_WINDOW + QUALITY_ZSCORE_WINDOW
 #      alert never encourages adding to Quality once it's already at (or
 #      past) its intended weight.
 # See _quality_zscore_alert_active for the actual gate.
-QUALITY_ZSCORE_ALERT_LOWER = -2.0
-QUALITY_ZSCORE_ALERT_UPPER = -1.5
+QUALITY_ZSCORE_ALERT_MAX = -1.0
 QUALITY_ZSCORE_MIN_ROIC = 15.0
 QUALITY_MAX_LAYER_WEIGHT_PCT = 10.0
 
@@ -1447,7 +1449,7 @@ def _quality_zscore_alert_active(
     """
     if z_score is None:
         return False
-    if not (QUALITY_ZSCORE_ALERT_LOWER <= z_score <= QUALITY_ZSCORE_ALERT_UPPER):
+    if z_score > QUALITY_ZSCORE_ALERT_MAX:
         return False
     if roic is None or roic < QUALITY_ZSCORE_MIN_ROIC:
         return False

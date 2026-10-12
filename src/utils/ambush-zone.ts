@@ -20,17 +20,22 @@ export interface AmbushSignal {
 }
 
 // Classified on the 2-decimal value the UI displays (backend/main.py already
-// rounds pullback_depth to 2dp), so a printed "-7.00%" can never be labelled
-// Overshot or a printed "-3.00%" labelled Watch by sub-cent float noise.
+// rounds pullback_depth to 2dp), so a printed "-7.00%" or "-3.00%" can't land
+// in the wrong zone because of sub-cent float noise.
 //   > 0%              Premium
 //   0% .. -2.99%      Watch
-//   -3.00% .. -7.00%  Kill Zone (both ends inclusive)
-//   < -7.00%          Overshot (a crash, not an entry)
+//   -3.00% .. -6.99%  Kill Zone (-3.00% inclusive)
+//   <= -7.00%         Overshot: a crash, not a pullback. Exactly -7.00%
+//                     counts as a crash (the Fortress crash rule). The
+//                     Ambush Radar groups these as Invalidated (see
+//                     ambush-grouping.ts), and the Pullback Depth badge
+//                     labels them Overshot, from this same function, so
+//                     the two always agree.
 export function classifyPullbackZone(pullbackDepth: number): PullbackZone {
   const depth = Math.round(pullbackDepth * 100) / 100;
   if (depth > PULLBACK_PREMIUM_THRESHOLD_PCT) return 'premium';
   if (depth > PULLBACK_KILL_ZONE_THRESHOLD_PCT) return 'watch';
-  if (depth >= PULLBACK_OVERSHOT_THRESHOLD_PCT) return 'killZone';
+  if (depth > PULLBACK_OVERSHOT_THRESHOLD_PCT) return 'killZone';
   return 'overshot';
 }
 

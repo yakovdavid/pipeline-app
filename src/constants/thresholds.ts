@@ -23,8 +23,8 @@ export const SATELLITE_TS_PCT = 0.12;
 // @/utils/ambush-zone for the classification itself:
 //   > 0%              Gray (Premium)
 //   0% to -2.99%      Orange (Watch)
-//   -3.00% to -7.00%  Red (Kill Zone / Entry Trigger)
-//   below -7.00%      Dark magenta (Overshot — a crash, NOT an entry)
+//   -3.00% to -6.99%  Red (Kill Zone / Entry Trigger)
+//   -7.00% or deeper  Dark magenta (Overshot — a crash, NOT an entry)
 // All tiers are additionally gated by the Macro Override: unless Macro
 // Trend is Bullish the badge is neutralized to gray "Invalidated".
 export const PULLBACK_PREMIUM_THRESHOLD_PCT = 0;
