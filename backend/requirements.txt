@@ -1,8 +1,8 @@
 fastapi
 uvicorn
-# Yahoo Finance: live quotes (main.py) and the 2-year daily closes behind
-# the Quality Z-Score (quality.py), since FMP's free tier paywalls
-# historical prices (HTTP 402).
+# Yahoo Finance: live quotes (main.py) and all Quality data (quality.py):
+# the 2-year daily closes behind the Z-Score, and ROE/ROA/operating margin
+# for the ROIC proxy and the Moat.
 yfinance
 pandas
 curl_cffi

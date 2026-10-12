@@ -1,44 +1,36 @@
-"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets, cached so
-Financial Modeling Prep's (FMP) free tier (250 requests/day) is enough.
-
-Two data sources:
-  - Prices: Yahoo Finance, via the `yfinance` library (the same library
-    main.py uses for quotes). FMP's free tier paywalls historical prices:
-    /stable/historical-price-eod/full answers HTTP 402.
-  - Fundamentals: FMP key-metrics, which the free tier does include.
+"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets, sourced
+entirely from Yahoo Finance through the `yfinance` library (the same library
+main.py uses for quotes). No API key, no paid plan.
 
 GET /api/quality/{ticker} returns, for one ticker:
-  - Statistics, from the last 2 years of daily closes (Yahoo Finance):
+  - Statistics, from the last 2 years of daily closes:
       z_score = (current_price - mean_price) / std_dev
     current_price is the most recent close in the series. Refreshed after 24h.
-  - Fundamentals, from up to 5 years of FMP annual key metrics:
-      roic: the most recent year's ROIC, as a percent (28 = 28%)
-      moat: Wide   if the average ROIC >= 15% and no year is below 10%
-            Narrow if the average ROIC >= 10% (and not Wide)
-            None   otherwise, or with fewer than 3 years of history
+  - Fundamentals, from Ticker(symbol).info (current trailing figures):
+      roic: a ROIC PROXY, as a percent (28 = 28%): Return on Equity, or
+            Return on Assets when Yahoo has no ROE. Yahoo doesn't publish
+            ROIC itself. The response key stays `roic` so the app and the
+            cache table keep working unchanged.
+      moat: Wide   if ROE >= 15% AND operating margin >= 15%
+            Narrow if ROE >= 10% AND operating margin >= 10% (and not Wide)
+            None   otherwise, or if either figure is missing
     Refreshed after 30 days.
 
 Each half is cached with its own timestamp (see backend/sql/
 004_quality_metrics_cache.sql), so a daily price refresh never refetches
-financial statements.
+fundamentals. That matters most for .info: it hits Yahoo's heaviest,
+most rate-limited endpoint (main.py avoids it for quotes for that reason),
+so it runs at most once per ticker per 30 days.
 
 Caching: Supabase when it is configured (main.py passes its client in),
-otherwise an in-memory cache with the same lifetimes. Without either, every
-request would cost an FMP call and a Yahoo call.
+otherwise an in-memory cache with the same lifetimes.
 
-Failure policy: if a refresh fails (rate limit, network, FMP or Yahoo down)
-and an expired cached value exists, that value is served and flagged
-*_stale in the response, rather than failing the request.
-
-Security: FMP takes the API key as a URL query parameter, and `requests`
-puts the full URL into its exception messages. So this module never
-includes a requests exception's text in its own errors or logs, and raises
-its own exceptions `from None`, which keeps the URL out of traceback
-context too.
+Failure policy: if a refresh fails (rate limit, network, Yahoo down) and an
+expired cached value exists, that value is served and flagged *_stale in the
+response, rather than failing the request.
 """
 
 import math
-import os
 import re
 import statistics
 import threading
@@ -46,45 +38,34 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Literal
-from urllib.parse import quote
 
-import requests
 import yfinance as yf
 from fastapi import APIRouter, HTTPException
 from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
 
 # --- Configuration --------------------------------------------------------
 
-FMP_BASE_URL = "https://financialmodelingprep.com"
-FMP_API_KEY_ENV = "FMP_API_KEY"
-FMP_TIMEOUT_SECONDS = 15.0
-# Retries cover network errors and 5xx only. A 429 is not retried: on the
-# free tier it means the daily quota is used up, and retrying would only
-# waste time.
-FMP_MAX_NETWORK_RETRIES = 2
-FMP_RETRY_BACKOFF_SECONDS = 1.5
-
 STATS_TTL = timedelta(hours=24)
 FUNDAMENTALS_TTL = timedelta(days=30)
 
 PRICE_HISTORY_DAYS = 730  # "the last 2 years of daily closing prices"
-# Yahoo Finance (yfinance) price history. Retried once on a transient
-# failure; a rate limit is not retried, same reasoning as FMP's 429.
+
+# Yahoo Finance requests. A transient failure is retried once; a rate limit
+# is not retried, since retrying straight away only prolongs the block.
 YF_MAX_ATTEMPTS = 2
 YF_RETRY_BACKOFF_SECONDS = 1.5
 YF_TIMEOUT_SECONDS = 15
 
-MOAT_MAX_YEARS = 5
-MOAT_MIN_YEARS = 3
-WIDE_MOAT_MIN_AVG_ROIC_PCT = 15.0
-WIDE_MOAT_MIN_YEAR_ROIC_PCT = 10.0
-NARROW_MOAT_MIN_AVG_ROIC_PCT = 10.0
+# Moat thresholds, as ratios (0.15 = 15%), applied to ROE and the operating
+# margin together.
+WIDE_MOAT_MIN_RATIO = 0.15
+NARROW_MOAT_MIN_RATIO = 0.10
 
 QUALITY_METRICS_TABLE = "quality_metrics"
 
 # Accepted ticker shape: US-style symbols plus dot or dash classes and
 # exchange suffixes (BRK-B, RY.TO). Validated before the symbol is sent to
-# Yahoo Finance or put into an FMP URL path.
+# Yahoo Finance.
 TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
 
 Moat = Literal["Wide", "Narrow", "None"]
@@ -93,33 +74,20 @@ Moat = Literal["Wide", "Narrow", "None"]
 # --- Errors ---------------------------------------------------------------
 
 
-class FmpError(Exception):
-    """An FMP request failed. Messages never contain the API key."""
+class QualityDataError(Exception):
+    """A Yahoo Finance request for quality data failed."""
 
 
-class FmpNotConfiguredError(FmpError):
-    """FMP_API_KEY is not set."""
+class QualityRateLimitError(QualityDataError):
+    """Yahoo Finance rate-limited the request."""
 
 
-class FmpAuthError(FmpError):
-    """FMP rejected the API key."""
+class PriceHistoryError(QualityDataError):
+    """Fetching daily closes failed."""
 
 
-class FmpRateLimitError(FmpError):
-    """FMP's request quota is used up (HTTP 429)."""
-
-
-class FmpPaymentRequiredError(FmpError):
-    """The FMP plan doesn't include this endpoint (HTTP 402)."""
-
-
-class FmpLegacyEndpointError(FmpError):
-    """FMP refused a /api/v3/ endpoint as legacy. FMP keeps v3 working only
-    for subscriptions that existed before August 31, 2025."""
-
-
-class PriceHistoryError(Exception):
-    """Fetching daily closes from Yahoo Finance (yfinance) failed."""
+class FundamentalsError(QualityDataError):
+    """Fetching Ticker.info failed."""
 
 
 class QualityTickerNotFoundError(Exception):
@@ -127,117 +95,48 @@ class QualityTickerNotFoundError(Exception):
     cached."""
 
 
-# --- FMP client -----------------------------------------------------------
-
-# Which FMP API generation to call. Starts with the /api/v3/ endpoints this
-# pipeline was specified against. On the first "Legacy Endpoint" refusal it
-# switches to the equivalent /stable/ endpoints for the rest of the process,
-# so a key that lacks v3 access costs one wasted request per restart, not
-# one per call. A benign race: two threads may both make one v3 attempt.
-_use_stable_api = False
+# --- Yahoo Finance client -------------------------------------------------
 
 
-def _fmp_api_key() -> str:
-    key = os.environ.get(FMP_API_KEY_ENV, "").strip()
-    if not key:
-        raise FmpNotConfiguredError(f"{FMP_API_KEY_ENV} is not set.")
-    return key
-
-
-def _fmp_error_message(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        message = payload.get("Error Message") or payload.get("error")
-        if isinstance(message, str):
-            return message.strip()[:300]
-    return None
-
-
-def _parse_fmp_response(response: requests.Response, path: str) -> Any:
-    try:
-        payload: Any = response.json()
-    except ValueError:
-        payload = None
-
-    message = _fmp_error_message(payload)
-    lowered = (message or "").lower()
-
-    if response.status_code == 429 or "limit reach" in lowered:
-        raise FmpRateLimitError("FMP request limit reached for today.")
-    # Checked before the generic message branch: a 402 carries an error body
-    # too, but naming the cause (the plan) is what makes it actionable.
-    if response.status_code == 402:
-        raise FmpPaymentRequiredError(f"FMP's current plan does not include {path} (HTTP 402).")
-    # Checked before the auth branch: FMP sends the legacy refusal as a 403.
-    if "legacy endpoint" in lowered:
-        raise FmpLegacyEndpointError(f"FMP refused {path} as a legacy endpoint.")
-    if response.status_code in (401, 403) or "invalid api key" in lowered:
-        raise FmpAuthError(f"FMP rejected the API key (HTTP {response.status_code}).")
-    if message is not None:
-        # A 200 can still carry an error body, e.g. a plan restriction.
-        raise FmpError(f"FMP error for {path}: {message}")
-    if not response.ok:
-        raise FmpError(f"FMP returned HTTP {response.status_code} for {path}.")
-    if payload is None:
-        raise FmpError(f"FMP returned a non-JSON response for {path}.")
-    return payload
-
-
-def _fmp_get_json(path: str, params: dict[str, str | int]) -> Any:
-    key = _fmp_api_key()
-    url = FMP_BASE_URL + path
-    for attempt in range(FMP_MAX_NETWORK_RETRIES + 1):
+def _with_retries(action: Callable[[], Any], error_type: type[QualityDataError], description: str) -> Any:
+    """Runs one yfinance call with the retry policy above. A missing ticker
+    (YFTickerMissingError) is re-raised for the caller to handle, a rate
+    limit becomes QualityRateLimitError, and anything else becomes
+    `error_type` after the last attempt."""
+    for attempt in range(YF_MAX_ATTEMPTS):
         try:
-            response = requests.get(url, params={**params, "apikey": key}, timeout=FMP_TIMEOUT_SECONDS)
-        except requests.RequestException as error:
-            # Only the exception TYPE is reported: its text contains the URL,
-            # and the URL contains the API key.
-            if attempt < FMP_MAX_NETWORK_RETRIES:
-                time.sleep(FMP_RETRY_BACKOFF_SECONDS * (2**attempt))
+            return action()
+        except YFTickerMissingError:
+            raise
+        except YFRateLimitError:
+            raise QualityRateLimitError(f"Yahoo Finance rate-limited the {description}.") from None
+        except Exception as error:  # noqa: BLE001 - yfinance surfaces network/parse failures as many types
+            if attempt < YF_MAX_ATTEMPTS - 1:
+                time.sleep(YF_RETRY_BACKOFF_SECONDS)
                 continue
-            raise FmpError(f"FMP request to {path} failed ({type(error).__name__}).") from None
-        if response.status_code >= 500 and attempt < FMP_MAX_NETWORK_RETRIES:
-            time.sleep(FMP_RETRY_BACKOFF_SECONDS * (2**attempt))
-            continue
-        return _parse_fmp_response(response, path)
+            raise error_type(f"Yahoo Finance {description} failed ({type(error).__name__}).") from None
     # Unreachable: the final attempt always returns or raises.
-    raise FmpError(f"FMP request to {path} failed.")
-
-
-def _fmp_get_with_fallback(
-    v3_request: tuple[str, dict[str, str | int]],
-    stable_request: tuple[str, dict[str, str | int]],
-) -> Any:
-    global _use_stable_api
-    if not _use_stable_api:
-        try:
-            return _fmp_get_json(*v3_request)
-        except FmpLegacyEndpointError:
-            _use_stable_api = True
-            print("[quality] FMP refused /api/v3/ as legacy; using the /stable/ API from now on.")
-    return _fmp_get_json(*stable_request)
+    raise error_type(f"Yahoo Finance {description} failed.")
 
 
 def fetch_daily_closes(symbol: str, today: date) -> list[float]:
-    """Daily closes for the last PRICE_HISTORY_DAYS, oldest first, from
-    Yahoo Finance via yfinance.
+    """Daily closes for the last PRICE_HISTORY_DAYS, oldest first.
 
-    Uses the unadjusted-for-dividends "Close" column (auto_adjust=False):
-    Yahoo still adjusts it for splits, so a split can't fake a crash in the
-    Z-Score, and the latest close matches the quoted price the app shows.
+    Uses the "Close" column with auto_adjust=False: Yahoo adjusts it for
+    splits (so a split can't fake a crash in the Z-Score) but not for
+    dividends (so the latest close matches the quoted price the app shows).
 
-    An unknown ticker (yfinance raises a YFTickerMissingError subclass)
-    returns [], which the caller reports as "not found". Any other failure
-    raises PriceHistoryError. raise_errors=True is what tells the two
+    An unknown ticker returns [], which the caller reports as "not found".
+    Any other failure raises. raise_errors=True is what tells the two
     apart: by default yfinance logs errors and returns an empty table, so a
     Yahoo outage would look like a ticker with no history.
     """
     start = today - timedelta(days=PRICE_HISTORY_DAYS)
     end = today + timedelta(days=1)  # yfinance's `end` is exclusive
 
-    history = None
-    for attempt in range(YF_MAX_ATTEMPTS):
-        try:
-            history = yf.Ticker(symbol).history(
+    try:
+        history = _with_retries(
+            lambda: yf.Ticker(symbol).history(
                 start=start.isoformat(),
                 end=end.isoformat(),
                 interval="1d",
@@ -245,19 +144,12 @@ def fetch_daily_closes(symbol: str, today: date) -> list[float]:
                 actions=False,
                 timeout=YF_TIMEOUT_SECONDS,
                 raise_errors=True,
-            )
-            break
-        except YFTickerMissingError:
-            return []
-        except YFRateLimitError:
-            raise PriceHistoryError(f"Yahoo Finance rate-limited the price history request for '{symbol}'.") from None
-        except Exception as error:  # noqa: BLE001 - yfinance surfaces network/parse failures as many types
-            if attempt < YF_MAX_ATTEMPTS - 1:
-                time.sleep(YF_RETRY_BACKOFF_SECONDS)
-                continue
-            raise PriceHistoryError(
-                f"Yahoo Finance price history request for '{symbol}' failed ({type(error).__name__})."
-            ) from None
+            ),
+            PriceHistoryError,
+            f"price history request for '{symbol}'",
+        )
+    except YFTickerMissingError:
+        return []
 
     if history is None or history.empty or "Close" not in history.columns:
         return []
@@ -276,36 +168,41 @@ def fetch_daily_closes(symbol: str, today: date) -> list[float]:
     return [close for _, close in dated_closes]
 
 
-def fetch_annual_roic_pcts(symbol: str) -> list[float]:
-    """Annual ROIC as percents, newest first, at most MOAT_MAX_YEARS.
+@dataclass(frozen=True)
+class ProfitabilityMetrics:
+    """Current trailing ratios from Ticker.info (0.28 = 28%). Each is None
+    when Yahoo doesn't report it, e.g. for an ETF."""
 
-    v3 key-metrics reports ROIC as `roic`; /stable/ as
-    `returnOnInvestedCapital`. Both are ratios (0.28 means 28%) and are
-    converted to percents here. Years with no ROIC value are skipped. An
-    empty list (e.g. an ETF, which has no financial statements) is a valid
-    result, not an error.
-    """
-    path_symbol = quote(symbol, safe="")
-    payload = _fmp_get_with_fallback(
-        (f"/api/v3/key-metrics/{path_symbol}", {"period": "annual", "limit": MOAT_MAX_YEARS}),
-        ("/stable/key-metrics", {"symbol": symbol, "period": "annual", "limit": MOAT_MAX_YEARS}),
+    return_on_equity: float | None
+    return_on_assets: float | None
+    operating_margin: float | None
+
+
+def _info_ratio(info: dict[str, Any], key: str) -> float | None:
+    value = info.get(key)
+    if isinstance(value, bool):  # bool is an int subclass; never a ratio
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    return ratio if math.isfinite(ratio) else None
+
+
+def fetch_profitability(symbol: str) -> ProfitabilityMetrics:
+    """ROE, ROA and operating margin from Ticker(symbol).info. Missing
+    figures are a valid result (all None for an ETF), not an error."""
+    try:
+        info = _with_retries(lambda: yf.Ticker(symbol).info, FundamentalsError, f"fundamentals request for '{symbol}'")
+    except YFTickerMissingError:
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    return ProfitabilityMetrics(
+        return_on_equity=_info_ratio(info, "returnOnEquity"),
+        return_on_assets=_info_ratio(info, "returnOnAssets"),
+        operating_margin=_info_ratio(info, "operatingMargins"),
     )
-    if not isinstance(payload, list):
-        return []
-
-    dated_roics: list[tuple[str, float]] = []
-    for row in payload:
-        if not isinstance(row, dict):
-            continue
-        raw = row.get("roic", row.get("returnOnInvestedCapital"))
-        if raw is None:
-            continue
-        try:
-            dated_roics.append((str(row.get("date", "")), float(raw) * 100))
-        except (TypeError, ValueError):
-            continue
-    dated_roics.sort(key=lambda pair: pair[0], reverse=True)  # ISO dates sort as text
-    return [roic for _, roic in dated_roics[:MOAT_MAX_YEARS]]
 
 
 # --- Calculations ---------------------------------------------------------
@@ -334,23 +231,25 @@ def compute_price_statistics(closes: list[float]) -> PriceStatistics:
     return PriceStatistics(current_price, mean_price, std_dev, z_score)
 
 
-def compute_moat(roic_pcts_newest_first: list[float]) -> tuple[float | None, Moat]:
-    """Returns (current ROIC, moat) from up to 5 years of annual ROIC.
+def compute_roic_proxy_pct(metrics: ProfitabilityMetrics) -> float | None:
+    """ROE as a percent, falling back to ROA; None when neither exists."""
+    ratio = metrics.return_on_equity if metrics.return_on_equity is not None else metrics.return_on_assets
+    return ratio * 100 if ratio is not None else None
 
-    Current ROIC is reported as long as one year exists. Moat is judged
-    strictly on the available years (3 to 5), and is 'None' with fewer
-    than 3.
-    """
-    years = roic_pcts_newest_first[:MOAT_MAX_YEARS]
-    current_roic = years[0] if years else None
-    if len(years) < MOAT_MIN_YEARS:
-        return current_roic, "None"
-    average = statistics.fmean(years)
-    if average >= WIDE_MOAT_MIN_AVG_ROIC_PCT and min(years) >= WIDE_MOAT_MIN_YEAR_ROIC_PCT:
-        return current_roic, "Wide"
-    if average >= NARROW_MOAT_MIN_AVG_ROIC_PCT:
-        return current_roic, "Narrow"
-    return current_roic, "None"
+
+def compute_moat(metrics: ProfitabilityMetrics) -> Moat:
+    """Wide / Narrow / None from ROE and the operating margin together. If
+    either is missing the moat is 'None', even when the ROIC proxy fell
+    back to ROA."""
+    roe = metrics.return_on_equity
+    margin = metrics.operating_margin
+    if roe is None or margin is None:
+        return "None"
+    if roe >= WIDE_MOAT_MIN_RATIO and margin >= WIDE_MOAT_MIN_RATIO:
+        return "Wide"
+    if roe >= NARROW_MOAT_MIN_RATIO and margin >= NARROW_MOAT_MIN_RATIO:
+        return "Narrow"
+    return "None"
 
 
 # --- Cache ----------------------------------------------------------------
@@ -416,7 +315,7 @@ class QualityMetricsStore:
 
 
 # One lock per ticker, so concurrent requests for the same ticker refresh
-# once instead of each spending FMP quota (and Yahoo calls) on the same data.
+# once instead of each making the same Yahoo calls.
 _symbol_locks: dict[str, threading.Lock] = {}
 _symbol_locks_guard = threading.Lock()
 
@@ -444,13 +343,13 @@ def _to_float(value: Any) -> float | None:
 def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime | None = None) -> dict[str, Any]:
     """The full cache-then-fetch flow for one already-validated symbol:
       1. Load the cached row.
-      2. Refresh statistics (Yahoo Finance) if older than 24h or missing.
-      3. Refresh fundamentals (FMP) if older than 30 days or missing.
+      2. Refresh statistics if older than 24h or missing.
+      3. Refresh fundamentals if older than 30 days or missing.
       4. Save the row if anything was refreshed, then return the payload.
     A failed refresh falls back to the expired cached half (flagged stale);
     with nothing cached for that half, the error is raised. Statistics are
-    refreshed first, so an unknown ticker stops before the fundamentals
-    call spends FMP quota.
+    refreshed first, so an unknown ticker stops before the heavier .info
+    call is made.
     """
     now = now or datetime.now(timezone.utc)
     with _symbol_lock(symbol):
@@ -477,7 +376,7 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
                         last_updated_stats=now.isoformat(),
                     )
                     refreshed = True
-            except PriceHistoryError as error:
+            except QualityDataError as error:
                 if not _has_stats(row):
                     raise
                 print(f"[quality] Statistics refresh failed for '{symbol}' ({error}); serving cached values.")
@@ -485,14 +384,15 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
 
         if not (_has_fundamentals(row) and _is_fresh(row.get("last_updated_fundamentals"), FUNDAMENTALS_TTL, now)):
             try:
-                current_roic, moat = compute_moat(fetch_annual_roic_pcts(symbol))
+                metrics = fetch_profitability(symbol)
+                roic_proxy = compute_roic_proxy_pct(metrics)
                 row.update(
-                    roic=round(current_roic, 2) if current_roic is not None else None,
-                    moat=moat,
+                    roic=round(roic_proxy, 2) if roic_proxy is not None else None,
+                    moat=compute_moat(metrics),
                     last_updated_fundamentals=now.isoformat(),
                 )
                 refreshed = True
-            except FmpError as error:
+            except QualityDataError as error:
                 if not _has_fundamentals(row):
                     raise
                 print(f"[quality] Fundamentals refresh failed for '{symbol}' ({error}); serving cached values.")
@@ -542,11 +442,9 @@ def create_quality_router(get_supabase_client: Callable[[], Any]) -> APIRouter:
             return get_quality_metrics(symbol, store)
         except QualityTickerNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from None
-        except (FmpNotConfiguredError, FmpAuthError, FmpPaymentRequiredError) as error:
-            raise HTTPException(status_code=503, detail=f"Quality data source unavailable: {error}") from None
-        except FmpRateLimitError as error:
+        except QualityRateLimitError as error:
             raise HTTPException(status_code=429, detail=str(error)) from None
-        except (FmpError, PriceHistoryError) as error:
+        except QualityDataError as error:
             raise HTTPException(status_code=502, detail=str(error)) from None
 
     return router
