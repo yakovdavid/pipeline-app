@@ -27,14 +27,9 @@ export type PortfolioTickerEntry = {
   // Undefined/missing (older, pre-feature entries) and exactly 1.0 both
   // mean "no correction" — see DEFAULT_CALIBRATION_FACTOR.
   calibrationFactor?: number;
-  // QUALITY Z-SCORE MODULE: this position's fundamental Return on
-  // Invested Capital, entered manually (Yahoo/yfinance doesn't expose
-  // this) — one half of the backend's Z-Score alert gate (see
-  // backend/main.py's QUALITY_ZSCORE_MIN_ROIC). Null until the user
-  // enters one; relevant for Quality-category positions only, but tracked
-  // regardless of category (harmless, same reasoning as
-  // highestWatermark above) in case a position is later recategorized.
-  roic: number | null;
+  // (ROIC is deliberately NOT stored here: it's fetched automatically from
+  // FMP via GET /api/quality. Older saved entries may still carry a manual
+  // `roic` field; it is ignored on load and dropped on the next save.)
   // CORE LAYER INTERNAL ALLOCATION: an optional, user-defined target for
   // this asset's own share WITHIN its layer (e.g. "AAPL should be 40% of
   // Core"), entered manually — there's no fixed model for sub-asset
@@ -43,7 +38,7 @@ export type PortfolioTickerEntry = {
   // ("no internal target set") until the user defines one. Primarily
   // surfaced for Core positions today (see PortfolioStockRow's
   // "Internal Allocation" line), but tracked regardless of category, same
-  // reasoning as roic/highestWatermark above.
+  // reasoning as highestWatermark above.
   internalTargetPct: number | null;
 };
 
@@ -89,17 +84,15 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // PortfolioStockRow itself still follows the Fortress 2.0 Indicator
   // Purge and shows nothing SMA-derived outside Satellite).
   pullbackDepth: number | null;
-  // QUALITY Z-SCORE MODULE: backend-computed (see backend/main.py's
-  // _calculate_quality_zscore), null for every non-Quality asset or
-  // whenever there isn't enough price history. Live/ephemeral, never
-  // persisted, same as drawdownPct.
+  // QUALITY Z-SCORE MODULE (SSOT): the z_score from GET /api/quality
+  // (backend/quality.py), the same number the Ambush Radar shows. Null for
+  // every non-Quality asset, or when that endpoint has no Z-Score or
+  // failed. Live/ephemeral, never persisted, same as drawdownPct.
   qualityZScore: number | null;
-  // Whether the backend's roic >= 15% AND Quality-layer-weight <= 10% gate
-  // (see backend/main.py's QUALITY_ZSCORE_* constants) was satisfied for
-  // THIS specific request — never re-derived client-side; PortfolioStockRow
-  // additionally hardcodes a `stock.category === 'Quality'` check before
-  // ever showing this, so a stale/mis-set value from a future bug can't
-  // surface an alert on the wrong layer.
+  // The Quality Buy Signal: Z-Score <= -1.0 AND ROIC >= 15% AND a moat,
+  // the Ambush Radar's Value Zone rule (isQualityBuySignal in
+  // @/utils/quality-signal). PortfolioStockRow additionally checks
+  // `stock.category === 'Quality'` before showing it.
   qualityZScoreAlert: boolean;
   // DATA-LOSS FIX: see StockQuote.priceStatus in @/services/api. An
   // 'unavailable' position keeps every persisted field (units, watermark,

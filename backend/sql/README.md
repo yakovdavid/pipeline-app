@@ -53,3 +53,9 @@ Once a Supabase project exists and you have its connection details:
   ticker to the radar and deletes the position. Called by `backend/main.py`'s
   `DELETE /api/portfolio/{ticker}`, which returns 503 until Supabase is
   configured.
+- `004_quality_metrics_cache.sql` — independent of the others. Creates the
+  `quality_metrics` table that caches Financial Modeling Prep results for
+  `GET /api/quality/{ticker}` (`backend/quality.py`): Z-Score statistics
+  (refreshed after 24h) and ROIC/Moat fundamentals (refreshed after 30
+  days). RLS is enabled with no policies, so only the service key can
+  access it. Until Supabase is configured, the endpoint caches in memory.

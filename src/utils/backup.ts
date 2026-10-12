@@ -52,7 +52,6 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
           assetType: 'Stock',
           units: 0,
           highestWatermark: null,
-          roic: null,
           internalTargetPct: null,
         }
       : null;
@@ -84,11 +83,8 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
       typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
         ? entry.calibrationFactor
         : undefined,
-    // QUALITY Z-SCORE MODULE: must round-trip through backup export/
-    // import same as every other persisted field — dropping it here would
-    // silently wipe out a user-entered ROIC the moment a backup is
-    // restored.
-    roic: typeof entry.roic === 'number' ? entry.roic : null,
+    // A manual `roic` from an older backup is ignored: ROIC is fetched
+    // automatically from FMP (GET /api/quality).
     // CORE LAYER INTERNAL ALLOCATION: must round-trip through backup
     // export/import same as every other persisted field — dropping it
     // here would silently wipe out a user-defined internal target the
@@ -103,7 +99,7 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
 function coerceAmbushEntry(value: unknown): AmbushTickerEntry | null {
   if (typeof value === 'string') {
     const ticker = value.trim().toUpperCase();
-    return ticker.length > 0 ? { ticker, assetType: 'Stock' } : null;
+    return ticker.length > 0 ? { ticker, assetType: 'Stock', layer: 'Satellite' } : null;
   }
   if (typeof value !== 'object' || value === null) {
     return null;
@@ -115,6 +111,10 @@ function coerceAmbushEntry(value: unknown): AmbushTickerEntry | null {
   return {
     ticker: entry.ticker.trim().toUpperCase(),
     assetType: normalizeAssetType(entry.assetType),
+    // UNIFIED RADAR: the layer must round-trip, or restoring a backup would
+    // turn every Quality entry back into a Satellite. Older backups have no
+    // layer and restore as Satellite, which is what they always were.
+    layer: entry.layer === 'Quality' ? 'Quality' : 'Satellite',
   };
 }
 

@@ -1,11 +1,13 @@
-import type { Stock } from '@/components/StockCard';
+import type { AmbushAsset } from '@/types/ambush';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import type { PortfolioStock } from '@/types/portfolio';
 import { getEffectiveUnits } from '@/utils/currency';
 
 // Shared by the Ambush Radar screen's own export and the Portfolio screen's
 // combined export, so the two reports describe Ambush data identically.
-export function formatAmbushLines(stocks: Stock[]): string[] {
+// Each line is tagged with its layer; Quality lines report the backend's
+// fundamentals and Z-Score, Satellite lines the technicals.
+export function formatAmbushLines(stocks: AmbushAsset[]): string[] {
   if (stocks.length === 0) {
     return ['  (none)'];
   }
@@ -13,7 +15,15 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
     // DATA-LOSS FIX: a ticker whose fetch failed is still listed, but its
     // placeholder numbers are never printed as real prices.
     if (stock.priceStatus === 'unavailable') {
-      return [`  ${stock.ticker} (${stock.assetType}): PRICE UNAVAILABLE (fetch failed)`];
+      return [`  ${stock.ticker} (${stock.assetType}, ${stock.layer}): PRICE UNAVAILABLE (fetch failed)`];
+    }
+    if (stock.layer === 'Quality') {
+      const roicText = stock.roic === null ? 'N/A' : `${stock.roic.toFixed(1)}%`;
+      const zScoreText = stock.zScore === null ? 'N/A' : stock.zScore.toFixed(2);
+      return [
+        `  ${stock.ticker} (${stock.assetType}, Quality): Price $${stock.price.toFixed(2)} | ` +
+          `ROIC ${roicText} | Moat: ${stock.moat ?? 'N/A'} | Z-Score: ${zScoreText}`,
+      ];
     }
     // TREND CLASSIFICATION: both backend-computed signals (see
     // backend/main.py's _classify_trend), replacing the old single,
@@ -33,7 +43,7 @@ export function formatAmbushLines(stocks: Stock[]): string[] {
     const warningSuffix = isNearStructuralStop ? ' [STRUCTURAL STOP WARNING]' : '';
 
     const line =
-      `  ${stock.ticker} (${stock.assetType}): Price $${stock.price.toFixed(2)} | ` +
+      `  ${stock.ticker} (${stock.assetType}, Satellite): Price $${stock.price.toFixed(2)} | ` +
       `SMA50 ${sma50Text} | SMA200 ${sma200Text} | Macro: ${macroTrendText} | ` +
       `Tactical: ${tacticalMomentumText}${warningSuffix}`;
 

@@ -54,7 +54,6 @@ export type TranslationKey =
   | 'invalidated'
   | 'qualityZScore'
   | 'zScoreAlert'
-  | 'roicPlaceholder'
   // Core Layer Internal Allocation
   | 'internalAllocation'
   | 'internalTargetPlaceholder'
@@ -82,7 +81,6 @@ export type TranslationKey =
   | 'moatNarrow'
   | 'moatNone'
   | 'zScoreLabel'
-  | 'demoTag'
   // Closed-loop watchlist: Satellite/Quality liquidation feedback toast
   | 'liquidatedMovedToAmbush'
   | 'liquidatedAlreadyOnAmbush'
@@ -213,7 +211,6 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     invalidated: 'מבוטל',
     qualityZScore: 'ציון Z איכות',
     zScoreAlert: 'התראת ציון Z',
-    roicPlaceholder: "תשואה על ההון המושקע % (איכות) - אופציונלי",
     internalAllocation: 'הקצאה פנימית',
     internalTargetPlaceholder: 'יעד פנימי % (ליבה) - אופציונלי',
     automatedTracking: 'מעקב אוטומטי',
@@ -235,7 +232,6 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     moatNarrow: 'צר',
     moatNone: 'אין',
     zScoreLabel: 'ציון Z',
-    demoTag: 'הדגמה',
     liquidatedMovedToAmbush: '{{ticker}} מומש והועבר למכ״ם המארבים',
     liquidatedAlreadyOnAmbush: '{{ticker}} מומש — כבר נמצא במכ״ם המארבים',
     liquidatedAmbushFailed: '{{ticker}} מומש, אך לא ניתן היה להוסיף אותו למכ״ם המארבים',
@@ -350,7 +346,6 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     invalidated: 'Invalidated',
     qualityZScore: 'Quality Z-Score',
     zScoreAlert: 'Z-Score Alert',
-    roicPlaceholder: 'ROIC % (Quality) - optional',
     internalAllocation: 'Internal Allocation',
     internalTargetPlaceholder: 'Internal Target % (Core) - optional',
     automatedTracking: 'Automated Tracking',
@@ -372,7 +367,6 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     moatNarrow: 'Narrow',
     moatNone: 'None',
     zScoreLabel: 'Z-Score',
-    demoTag: 'DEMO',
     liquidatedMovedToAmbush: '{{ticker}} liquidated and moved to Ambush Radar',
     liquidatedAlreadyOnAmbush: '{{ticker}} liquidated — already on Ambush Radar',
     liquidatedAmbushFailed: "{{ticker}} liquidated, but couldn't be added to Ambush Radar",

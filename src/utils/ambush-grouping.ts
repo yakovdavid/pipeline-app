@@ -1,5 +1,6 @@
 import type { AmbushAsset, QualityAmbushAsset, SatelliteAmbushAsset } from '@/types/ambush';
 import { classifyPullbackZone } from '@/utils/ambush-zone';
+import { isQualityBuySignal, passesQualityFundamentals } from '@/utils/quality-signal';
 
 // UNIFIED RADAR: assets are grouped by operational readiness, not by layer,
 // so Satellite and Quality assets in the same state share a section.
@@ -7,11 +8,6 @@ export type AmbushReadinessZone = 'valueZone' | 'watch' | 'invalidated';
 
 // Display order of the radar's sections.
 export const AMBUSH_READINESS_ORDER: readonly AmbushReadinessZone[] = ['valueZone', 'watch', 'invalidated'];
-
-// A Quality asset must clear both fundamental gates to be considered at all.
-export const QUALITY_MIN_ROIC_PCT = 15;
-// At or below this Z-Score, a fundamentally sound Quality asset is actionable.
-export const QUALITY_VALUE_ZONE_MAX_ZSCORE = -1.0;
 
 export type AmbushReadinessGroups = Record<AmbushReadinessZone, AmbushAsset[]>;
 
@@ -49,16 +45,19 @@ function classifySatellite(asset: SatelliteAmbushAsset): AmbushReadinessZone {
   }
 }
 
-// Quality (fundamental + statistical):
-//   Invalidated: ROIC < 15% or no moat.
-//   Value Zone:  passes both gates and Z-Score <= -1.0.
-//   Watch:       passes both gates and Z-Score  > -1.0.
-// These three conditions are mutually exclusive and cover every asset.
+// Quality (fundamental + statistical), on live GET /api/quality data. The
+// rules live in @/utils/quality-signal, shared with the Portfolio alert:
+//   Invalidated: fails a fundamental gate (ROIC < 15%, no moat, or either
+//     unknown), or the fetch failed.
+//   Value Zone:  a Buy Signal: passes both gates and Z-Score <= -1.0. The
+//     Portfolio raises its Quality alert on exactly the same condition.
+//   Watch:       passes both gates, but Z-Score > -1.0 or no Z-Score yet
+//                (too little price history).
 function classifyQuality(asset: QualityAmbushAsset): AmbushReadinessZone {
-  if (asset.roic < QUALITY_MIN_ROIC_PCT || asset.moat === 'None') {
+  if (asset.priceStatus === 'unavailable' || !passesQualityFundamentals(asset)) {
     return 'invalidated';
   }
-  return asset.zScore <= QUALITY_VALUE_ZONE_MAX_ZSCORE ? 'valueZone' : 'watch';
+  return isQualityBuySignal(asset) ? 'valueZone' : 'watch';
 }
 
 export function classifyAmbushReadiness(asset: AmbushAsset): AmbushReadinessZone {
@@ -88,6 +87,11 @@ function compareReadiness(a: AmbushAsset, b: AmbushAsset): number {
     return compareSatellite(a, b);
   }
   if (a.layer === 'Quality' && b.layer === 'Quality') {
+    // Rows without a Z-Score sort after those with one.
+    if (a.zScore === null || b.zScore === null) {
+      if (a.zScore === b.zScore) return 0;
+      return a.zScore === null ? 1 : -1;
+    }
     return a.zScore - b.zScore;
   }
   return 0;

@@ -22,19 +22,26 @@ import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { QualityAmbushCard } from '@/components/QualityAmbushCard';
 import { StockCard } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
-import { DEMO_QUALITY_AMBUSH_ASSETS } from '@/constants/ambush-demo-data';
 import { AMBUSH_ZONE_TITLE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
-import { assetTypeLabel } from '@/constants/labels';
+import { assetTypeLabel, categoryLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
-import { createUnavailableQuote, fetchInChunks, fetchStockData, type StockQuote } from '@/services/api';
-import type { AmbushAsset, AmbushTickerEntry, SatelliteAmbushAsset } from '@/types/ambush';
+import { fetchInChunks, fetchQualityMetrics, fetchStockData } from '@/services/api';
+import type { AmbushAsset, AmbushLayer, AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import { AMBUSH_READINESS_ORDER, groupAmbushByReadiness, type AmbushReadinessZone } from '@/utils/ambush-grouping';
+import {
+  buildQualityAmbushAsset,
+  buildSatelliteAmbushAsset,
+  buildUnavailableAmbushAsset,
+  fetchAmbushAsset,
+  refreshAmbushAsset,
+  toAmbushTickerEntry,
+} from '@/utils/ambush-assets';
 import { loadAmbushTickerEntries, subscribeToAmbushAdditions } from '@/utils/ambush-storage';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
@@ -61,21 +68,26 @@ const INITIAL_COLLAPSED_SECTIONS: Record<AmbushReadinessZone, boolean> = {
   invalidated: false,
 };
 
-// Keyed by layer AND ticker: the same ticker can be on the radar as both a
-// Satellite and a Quality asset (the AAPL demo row alongside a watched
-// AAPL, for instance), and React keys must be unique.
-function extractAmbushItemKey(item: AmbushAsset): string {
+// A ticker appears on the radar once (add and liquidation both skip a
+// ticker that's already there, in either layer), but the key still
+// includes the layer so a row's key changes if it ever switches layer.
+function ambushAssetKey(item: AmbushAsset): string {
   return `${item.layer}:${item.ticker}`;
 }
 
+function isSameTicker(a: string, b: string): boolean {
+  return a.trim().toUpperCase() === b.trim().toUpperCase();
+}
+
 const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
-  { ticker: 'AAPL', assetType: 'Stock' },
-  { ticker: 'TSLA', assetType: 'Stock' },
+  { ticker: 'AAPL', assetType: 'Stock', layer: 'Satellite' },
+  { ticker: 'TSLA', assetType: 'Stock', layer: 'Satellite' },
 ];
 
-// "Ambush Radar" (מכ"ם מארבים) tracks stocks and ETFs against their trend to
-// surface mean-reversion opportunities: stocks are judged against SMA50,
-// ETFs against the longer SMA200 (see StockCard for the trend rule itself).
+// "Ambush Radar" (מכ"ם מארבים): one watchlist of re-entry candidates in two
+// layers, grouped by readiness. Satellite tickers are judged on Yahoo
+// technicals (Macro Trend + Pullback Depth, see StockCard); Quality tickers
+// on the backend's 2-year Z-Score, ROIC and Moat (see QualityAmbushCard).
 export default function AmbushRadarScreen() {
   const { colors, isDarkMode } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read, same as usePipelineTheme
@@ -84,29 +96,29 @@ export default function AmbushRadarScreen() {
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
-  // The real, persisted watchlist. Every row is a Satellite asset, tagged
-  // `layer: 'Satellite'` when it is created (load, add, liquidation
-  // handover) rather than at render time, so unchanged rows keep their
-  // object identity and StockCard's memo() keeps working.
-  const [stocks, setStocks] = useState<SatelliteAmbushAsset[]>([]);
+  // The real, persisted watchlist: Satellite AND Quality rows, each built
+  // from its own data source (see @/utils/ambush-assets). Rows are created
+  // already tagged with their layer, so unchanged rows keep their object
+  // identity and the cards' memo() keeps working.
+  const [assets, setAssets] = useState<AmbushAsset[]>([]);
   // CACHE INTEGRITY (AppState/hydration safety): see the identical
   // canPersistRef in PortfolioScreen (index.tsx) for the full rationale —
   // the short version is that the persistence effect below used to gate
   // purely on `!isInitializing`, which flips to false on every exit path
   // out of loadAmbushData, including the two bail-outs that deliberately
-  // leave `stocks` untouched. That let a failed/interrupted load (e.g.
+  // leave `assets` untouched. That let a failed/interrupted load (e.g.
   // the OS suspending an in-flight fetch while this app was backgrounded
   // on Android) permanently overwrite the real, still-intact
   // AsyncStorage watchlist with an empty array the instant isInitializing
   // went false. canPersistRef starts false and is flipped true ONLY by
-  // setStocksTrusted, which every call site with genuinely trustworthy
-  // data already uses instead of calling setStocks directly.
+  // setAssetsTrusted, which every call site with genuinely trustworthy
+  // data already uses instead of calling setAssets directly.
   const canPersistRef = useRef(false);
 
-  const setStocksTrusted = useCallback(
-    (update: SatelliteAmbushAsset[] | ((previous: SatelliteAmbushAsset[]) => SatelliteAmbushAsset[])) => {
+  const setAssetsTrusted = useCallback(
+    (update: AmbushAsset[] | ((previous: AmbushAsset[]) => AmbushAsset[])) => {
       canPersistRef.current = true;
-      setStocks(update);
+      setAssets(update);
     },
     [],
   );
@@ -119,6 +131,8 @@ export default function AmbushRadarScreen() {
   const [syncWarning, setSyncWarning] = useState(false);
   const [ticker, setTicker] = useState('');
   const [selectedAssetType, setSelectedAssetType] = useState<AssetType>('Stock');
+  // Which layer a newly added ticker joins, and so which data source it uses.
+  const [selectedLayer, setSelectedLayer] = useState<AmbushLayer>('Satellite');
   const [isAdding, setIsAdding] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -155,7 +169,7 @@ export default function AmbushRadarScreen() {
             'previous state instead of falling back to defaults.',
           error,
         );
-        // CACHE INTEGRITY: deliberately NOT setStocksTrusted — canPersistRef
+        // CACHE INTEGRITY: deliberately NOT setAssetsTrusted — canPersistRef
         // stays false, so the persistence effect below keeps refusing to
         // write until a load actually succeeds.
         if (isStillRelevant()) {
@@ -170,7 +184,7 @@ export default function AmbushRadarScreen() {
         // every ticker) is valid state, not a failure — show it as-is,
         // and this IS trustworthy enough to persist.
         if (isStillRelevant()) {
-          setStocksTrusted([]);
+          setAssetsTrusted([]);
           setSyncWarning(false);
           setIsInitializing(false);
         }
@@ -181,27 +195,23 @@ export default function AmbushRadarScreen() {
       // Promise.allSettled over the whole watchlist at once) to avoid
       // overwhelming the network with N simultaneous connections — this
       // still awaits the full queue before moving on, so isInitializing
-      // below only flips to false once every batch has resolved.
-      const results = await fetchInChunks(entries, (entry) => fetchStockData(entry.ticker));
+      // below only flips to false once every batch has resolved. Each entry
+      // is fetched from its own layer's source (fetchAmbushAsset):
+      // Satellite from /api/stock, Quality from /api/quality.
+      const results = await fetchInChunks(entries, fetchAmbushAsset);
 
       // DATA-LOSS FIX: one row per stored ticker, ALWAYS, in storage order.
-      // A ticker whose fetch failed becomes an 'unavailable' row (see
-      // createUnavailableQuote) instead of being dropped. The old code kept
-      // only the fulfilled results, so the persistence effect then saved
-      // that shorter list and permanently removed every ticker whose fetch
-      // happened to fail. Because this list now matches storage entry for
-      // entry, it is safe to mark trusted and persist even when EVERY fetch
-      // failed: saving it writes back exactly what was read.
-      const loadedStocks: SatelliteAmbushAsset[] = entries.map((entry, index) => {
+      // A ticker whose fetch failed becomes an 'unavailable' row instead of
+      // being dropped (fetchAmbushAsset never rejects; the rejected branch
+      // is only a type-level fallback). Because this list matches storage
+      // entry for entry, it is safe to mark trusted and persist even when
+      // EVERY fetch failed: saving it writes back exactly what was read.
+      const loadedAssets: AmbushAsset[] = entries.map((entry, index) => {
         const result = results[index];
-        return {
-          ...entry,
-          ...(result.status === 'fulfilled' ? result.value : createUnavailableQuote()),
-          layer: 'Satellite',
-        };
+        return result.status === 'fulfilled' ? result.value : buildUnavailableAmbushAsset(entry);
       });
 
-      const failedCount = results.filter((result) => result.status === 'rejected').length;
+      const failedCount = loadedAssets.filter((asset) => asset.priceStatus === 'unavailable').length;
       if (failedCount > 0) {
         console.error(
           `[hydration] ${failedCount} of ${entries.length} ticker fetch(es) failed; keeping those ` +
@@ -210,14 +220,14 @@ export default function AmbushRadarScreen() {
       }
 
       if (isStillRelevant()) {
-        setStocksTrusted(loadedStocks);
+        setAssetsTrusted(loadedAssets);
         // Screen-level banner only for a sync-wide failure; a partial
         // failure shows on the affected cards.
         setSyncWarning(failedCount === entries.length);
         setIsInitializing(false);
       }
     },
-    [setStocksTrusted],
+    [setAssetsTrusted],
   );
 
   // Load the saved watchlist every time this tab gains focus (including the
@@ -249,18 +259,17 @@ export default function AmbushRadarScreen() {
   // so the next successful load shows it.
   useEffect(
     () =>
-      subscribeToAmbushAdditions((addedStock) => {
+      subscribeToAmbushAdditions((addedAsset) => {
         if (!canPersistRef.current) {
           return;
         }
-        const addedTicker = addedStock.ticker.trim().toUpperCase();
-        setStocksTrusted((prevStocks) =>
-          prevStocks.some((stock) => stock.ticker.trim().toUpperCase() === addedTicker)
-            ? prevStocks
-            : [...prevStocks, { ...addedStock, layer: 'Satellite' }],
+        setAssetsTrusted((previous) =>
+          previous.some((asset) => isSameTicker(asset.ticker, addedAsset.ticker))
+            ? previous
+            : [...previous, addedAsset],
         );
       }),
-    [setStocksTrusted],
+    [setAssetsTrusted],
   );
 
   // Tracks whether this screen is still mounted — read from the AppState
@@ -286,12 +295,12 @@ export default function AmbushRadarScreen() {
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      const tickersToRefresh = stocks.map((stock) => stock.ticker);
+      const assetsToRefresh = assets;
 
-      if (tickersToRefresh.length === 0) {
+      if (assetsToRefresh.length === 0) {
         // Nothing to refresh — either a genuinely empty watchlist, or the
         // initial load never got real data in. Skip entirely rather than
-        // calling setStocksTrusted with a no-op empty result, which would
+        // calling setAssetsTrusted with a no-op empty result, which would
         // wrongly mark canPersistRef as trustworthy and let the
         // persistence effect below write this still-empty `[]` over
         // whatever real data is (or isn't) actually sitting in
@@ -299,30 +308,28 @@ export default function AmbushRadarScreen() {
         return;
       }
 
-      // CONCURRENCY LIMITING: see loadAmbushData above — small batches,
-      // not one Promise.allSettled over the whole list. Parameter
-      // deliberately not named `t` here (unlike elsewhere in this file)
-      // to avoid shadowing the translation function from
-      // usePipelineLanguage.
-      const results = await fetchInChunks(tickersToRefresh, (tickerSymbol) => fetchStockData(tickerSymbol));
+      // Each row refreshes from its own layer's source. refreshAmbushAsset
+      // returns null on failure, so a failed row keeps its last good data
+      // (or stays 'unavailable') instead of being replaced by a placeholder.
+      // CONCURRENCY LIMITING: small batches, same as loadAmbushData.
+      const results = await fetchInChunks(assetsToRefresh, refreshAmbushAsset);
 
-      // Map successful results back by ticker (rather than by index) so a
-      // concurrent add/delete during the fetch can't misalign the data.
-      const freshQuotes = new Map<string, StockQuote>();
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          freshQuotes.set(tickersToRefresh[index], result.value);
+      // Mapped back by layer+ticker (not by index) so a concurrent
+      // add/delete during the fetch can't misalign the data.
+      const freshAssets = new Map<string, AmbushAsset>();
+      results.forEach((result) => {
+        if (result.status === 'fulfilled' && result.value !== null) {
+          freshAssets.set(ambushAssetKey(result.value), result.value);
         }
       });
 
       // STATE PROTECTION: every single refresh attempt failed (network
       // outage, or the app got backgrounded mid-refresh and the OS
-      // suspended the request) — every position below falls through to
-      // `return stock` unchanged, so nothing is lost, but the user should
-      // still see a subtle signal that this refresh didn't actually reach
-      // the server. A PARTIAL failure is treated as success — normal,
-      // everyday flakiness for one ticker, not a sync-wide problem.
-      if (freshQuotes.size === 0) {
+      // suspended the request) — every row keeps its current data, so
+      // nothing is lost, but the user should still see a subtle signal that
+      // this refresh didn't reach the server. A PARTIAL failure is treated
+      // as success — normal, everyday flakiness for one ticker.
+      if (freshAssets.size === 0) {
         console.error(
           '[sync] All ticker refresh(es) failed (network issue, or the app was backgrounded ' +
             'mid-refresh); retaining the current watchlist instead of clearing it.',
@@ -332,12 +339,7 @@ export default function AmbushRadarScreen() {
       }
       setSyncWarning(false);
 
-      setStocksTrusted((prevStocks) =>
-        prevStocks.map((stock) => {
-          const freshQuote = freshQuotes.get(stock.ticker);
-          return freshQuote ? { ...stock, ...freshQuote } : stock;
-        }),
-      );
+      setAssetsTrusted((previous) => previous.map((asset) => freshAssets.get(ambushAssetKey(asset)) ?? asset));
     } finally {
       setRefreshing(false);
     }
@@ -373,20 +375,23 @@ export default function AmbushRadarScreen() {
       return;
     }
 
-    const entries: AmbushTickerEntry[] = stocks.map(({ ticker: symbol, assetType }) => ({
-      ticker: symbol,
-      assetType,
-    }));
+    // Ticker, asset type and layer for every row, 'unavailable' ones too,
+    // so this list is never shorter than what was loaded.
+    const entries: AmbushTickerEntry[] = assets.map(toAmbushTickerEntry);
     AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(entries)).catch((error) => {
       console.warn('Failed to save watchlist to storage:', error);
     });
-  }, [stocks, isInitializing]);
+  }, [assets, isInitializing]);
 
   // Fire a one-time local notification for any ETF that has just entered
   // the structural stop warning zone (within 2% of its SMA200). Re-arms if
   // the price later moves back out, so a later re-entry notifies again.
+  // Satellite rows only: the structural stop is an SMA200 (technical) rule.
   useEffect(() => {
-    stocks.forEach((stock) => {
+    assets.forEach((stock) => {
+      if (stock.layer !== 'Satellite') {
+        return;
+      }
       // A placeholder price (priceStatus 'unavailable') must never fire a
       // notification.
       const isNearStructuralStop =
@@ -404,25 +409,36 @@ export default function AmbushRadarScreen() {
         notifiedTickersRef.current.delete(stock.ticker);
       }
     });
-  }, [stocks]);
+  }, [assets]);
 
   const handleAddTicker = async () => {
     const normalizedTicker = normalizeTickerInput(ticker);
     if (!normalizedTicker || isAdding) {
       return;
     }
-    if (stocks.some((stock) => stock.ticker === normalizedTicker)) {
+    // A ticker appears on the radar once, in either layer.
+    if (assets.some((asset) => isSameTicker(asset.ticker, normalizedTicker))) {
       setTicker('');
       return;
     }
 
     setIsAdding(true);
     try {
-      const quote = await fetchStockData(normalizedTicker);
-      setStocksTrusted((prevStocks) => [
-        ...prevStocks,
-        { ticker: normalizedTicker, assetType: selectedAssetType, ...quote, layer: 'Satellite' },
-      ]);
+      const entry: AmbushTickerEntry = { ticker: normalizedTicker, assetType: selectedAssetType, layer: selectedLayer };
+      // Unlike load/refresh, a failed fetch here is an error the user sees:
+      // a ticker that can't be priced isn't added at all. For Quality that
+      // also covers a ticker FMP has no price history for.
+      let newAsset: AmbushAsset;
+      if (selectedLayer === 'Quality') {
+        const metrics = await fetchQualityMetrics(normalizedTicker);
+        if (metrics.currentPrice === null) {
+          throw new Error(t('fetchFailedForTicker', { ticker: normalizedTicker }));
+        }
+        newAsset = buildQualityAmbushAsset(entry, metrics);
+      } else {
+        newAsset = buildSatelliteAmbushAsset(entry, await fetchStockData(normalizedTicker));
+      }
+      setAssetsTrusted((previous) => [...previous, newAsset]);
       setTicker('');
     } catch (error) {
       const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: normalizedTicker });
@@ -438,20 +454,9 @@ export default function AmbushRadarScreen() {
   // defeat memo() by changing this prop for every row on every render.
   const handleDeleteTicker = useCallback(
     (tickerToDelete: string) => {
-      setStocksTrusted((prevStocks) => prevStocks.filter((stock) => stock.ticker !== tickerToDelete));
+      setAssetsTrusted((previous) => previous.filter((asset) => !isSameTicker(asset.ticker, tickerToDelete)));
     },
-    [setStocksTrusted],
-  );
-
-  // UNIFIED RADAR: Satellite assets (the real, persisted watchlist) plus,
-  // in development builds only, the demo Quality assets. The demo rows are
-  // merged here, into what's DISPLAYED, never into `stocks`. `stocks` is
-  // what the persistence effect saves, so putting them there would write
-  // them into the user's real watchlist. Release builds (__DEV__ false)
-  // show only real assets.
-  const radarAssets = useMemo<AmbushAsset[]>(
-    () => (__DEV__ ? [...stocks, ...DEMO_QUALITY_AMBUSH_ASSETS] : stocks),
-    [stocks],
+    [setAssetsTrusted],
   );
 
   // COLLAPSIBLE SECTIONS: one flag per readiness zone; true means
@@ -471,7 +476,7 @@ export default function AmbushRadarScreen() {
   // asset objects are passed through unchanged, so StockCard's and
   // QualityAmbushCard's memo() still skip rows that didn't change.
   const sections = useMemo<AmbushSection[]>(() => {
-    const groups = groupAmbushByReadiness(radarAssets);
+    const groups = groupAmbushByReadiness(assets);
     return AMBUSH_READINESS_ORDER.filter((zone) => groups[zone].length > 0).map((zone) => ({
       key: zone,
       title: t(AMBUSH_ZONE_TITLE_KEY[zone]),
@@ -480,15 +485,14 @@ export default function AmbushRadarScreen() {
       isCollapsed: collapsedSections[zone],
       data: collapsedSections[zone] ? [] : groups[zone],
     }));
-  }, [radarAssets, collapsedSections, colors, t]);
+  }, [assets, collapsedSections, colors, t]);
 
   // Picks the card by layer. A Quality card gets its section's zone for
-  // its status strip. Quality rows have no delete button: today they are
-  // only demo rows, which aren't part of the saved watchlist.
+  // its status strip. Both share the same delete handler.
   const renderRadarItem = useCallback<SectionListRenderItem<AmbushAsset, AmbushSectionInfo>>(
     ({ item, section }) =>
       item.layer === 'Quality' ? (
-        <QualityAmbushCard asset={item} zone={section.key} />
+        <QualityAmbushCard asset={item} zone={section.key} onDelete={handleDeleteTicker} />
       ) : (
         <StockCard stock={item} onDelete={handleDeleteTicker} />
       ),
@@ -524,7 +528,7 @@ export default function AmbushRadarScreen() {
 
   const handleCopyAmbushData = async () => {
     const timestamp = new Date().toLocaleString();
-    const report = [`Ambush Radar Report — ${timestamp}`, '', ...formatAmbushLines(stocks)].join(
+    const report = [`Ambush Radar Report — ${timestamp}`, '', ...formatAmbushLines(assets)].join(
       '\n',
     );
 
@@ -558,6 +562,32 @@ export default function AmbushRadarScreen() {
           onSubmit={handleAddTicker}
           editable={!isAdding}
         />
+      </View>
+
+      {/* UNIFIED RADAR: which layer a new ticker joins. Satellite tickers
+          are judged on Yahoo technicals; Quality tickers on the backend's
+          Z-Score, ROIC and Moat. Colors match each layer's Portfolio color. */}
+      <View style={styles.assetTypeRow}>
+        <TouchableOpacity
+          style={[
+            styles.assetTypeButton,
+            { borderColor: colors.satellite },
+            selectedLayer === 'Satellite' && { backgroundColor: colors.satellite },
+          ]}
+          onPress={() => setSelectedLayer('Satellite')}
+          accessibilityState={{ selected: selectedLayer === 'Satellite' }}>
+          <Text style={styles.assetTypeButtonText}>{categoryLabel(t, 'Satellite')}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[
+            styles.assetTypeButton,
+            { borderColor: colors.quality },
+            selectedLayer === 'Quality' && { backgroundColor: colors.quality },
+          ]}
+          onPress={() => setSelectedLayer('Quality')}
+          accessibilityState={{ selected: selectedLayer === 'Quality' }}>
+          <Text style={styles.assetTypeButtonText}>{categoryLabel(t, 'Quality')}</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={styles.assetTypeRow}>
@@ -613,7 +643,7 @@ export default function AmbushRadarScreen() {
           <PullToRefreshLogo isRefreshing={refreshing} />
           <SectionList<AmbushAsset, AmbushSectionInfo>
             sections={sections}
-            keyExtractor={extractAmbushItemKey}
+            keyExtractor={ambushAssetKey}
             renderItem={renderRadarItem}
             renderSectionHeader={renderSectionHeader}
             // Sticky on both platforms (Android defaults to off): the

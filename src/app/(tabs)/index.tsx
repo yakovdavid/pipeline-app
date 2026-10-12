@@ -39,16 +39,17 @@ import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/l
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import {
-  createUnavailableQuote,
   fetchInChunks,
   fetchIntel,
-  fetchStockData,
+  fetchPortfolioQuote,
   liquidatePortfolioAsset,
   type IntelBatchResponse,
   type StockQuote,
 } from '@/services/api';
+import type { AmbushAsset, AmbushLayer } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
+import { buildUnavailableAmbushAsset, fetchAmbushAsset } from '@/utils/ambush-assets';
 import { addTickerToAmbushRadar, loadAmbushTickerEntries, notifyAmbushAddition } from '@/utils/ambush-storage';
 import { createBackupPayload, parseBackupPayload, restoreBackupPayload, type BackupPayload } from '@/utils/backup';
 import {
@@ -336,10 +337,6 @@ export default function PortfolioScreen() {
   // added with no correction at all (factor 1.0, i.e. trust the API price
   // as-is).
   const [totalValueInput, setTotalValueInput] = useState('');
-  // QUALITY Z-SCORE MODULE: optional, relevant for Quality positions only
-  // (see the "ROIC" field's own conditional render below) — see
-  // handleAddTicker for how this becomes a PortfolioTickerEntry.roic.
-  const [roicInput, setRoicInput] = useState('');
   // CORE LAYER INTERNAL ALLOCATION: optional, relevant for Core positions
   // only (see the "Internal Target" field's own conditional render below)
   // — see handleAddTicker for how this becomes a
@@ -491,7 +488,7 @@ export default function PortfolioScreen() {
         throw new Error('Stored portfolio data is not an array.');
       }
       // Entries saved before "units", "assetType", "highestWatermark",
-      // "calibrationFactor", "roic", or "internalTargetPct" existed
+      // "calibrationFactor", or "internalTargetPct" existed
       // won't have valid values; backfill them rather than letting
       // totals/trailing-stop math break on undefined/NaN.
       // calibrationFactor is left undefined (not coerced to 1.0) for old
@@ -508,13 +505,10 @@ export default function PortfolioScreen() {
           typeof entry.calibrationFactor === 'number' && entry.calibrationFactor > 0
             ? entry.calibrationFactor
             : undefined,
-        // QUALITY Z-SCORE MODULE: entries saved before this feature
-        // existed won't have a roic at all; backfill to null (never
-        // evaluated as "no ROIC entered") rather than 0 (which would
-        // read as a genuinely terrible ROIC).
-        roic: typeof entry.roic === 'number' ? entry.roic : null,
-        // CORE LAYER INTERNAL ALLOCATION: same backfill reasoning as
-        // roic above — null means "no internal target defined", not 0%.
+        // A legacy manual `roic` field is not copied over (ROIC now comes
+        // from FMP via /api/quality), so the next save drops it.
+        // CORE LAYER INTERNAL ALLOCATION: null means "no internal target
+        // defined", not 0%.
         internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
       }));
     } catch (error) {
@@ -553,15 +547,13 @@ export default function PortfolioScreen() {
     // still awaits the full queue before moving on, so isInitializing
     // below only flips to false once every batch has resolved.
     const results = await fetchInChunks(entries, (entry) =>
-      // QUALITY Z-SCORE MODULE: roic is already known from the persisted
-      // entry at this point (unlike qualityWeightPct, which needs every
-      // position's price already loaded — see onRefresh for where that
-      // gets threaded through instead), so it's sent from the very first
-      // fetch. highWaterMark is intentionally omitted here: this is each
+      // SSOT: Quality positions also read their Z-Score, ROIC and Moat from
+      // /api/quality (see fetchPortfolioQuote), the same source the Ambush
+      // Radar uses. highWaterMark is intentionally omitted here: this is each
       // position's FIRST fetch of the session, so there's nothing yet to
       // compare against beyond what computeHighestWatermark below already
       // does client-side.
-      fetchStockData(entry.ticker, entry.category, { roic: entry.roic }),
+      fetchPortfolioQuote(entry.ticker, entry.category),
     );
 
     // DATA-LOSS FIX: one row per stored entry, ALWAYS, in storage order. A
@@ -613,7 +605,7 @@ export default function PortfolioScreen() {
     try {
       // Refreshes from the live `stocks` array (not just a plain ticker
       // string list) so each request can carry that position's own
-      // category — see fetchStockData's `category` param — for the
+      // category — see fetchPortfolioQuote's `category` param — for the
       // Satellite/Quality-keyed Mean Reversion threshold, same as every
       // other fetch site below.
       const stocksToRefresh = stocks;
@@ -629,29 +621,11 @@ export default function PortfolioScreen() {
         // (or isn't) actually sitting in AsyncStorage.
         return;
       }
-      // QUALITY Z-SCORE MODULE: the Quality layer's weight from the
-      // portfolio composition just BEFORE this refresh (same
-      // computeLayerWeightPct/getEffectiveUnits math the render body uses
-      // for its own qualityWeightPct below) — the closest approximation
-      // available without a circular fetch-then-recompute-then-refetch
-      // dance. Every non-Quality stock simply omits qualityWeightPct
-      // entirely (see StockDataOptions), same as it omits roic gating that
-      // doesn't apply to it.
-      const previousTotalPortfolioValue = stocksToRefresh.reduce(
-        (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
-        0,
-      );
-      const previousQualityWeightPct = computeLayerWeightPct(
-        stocksToRefresh.filter((stock) => stock.category === 'Quality'),
-        previousTotalPortfolioValue,
-      );
       // CONCURRENCY LIMITING: see loadInitialStocks above — small batches,
-      // not one Promise.allSettled over the whole list.
+      // not one Promise.allSettled over the whole list. SSOT: Quality
+      // positions get their Z-Score from /api/quality (fetchPortfolioQuote).
       const results = await fetchInChunks(stocksToRefresh, (stock) =>
-        fetchStockData(stock.ticker, stock.category, {
-          roic: stock.roic,
-          qualityWeightPct: stock.category === 'Quality' ? previousQualityWeightPct : undefined,
-        }),
+        fetchPortfolioQuote(stock.ticker, stock.category),
       );
 
       const freshQuotes = new Map<string, StockQuote>();
@@ -767,16 +741,9 @@ export default function PortfolioScreen() {
       return;
     }
 
-    // QUALITY Z-SCORE MODULE: blank means "no ROIC entered" (null), never
-    // 0 — same "blank input degrades to a safe no-op" pattern as the Total
-    // Value field above/below.
-    const trimmedRoicInput = roicInput.trim();
-    const parsedRoic = trimmedRoicInput === '' ? null : Number(trimmedRoicInput);
-    const roic = parsedRoic !== null && Number.isFinite(parsedRoic) ? parsedRoic : null;
-
     // CORE LAYER INTERNAL ALLOCATION: blank means "no internal target
     // entered" (null), same "blank input degrades to a safe no-op"
-    // pattern as roic just above.
+    // pattern as the Total Value field below.
     const trimmedInternalTargetInput = internalTargetInput.trim();
     const parsedInternalTarget =
       trimmedInternalTargetInput === '' ? null : Number(trimmedInternalTargetInput);
@@ -785,17 +752,9 @@ export default function PortfolioScreen() {
 
     setIsAdding(true);
     try {
-      // qualityWeightPct here is this render's already-computed Quality
-      // layer weight (see computeLayerWeightPct below) — the portfolio's
-      // composition just BEFORE this new position is added, the closest
-      // approximation available without a circular fetch-then-recompute-
-      // then-refetch dance. Only meaningful when selectedCategory is
-      // 'Quality'; harmless to always send otherwise (the backend's alert
-      // gate only ever fires for a Quality-category z_score to begin with).
-      const quote = await fetchStockData(normalizedTicker, selectedCategory, {
-        roic,
-        qualityWeightPct,
-      });
+      // SSOT: a Quality position's Z-Score, ROIC and Moat come from
+      // /api/quality (see fetchPortfolioQuote); nothing is entered by hand.
+      const quote = await fetchPortfolioQuote(normalizedTicker, selectedCategory);
 
       // AUTO-CALIBRATION FOR BROKEN PRICES: quote.localPrice here is the
       // RAW, freshly-fetched API value — nothing has calibrated it yet, so
@@ -831,14 +790,12 @@ export default function PortfolioScreen() {
           priceStatus: calibratedQuote.priceStatus,
           highestWatermark: computeHighestWatermark(null, calibratedQuote.price),
           calibrationFactor,
-          roic,
           internalTargetPct,
         },
       ]);
       setTicker('');
       setUnits('1');
       setTotalValueInput('');
-      setRoicInput('');
       setInternalTargetInput('');
       setIsAddModalVisible(false);
     } catch (error) {
@@ -916,9 +873,18 @@ export default function PortfolioScreen() {
         return;
       }
 
-      addTickerToAmbushRadar({ ticker: deletedTicker, assetType })
-        .then((result) => {
-          notifyAmbushAddition(toAmbushStock(stockToDelete));
+      // UNIFIED RADAR: a Quality position keeps its layer on the radar, so
+      // it is tracked by Z-Score/ROIC/Moat (fetched from /api/quality; a
+      // failed fetch still delivers an 'unavailable' row) rather than by
+      // the Satellite technicals.
+      const layer: AmbushLayer = category === 'Quality' ? 'Quality' : 'Satellite';
+      addTickerToAmbushRadar({ ticker: deletedTicker, assetType, layer })
+        .then(async (result) => {
+          const asset: AmbushAsset =
+            layer === 'Quality'
+              ? await fetchAmbushAsset({ ticker: deletedTicker, assetType, layer })
+              : { ...toAmbushStock(stockToDelete), layer: 'Satellite' };
+          notifyAmbushAddition(asset);
           showToast(
             t(result === 'added' ? 'liquidatedMovedToAmbush' : 'liquidatedAlreadyOnAmbush', {
               ticker: deletedTicker,
@@ -960,7 +926,6 @@ export default function PortfolioScreen() {
       newUnits: number,
       newAssetType: AssetType,
       newTotalValueInput: string,
-      newRoicInput: string,
       newInternalTargetInput: string,
     ) => {
       setStocksTrusted((prevStocks) =>
@@ -979,18 +944,9 @@ export default function PortfolioScreen() {
           const highestWatermark =
             stock.highestWatermark ?? (stock.priceStatus === 'live' ? stock.price : null);
 
-          // QUALITY Z-SCORE MODULE: a BLANK ROIC field here PRESERVES this
-          // position's existing roic unchanged — same "blank means leave
-          // it alone" reasoning as the Total Value field just below, not
-          // "blank means clear it to null" (that would silently wipe out a
-          // previously-entered ROIC just because this unrelated edit left
-          // the field blank, which on Edit is the common case).
-          const trimmedRoicInput = newRoicInput.trim();
-          const parsedRoic = trimmedRoicInput === '' ? null : Number(trimmedRoicInput);
-          const roic = trimmedRoicInput === '' || !Number.isFinite(parsedRoic) ? stock.roic : parsedRoic;
-
-          // CORE LAYER INTERNAL ALLOCATION: same "blank preserves the
-          // existing value" reasoning as roic just above.
+          // CORE LAYER INTERNAL ALLOCATION: a BLANK field PRESERVES the
+          // existing value — same "blank means leave it alone" reasoning as
+          // the Total Value field just below.
           const trimmedInternalTargetInput = newInternalTargetInput.trim();
           const parsedInternalTarget =
             trimmedInternalTargetInput === '' ? null : Number(trimmedInternalTargetInput);
@@ -1014,7 +970,7 @@ export default function PortfolioScreen() {
           // an 'unavailable' row it would compute against the placeholder
           // 0, reset calibrationFactor to 1.0, and set the watermark to 0,
           // destroying both. So a Total Value entered while the price is
-          // unavailable is ignored; units/type/roic/target still save.
+          // unavailable is ignored; units/type/target still save.
           if (
             stock.priceStatus === 'unavailable' ||
             parsedTotalValue === null ||
@@ -1026,7 +982,6 @@ export default function PortfolioScreen() {
               units: newUnits,
               assetType: newAssetType,
               highestWatermark,
-              roic,
               internalTargetPct,
             };
           }
@@ -1066,7 +1021,6 @@ export default function PortfolioScreen() {
             sma200: newSma200,
             calibrationFactor,
             highestWatermark: newUsdPrice,
-            roic,
             internalTargetPct,
           };
         }),
@@ -1112,13 +1066,15 @@ export default function PortfolioScreen() {
       const ambushEntries = (await loadAmbushTickerEntries()) ?? [];
 
       // CONCURRENCY LIMITING: see loadInitialStocks above.
-      const ambushResults = await fetchInChunks(ambushEntries, (entry) => fetchStockData(entry.ticker));
+      // UNIFIED RADAR: each entry is fetched from its own layer's source
+      // (fetchAmbushAsset), exactly as the Ambush screen builds its rows.
+      const ambushResults = await fetchInChunks(ambushEntries, fetchAmbushAsset);
 
       // Every watched ticker appears in the export; one whose fetch failed
       // is listed as price-unavailable rather than silently left out.
-      const ambushStocks: Stock[] = ambushEntries.map((entry, index) => {
+      const ambushStocks: AmbushAsset[] = ambushEntries.map((entry, index) => {
         const result = ambushResults[index];
-        return { ...entry, ...(result.status === 'fulfilled' ? result.value : createUnavailableQuote()) };
+        return result.status === 'fulfilled' ? result.value : buildUnavailableAmbushAsset(entry);
       });
 
       const timestamp = new Date().toLocaleString();
@@ -1176,14 +1132,10 @@ export default function PortfolioScreen() {
       // initial-load flow); Ambush Radar's separate mounted screen picks up
       // its half of the restore the next time its tab gains focus.
       // CONCURRENCY LIMITING: see loadInitialStocks above.
-      // QUALITY Z-SCORE MODULE: roic round-trips through the backup JSON
-      // (see coercePortfolioEntry in @/utils/backup) and is already known
-      // per-entry; qualityWeightPct is omitted here, same reasoning as
-      // loadInitialStocks — there's no prior portfolio composition to
-      // approximate it from right after a restore, so the alert simply
-      // stays inactive until the next pull-to-refresh.
+      // SSOT: Quality positions read their Z-Score, ROIC and Moat from
+      // /api/quality, same as loadInitialStocks.
       const results = await fetchInChunks(payload.portfolio, (entry) =>
-        fetchStockData(entry.ticker, entry.category, { roic: entry.roic }),
+        fetchPortfolioQuote(entry.ticker, entry.category),
       );
 
       // DATA-LOSS FIX: one row per restored entry, ALWAYS; a failed fetch
@@ -1734,24 +1686,6 @@ export default function PortfolioScreen() {
                     </TouchableOpacity>
                   </View>
 
-                  {/* QUALITY Z-SCORE MODULE: only shown once Quality is
-                      selected above — ROIC is meaningless to the Trailing
-                      Stop/Kill Switch mechanisms the other two layers use.
-                      Optional; see handleAddTicker for how a blank value
-                      here becomes a null roic. */}
-                  {selectedCategory === 'Quality' && (
-                    <TextInput
-                      style={[styles.unitsInput, styles.standaloneInput]}
-                      value={roicInput}
-                      onChangeText={setRoicInput}
-                      placeholder={t('roicPlaceholder')}
-                      placeholderTextColor={colors.textSecondary}
-                      keyboardType="numeric"
-                      maxLength={15}
-                      editable={!isAdding}
-                    />
-                  )}
-
                   {/* CORE LAYER INTERNAL ALLOCATION: only shown once Core
                       is selected above — an internal target is meaningless
                       to the Trailing Stop/Kill Switch mechanisms the other
@@ -2014,7 +1948,6 @@ type PortfolioStockRowProps = {
     units: number,
     assetType: AssetType,
     totalValueInput: string,
-    roicInput: string,
     internalTargetInput: string,
   ) => void;
   colors: PipelineColorScheme;
@@ -2061,11 +1994,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // pre-filled with a value that then got silently resubmitted alongside
   // an unrelated units change.
   const [totalValueText, setTotalValueText] = useState('');
-  // QUALITY Z-SCORE MODULE: same "starts blank, means leave unchanged"
-  // pattern as totalValueText above — see onSaveEdit in PortfolioScreen.
-  const [roicText, setRoicText] = useState('');
   // CORE LAYER INTERNAL ALLOCATION: same "starts blank, means leave
-  // unchanged" pattern as roicText above.
+  // unchanged" pattern as totalValueText above.
   const [internalTargetText, setInternalTargetText] = useState('');
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
@@ -2093,7 +2023,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // multi-currency note on allSections in PortfolioScreen for why mixing
   // those would silently corrupt this for any mixed-currency layer.
   // Computed for every category (harmless — same reasoning as
-  // highestWatermark/roic being tracked regardless of category), but only
+  // highestWatermark being tracked regardless of category), but only
   // actually rendered for Core today (see the JSX below).
   const internalWeightPct = computeInternalWeightPct(stock, layerTotalValue);
 
@@ -2173,15 +2103,11 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const isFundamentalAuditRequired =
     stock.category === 'Quality' && stock.drawdownPct !== null && stock.drawdownPct <= -15;
 
-  // LAYER 2: QUALITY — Z-Score Module: the alert boolean (stock.
-  // qualityZScoreAlert) already reflects the backend's own roic >= 15% AND
-  // Quality-layer-weight <= 10% gate (see backend/main.py's
-  // QUALITY_ZSCORE_* constants) — never re-derived here. This additionally
-  // hardcodes a `stock.category === 'Quality'` check before it's ever
-  // allowed to show, same defense-in-depth reasoning as
-  // computeSatelliteTrailingStopPrice above: a stray/mis-set value on a
-  // non-Quality stock (shouldn't happen — the backend only evaluates this
-  // for Quality requests — but this is the belt-and-suspenders layer) can
+  // LAYER 2: QUALITY — Buy Signal (SSOT): stock.qualityZScoreAlert is set
+  // by fetchPortfolioQuote via isQualityBuySignal — Z-Score <= -1.0 AND
+  // ROIC >= 15% AND a moat, all from /api/quality: exactly the Ambush
+  // Radar's Value Zone. A value trap (cheap but broken fundamentals) never
+  // alerts. The category check is defense in depth, so a stray value can
   // never surface an alert on the wrong layer.
   const isQualityZScoreAlertActive = stock.category === 'Quality' && stock.qualityZScoreAlert === true;
 
@@ -2189,7 +2115,6 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     setUnitsText(String(stock.units));
     setEditedAssetType(stock.assetType);
     setTotalValueText('');
-    setRoicText('');
     setInternalTargetText('');
     setIsEditing(true);
   };
@@ -2200,7 +2125,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       Alert.alert(t('invalidUnitsTitle'), t('invalidUnitsMessage'));
       return;
     }
-    onSaveEdit(stock.ticker, parsedUnits, editedAssetType, totalValueText, roicText, internalTargetText);
+    onSaveEdit(stock.ticker, parsedUnits, editedAssetType, totalValueText, internalTargetText);
     setIsEditing(false);
   };
 
@@ -2262,27 +2187,11 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             maxLength={15}
             onSubmitEditing={handleSaveEdit}
           />
-          {/* QUALITY Z-SCORE MODULE: only shown for Quality positions —
-              ROIC is meaningless to the Trailing Stop/Kill Switch
-              mechanisms the other two layers use. Same "blank preserves
-              the existing value" pattern as the Total Value field above. */}
-          {stock.category === 'Quality' && (
-            <TextInput
-              style={[styles.unitsEditInput, styles.totalValueEditInput]}
-              value={roicText}
-              onChangeText={setRoicText}
-              placeholder={t('roicPlaceholder')}
-              placeholderTextColor={colors.textSecondary}
-              keyboardType="numeric"
-              maxLength={15}
-              onSubmitEditing={handleSaveEdit}
-            />
-          )}
           {/* CORE LAYER INTERNAL ALLOCATION: only shown for Core positions
               — an internal target is meaningless to the Trailing Stop/Kill
               Switch mechanisms the other two layers use. Same "blank
-              preserves the existing value" pattern as the Total Value/ROIC
-              fields above. */}
+              preserves the existing value" pattern as the Total Value
+              field above. */}
           {stock.category === 'Core' && (
             <TextInput
               style={[styles.unitsEditInput, styles.totalValueEditInput]}
@@ -2504,15 +2413,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       )}
 
       {/* LAYER 2: QUALITY — Z-Score Module: a separate, independent signal
-          from the Kill Switch block above (drawdown vs. 52-week high) — a
-          statistical read of price vs. SMA50, not a fundamental drawdown
-          review. The score itself renders whenever the backend could
-          compute one; the ALERT tag only when isQualityZScoreAlertActive
-          (the backend's own roic >= 15% AND Quality-layer-weight <= 10%
-          gate, plus this component's own hardcoded category check — see
-          its own comment above). Independent of stock.drawdownPct's
-          nullity so it still shows even in the rare case the Kill Switch
-          block above doesn't (e.g. a missing 52-week high). */}
+          from the Kill Switch block above (drawdown vs. 52-week high) — the
+          2-year statistical Z-Score from /api/quality, not a fundamental
+          drawdown review. The score itself renders whenever the backend
+          could compute one; the ALERT tag only when
+          isQualityZScoreAlertActive (the full Buy Signal, so a value trap
+          shows its score but no alert — see its own comment above).
+          Independent of stock.drawdownPct's nullity so it still shows even
+          in the rare case the Kill Switch block above doesn't (e.g. a
+          missing 52-week high). */}
       {!isEditing && !isPriceUnavailable && stock.category === 'Quality' && stock.qualityZScore !== null && (
         <View style={styles.zScoreBlock}>
           <Text style={styles.zScoreText}>
@@ -2659,10 +2568,9 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fontSize: 16,
     textAlign: 'center',
   },
-  // Shared by the ROIC field and the Internal Target field (Quality/Core
-  // only, respectively) — both stand alone (not inside a unitsValueRow-
-  // style flex row like units/totalValue above), so both need this same
-  // bottom margin to match the spacing every other field in this form
+  // The Internal Target field (Core only) stands alone (not inside a
+  // unitsValueRow-style flex row like units/totalValue above), so it needs
+  // this bottom margin to match the spacing every other field in this form
   // already has.
   standaloneInput: {
     marginBottom: 16,

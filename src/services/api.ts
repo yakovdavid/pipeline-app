@@ -1,5 +1,7 @@
+import type { QualityMoat } from '@/types/ambush';
 import type { AssetType, TrendLabel } from '@/types/asset';
 import type { PortfolioCategory } from '@/types/portfolio';
+import { isQualityBuySignal } from '@/utils/quality-signal';
 
 export type StockQuote = {
   // Multi-Currency engine: normalized to USD by the backend — this is the
@@ -46,16 +48,14 @@ export type StockQuote = {
   // above. Null whenever sma50 itself is unavailable, same convention as
   // every other nullable field here.
   pullbackDepth: number | null;
-  // QUALITY Z-SCORE MODULE: backend-computed (see backend/main.py's
-  // _calculate_quality_zscore) — null for any non-Quality request (the
-  // `category` param wasn't 'Quality') or when there isn't enough price
-  // history yet.
+  // QUALITY SINGLE SOURCE OF TRUTH: the 2-year Z-Score from
+  // GET /api/quality/{ticker}, filled in by fetchPortfolioQuote for
+  // Quality positions only. fetchStockData itself always leaves it null,
+  // since /api/stock no longer computes any Z-Score.
   qualityZScore: number | null;
-  // The backend's own roic >= 15% AND Quality-layer-weight <= 10% Z-Score
-  // alert gate (see backend/main.py's QUALITY_ZSCORE_* constants),
-  // evaluated against whatever roic/qualityWeightPct this specific
-  // request supplied (see fetchStockData's options param below) — always
-  // false when those weren't supplied, never a guessed default.
+  // The Quality Buy Signal (isQualityBuySignal in @/utils/quality-signal):
+  // Z-Score <= -1.0 AND ROIC >= 15% AND a moat, all from /api/quality —
+  // exactly the Ambush Radar's Value Zone. A value trap never alerts.
   qualityZScoreAlert: boolean;
   // DATA-LOSS FIX: 'live' for every quote fetchStockData returns;
   // 'unavailable' only for the placeholder createUnavailableQuote builds
@@ -168,20 +168,12 @@ export async function fetchInChunks<TItem, TResult>(
 // so its call sites simply omit this — the backend then falls back to its
 // own DEFAULT_ANOMALY_CATEGORY ('Satellite'). Only the Portfolio screen
 // (which knows each position's real category) passes this explicitly.
-// TRAILING STOP ENGINE / QUALITY Z-SCORE MODULE: optional, portfolio-
-// composition-dependent context only the Portfolio screen (index.tsx) can
-// supply — Ambush Radar has neither a watermark, a fundamentals concept,
-// nor a layer-weight concept, so it always omits this entirely (same as
-// it already omits `category`). All three are read by the backend as
-// query params (see backend/main.py's get_stock) but never required: a
-// missing highWaterMark just means "no prior watermark to compare
-// against yet," and a missing roic/qualityWeightPct means the Z-Score
-// alert gate simply can't be satisfied for this request (never "doesn't
-// apply" — see backend/main.py's _quality_zscore_alert_active).
+// Optional, Portfolio-only context (the Ambush Radar never sends it), read
+// by the backend as a query param (see backend/main.py's get_stock):
+// highWaterMark drives the Satellite trailing stop. ROIC is never sent: the
+// backend fetches it from FMP itself (GET /api/quality).
 export type StockDataOptions = {
   highWaterMark?: number | null;
-  roic?: number | null;
-  qualityWeightPct?: number | null;
 };
 
 export async function fetchStockData(
@@ -201,12 +193,6 @@ export async function fetchStockData(
     }
     if (options?.highWaterMark !== undefined && options.highWaterMark !== null) {
       params.set('high_water_mark', String(options.highWaterMark));
-    }
-    if (options?.roic !== undefined && options.roic !== null) {
-      params.set('roic', String(options.roic));
-    }
-    if (options?.qualityWeightPct !== undefined && options.qualityWeightPct !== null) {
-      params.set('quality_weight_pct', String(options.qualityWeightPct));
     }
     response = await fetch(`${API_BASE_URL}/api/stock/${normalizedTicker}?${params.toString()}`);
   } catch {
@@ -243,8 +229,6 @@ export async function fetchStockData(
     macro_trend?: string | null;
     tactical_momentum?: string | null;
     pullback_depth?: number | null;
-    quality_z_score?: number | null;
-    quality_z_score_alert?: boolean;
   };
 
   if (typeof data.price !== 'number') {
@@ -266,10 +250,98 @@ export async function fetchStockData(
     high52: typeof data.high_52 === 'number' ? data.high_52 : null,
     drawdownPct: typeof data.drawdown_pct === 'number' ? data.drawdown_pct : null,
     pullbackDepth: typeof data.pullback_depth === 'number' ? data.pullback_depth : null,
-    qualityZScore: typeof data.quality_z_score === 'number' ? data.quality_z_score : null,
-    qualityZScoreAlert: data.quality_z_score_alert === true,
+    // Filled in by fetchPortfolioQuote for Quality positions.
+    qualityZScore: null,
+    qualityZScoreAlert: false,
     priceStatus: 'live',
   };
+}
+
+export type QualityMetrics = {
+  ticker: string;
+  // Latest daily close the Z-Score was computed from.
+  currentPrice: number | null;
+  // 2-year Z-Score; null with too little price history.
+  zScore: number | null;
+  // Most recent year's ROIC as a percent; null with no financial statements.
+  roic: number | null;
+  moat: QualityMoat | null;
+  // True when a backend refresh failed and expired cached values are shown.
+  statsStale: boolean;
+  fundamentalsStale: boolean;
+};
+
+const QUALITY_MOATS: readonly QualityMoat[] = ['Wide', 'Narrow', 'None'];
+
+// QUALITY SINGLE SOURCE OF TRUTH: GET /api/quality/{ticker} (backend
+// quality.py): Z-Score, ROIC and Moat, cached server-side (24h statistics,
+// 30-day fundamentals). Used for every Quality asset, in both the Portfolio
+// and the Ambush Radar. Throws on any failure; callers decide the fallback.
+export async function fetchQualityMetrics(ticker: string): Promise<QualityMetrics> {
+  const symbol = ticker.trim().toUpperCase();
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/quality/${encodeURIComponent(symbol)}`);
+  } catch {
+    throw new Error(`Could not reach the Pipeline API at ${API_BASE_URL}.`);
+  }
+
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const errorBody = (await response.json()) as { detail?: string };
+      detail = errorBody.detail ?? detail;
+    } catch {
+      // Response body was not valid JSON; fall back to the status text.
+    }
+    throw new Error(`Failed to fetch quality metrics for ${symbol}: ${detail}`);
+  }
+
+  const data = (await response.json()) as {
+    ticker?: string;
+    current_price?: number | null;
+    z_score?: number | null;
+    roic?: number | null;
+    moat?: string | null;
+    stats_stale?: boolean;
+    fundamentals_stale?: boolean;
+  };
+
+  return {
+    ticker: typeof data.ticker === 'string' ? data.ticker : symbol,
+    currentPrice: typeof data.current_price === 'number' ? data.current_price : null,
+    zScore: typeof data.z_score === 'number' ? data.z_score : null,
+    roic: typeof data.roic === 'number' ? data.roic : null,
+    moat: QUALITY_MOATS.includes(data.moat as QualityMoat) ? (data.moat as QualityMoat) : null,
+    statsStale: data.stats_stale === true,
+    fundamentalsStale: data.fundamentals_stale === true,
+  };
+}
+
+// What the Portfolio screen fetches for every position. Non-Quality
+// positions are a plain fetchStockData. Quality positions ALSO fetch
+// GET /api/quality in parallel, for the Z-Score and the Buy Signal alert
+// (isQualityBuySignal: the Ambush Radar's Value Zone rule, so broken
+// fundamentals suppress the alert). The Yahoo quote is still required
+// (valuation, currency, calibration and the watermark all depend on it),
+// so if it fails the whole fetch fails, as before. If only the quality call
+// fails, the position keeps its price and shows no Z-Score and no alert
+// until a later refresh succeeds.
+export async function fetchPortfolioQuote(
+  ticker: string,
+  category: PortfolioCategory,
+  options?: StockDataOptions,
+): Promise<StockQuote> {
+  const quotePromise = fetchStockData(ticker, category, options);
+  if (category !== 'Quality') {
+    return quotePromise;
+  }
+  const [quote, metrics] = await Promise.all([quotePromise, fetchQualityMetrics(ticker).catch(() => null)]);
+  if (metrics === null) {
+    return quote;
+  }
+  return { ...quote, qualityZScore: metrics.zScore, qualityZScoreAlert: isQualityBuySignal(metrics) };
 }
 
 // TREND CLASSIFICATION: validates the backend's macro_trend/

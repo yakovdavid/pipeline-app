@@ -30,3 +30,14 @@ export const SATELLITE_TS_PCT = 0.12;
 export const PULLBACK_PREMIUM_THRESHOLD_PCT = 0;
 export const PULLBACK_KILL_ZONE_THRESHOLD_PCT = -3.0;
 export const PULLBACK_OVERSHOT_THRESHOLD_PCT = -7.0;
+
+// QUALITY MARGIN OF SAFETY: the single Z-Score line for every Quality asset,
+// app-wide. At or below it, a fundamentally sound Quality asset is a Buy
+// Signal: the Ambush Radar's Value Zone and the Portfolio's Quality alert.
+// Both apply it through isQualityBuySignal (@/utils/quality-signal) to the
+// same backend values (GET /api/quality/{ticker}), so they can't disagree.
+export const QUALITY_MARGIN_OF_SAFETY_ZSCORE = -1.0;
+
+// QUALITY FUNDAMENTAL GATE: the minimum ROIC (percent) for a Quality asset
+// to count at all. Below it, a cheap Z-Score is a value trap, not a signal.
+export const QUALITY_MIN_ROIC_PCT = 15;

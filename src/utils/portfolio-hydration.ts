@@ -18,7 +18,7 @@ export function computeHighestWatermark(previousWatermark: number | null, latest
 //     (see @/utils/calibration) and the watermark advances if the price is
 //     a new high.
 //   - quote === null (the fetch failed): every persisted field (units,
-//     watermark, calibration, roic, internal target) is kept exactly as
+//     watermark, calibration, internal target) is kept exactly as
 //     stored, and the price fields become createUnavailableQuote's
 //     placeholders with priceStatus 'unavailable'. The watermark is NOT fed
 //     the placeholder price, so a failed fetch can never touch it.
@@ -50,9 +50,8 @@ export function toPortfolioTickerEntry(stock: PortfolioStock): PortfolioTickerEn
     // AUTO-CALIBRATION FOR BROKEN PRICES: dropping this would silently
     // un-calibrate a position the next time the app restarts.
     calibrationFactor: stock.calibrationFactor,
-    // QUALITY Z-SCORE MODULE / CORE INTERNAL ALLOCATION: user-entered,
-    // so they must survive every save.
-    roic: stock.roic,
+    // CORE INTERNAL ALLOCATION: user-entered, so it must survive every
+    // save.
     internalTargetPct: stock.internalTargetPct,
   };
 }

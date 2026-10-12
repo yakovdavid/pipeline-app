@@ -1,12 +1,13 @@
 import { memo, useMemo } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { AMBUSH_ZONE_BADGE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { QualityAmbushAsset, QualityMoat } from '@/types/ambush';
-import { QUALITY_MIN_ROIC_PCT, type AmbushReadinessZone } from '@/utils/ambush-grouping';
+import { QUALITY_MIN_ROIC_PCT } from '@/constants/thresholds';
+import type { AmbushReadinessZone } from '@/utils/ambush-grouping';
 import { formatUnitPrice } from '@/utils/currency';
 
 export type QualityAmbushCardProps = {
@@ -15,74 +16,97 @@ export type QualityAmbushCardProps = {
   // classifyAmbushReadiness). Passed in from its section rather than
   // recomputed, so the badge always matches the section it sits under.
   zone: AmbushReadinessZone;
+  // Removes the ticker from the radar (same handler StockCard uses).
+  onDelete: (ticker: string) => void;
 };
 
-function moatLabel(t: TFunction, moat: QualityMoat): string {
+function moatLabel(t: TFunction, moat: QualityMoat | null): string {
   switch (moat) {
     case 'Wide':
       return t('moatWide');
     case 'Narrow':
       return t('moatNarrow');
     case 'None':
-    default:
       return t('moatNone');
+    default:
+      return t('notAvailable');
   }
 }
 
-// UNIFIED RADAR: the Quality (fundamental) counterpart of StockCard. Three
-// rows, top to bottom: ticker and price; fundamentals (ROIC, green at or
-// above the 15% gate and red below it, plus the moat); the Z-Score as the
-// statistical trigger. A status strip along the bottom shows the readiness
-// zone in that zone's color.
+// UNIFIED RADAR: the Quality (fundamental) counterpart of StockCard,
+// populated from GET /api/quality/{ticker}. Three rows, top to bottom:
+// ticker and price; fundamentals (ROIC, green at or above the 15% gate and
+// red below it, plus the moat); the Z-Score as the statistical trigger. A
+// status strip along the bottom shows the readiness zone in that zone's
+// color.
 //
-// Follows the app's light/dark theme like every other card, so in dark
-// mode it reads as the dark dashboard card, and in light mode it doesn't
-// clash with the cards around it.
+// Missing values show as "N/A": ROIC when the company has no financial
+// statements (e.g. an ETF), the Z-Score when there isn't enough price
+// history. When the fetch failed entirely (priceStatus 'unavailable') the
+// card shows "Price unavailable" and a retry hint instead of the metric
+// rows, since those are only placeholders; the ticker stays on the radar.
 //
-// Wrapped in memo() so refreshing other rows doesn't re-render this one;
-// theme and language are context reads, which still re-render it.
-export const QualityAmbushCard = memo(function QualityAmbushCard({ asset, zone }: QualityAmbushCardProps) {
+// Follows the app's light/dark theme like every other card. Wrapped in
+// memo() so refreshing other rows doesn't re-render this one; theme and
+// language are context reads, which still re-render it.
+export const QualityAmbushCard = memo(function QualityAmbushCard({ asset, zone, onDelete }: QualityAmbushCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
 
   const zoneColors = ambushZoneColors(colors, zone);
-  const passesRoicGate = asset.roic >= QUALITY_MIN_ROIC_PCT;
-  const priceDisplay = formatUnitPrice(asset.ticker, asset.localPrice, asset.currencySymbol, t('ag'));
+  const isUnavailable = asset.priceStatus === 'unavailable';
+  const roicColor =
+    asset.roic === null ? colors.textSecondary : asset.roic >= QUALITY_MIN_ROIC_PCT ? colors.bullish : colors.bearish;
 
   return (
     <View style={styles.card}>
       <View style={styles.headerRow}>
-        <View style={styles.tickerGroup}>
-          {/* Ticker symbols stay LTR regardless of app language. */}
-          <Text style={styles.ticker}>{asset.ticker}</Text>
-          {asset.isDemo && (
-            <View style={styles.demoTag}>
-              <Text style={styles.demoTagText}>{t('demoTag')}</Text>
-            </View>
+        {/* Ticker symbols stay LTR regardless of app language. */}
+        <Text style={styles.ticker}>{asset.ticker}</Text>
+        <View style={styles.headerRight}>
+          {isUnavailable ? (
+            <Text style={styles.priceUnavailable}>{t('priceUnavailable')}</Text>
+          ) : (
+            <Text style={styles.price}>
+              {formatUnitPrice(asset.ticker, asset.localPrice, asset.currencySymbol, t('ag'))}
+            </Text>
           )}
-        </View>
-        <Text style={styles.price}>{priceDisplay}</Text>
-      </View>
-
-      <View style={styles.fundamentalsRow}>
-        <View style={styles.metric}>
-          <Text style={styles.metricLabel}>{t('roicLabel')}</Text>
-          <Text style={[styles.metricValue, { color: passesRoicGate ? colors.bullish : colors.bearish }]}>
-            {asset.roic.toFixed(1)}%
-          </Text>
-        </View>
-        <View style={styles.metric}>
-          <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
-          <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
+          <TouchableOpacity
+            onPress={() => onDelete(asset.ticker)}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            accessibilityLabel={`Remove ${asset.ticker} from Ambush Radar`}>
+            <Text style={styles.deleteButtonText}>✕</Text>
+          </TouchableOpacity>
         </View>
       </View>
 
-      {/* The statistical trigger, shown larger than the fundamentals. */}
-      <View style={styles.zScoreRow}>
-        <Text style={styles.zScoreLabel}>{t('zScoreLabel')}:</Text>
-        <Text style={styles.zScoreValue}>{asset.zScore.toFixed(2)}</Text>
-      </View>
+      {isUnavailable ? (
+        <Text style={styles.fetchFailedHint}>{t('priceFetchFailedHint')}</Text>
+      ) : (
+        <>
+          <View style={styles.fundamentalsRow}>
+            <View style={styles.metric}>
+              <Text style={styles.metricLabel}>{t('roicLabel')}</Text>
+              <Text style={[styles.metricValue, { color: roicColor }]}>
+                {asset.roic === null ? t('notAvailable') : `${asset.roic.toFixed(1)}%`}
+              </Text>
+            </View>
+            <View style={styles.metric}>
+              <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
+              <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
+            </View>
+          </View>
+
+          {/* The statistical trigger, shown larger than the fundamentals. */}
+          <View style={styles.zScoreRow}>
+            <Text style={styles.zScoreLabel}>{t('zScoreLabel')}:</Text>
+            <Text style={styles.zScoreValue}>
+              {asset.zScore === null ? t('notAvailable') : asset.zScore.toFixed(2)}
+            </Text>
+          </View>
+        </>
+      )}
 
       <View style={[styles.statusStrip, { backgroundColor: zoneColors.badgeBackground }]}>
         <Text style={[styles.statusStripText, { color: zoneColors.badgeText }]}>
@@ -127,10 +151,10 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       paddingHorizontal: 16,
       paddingTop: 14,
     },
-    tickerGroup: {
+    headerRight: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 8,
+      gap: 12,
     },
     ticker: {
       color: colors.textPrimary,
@@ -138,24 +162,32 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       fontWeight: '700',
       writingDirection: 'ltr',
     },
-    demoTag: {
-      borderWidth: 1,
-      borderColor: colors.textSecondary,
-      borderRadius: 4,
-      paddingHorizontal: 6,
-      paddingVertical: 1,
-    },
-    demoTagText: {
-      color: colors.textSecondary,
-      fontSize: 10,
-      fontWeight: '700',
-      writingDirection,
-    },
     price: {
       color: colors.textPrimary,
       fontSize: 18,
       fontWeight: '600',
       writingDirection: 'ltr',
+    },
+    priceUnavailable: {
+      color: colors.warning,
+      fontSize: 14,
+      fontWeight: '600',
+      textAlign,
+      writingDirection,
+    },
+    deleteButtonText: {
+      color: colors.bearish,
+      fontSize: 16,
+      fontWeight: '700',
+    },
+    fetchFailedHint: {
+      color: colors.textSecondary,
+      fontSize: 12,
+      paddingHorizontal: 16,
+      marginTop: 10,
+      marginBottom: 12,
+      textAlign,
+      writingDirection,
     },
     fundamentalsRow: {
       flexDirection: rowDirection,
