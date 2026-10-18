@@ -23,7 +23,7 @@ import { QualityAmbushCard } from '@/components/QualityAmbushCard';
 import { StockCard } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { AMBUSH_ZONE_TITLE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
-import { assetTypeLabel, categoryLabel } from '@/constants/labels';
+import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
@@ -43,6 +43,8 @@ import {
   toAmbushTickerEntry,
 } from '@/utils/ambush-assets';
 import { loadAmbushTickerEntries, subscribeToAmbushAdditions, subscribeToAmbushRemovals } from '@/utils/ambush-storage';
+import { isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
+import { useLayerWeights } from '@/utils/layer-weights-store';
 import { requestPortfolioBuy } from '@/utils/portfolio-buy-handoff';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
@@ -489,10 +491,32 @@ export default function AmbushRadarScreen() {
     assetsRef.current = assets;
   }, [assets]);
 
+  // CIRCUIT BREAKER (Layer Overweight Lock): the Portfolio's live,
+  // cash-diluted weights (see @/utils/layer-weights-store). A layer
+  // strictly above its target + 1% is locked: its cards are dimmed and
+  // badged, and Buy is disabled, in every readiness zone. This re-renders
+  // as soon as the Portfolio publishes new weights, including right after
+  // cash is added or withdrawn. Unknown weights (the Portfolio hasn't
+  // finished loading) lock nothing.
+  const layerWeights = useLayerWeights();
+  const lockedLayers = useMemo<Record<AmbushLayer, boolean>>(
+    () => ({
+      Satellite: layerWeights !== null && isLayerOverweight('Satellite', layerWeights, CATEGORY_TARGET_PCT),
+      Quality: layerWeights !== null && isLayerOverweight('Quality', layerWeights, CATEGORY_TARGET_PCT),
+    }),
+    [layerWeights],
+  );
+  const lockedLayersRef = useRef(lockedLayers);
+  useEffect(() => {
+    lockedLayersRef.current = lockedLayers;
+  }, [lockedLayers]);
+
   const handleBuyTicker = useCallback(
     (tickerToBuy: string) => {
       const asset = assetsRef.current.find((candidate) => isSameTicker(candidate.ticker, tickerToBuy));
-      if (asset === undefined) {
+      // The card's Buy button is already disabled on a locked layer; this
+      // is the second layer of that block.
+      if (asset === undefined || lockedLayersRef.current[asset.layer]) {
         return;
       }
       requestPortfolioBuy({ ticker: asset.ticker, assetType: asset.assetType, layer: asset.layer });
@@ -530,15 +554,27 @@ export default function AmbushRadarScreen() {
   }, [assets, collapsedSections, colors, t]);
 
   // Picks the card by layer. A Quality card gets its section's zone for
-  // its status strip. Both share the same delete handler.
+  // its status strip. Both share the same delete and buy handlers, and get
+  // their own layer's overweight lock.
   const renderRadarItem = useCallback<SectionListRenderItem<AmbushAsset, AmbushSectionInfo>>(
     ({ item, section }) =>
       item.layer === 'Quality' ? (
-        <QualityAmbushCard asset={item} zone={section.key} onDelete={handleDeleteTicker} onBuy={handleBuyTicker} />
+        <QualityAmbushCard
+          asset={item}
+          zone={section.key}
+          onDelete={handleDeleteTicker}
+          onBuy={handleBuyTicker}
+          isOverweightLocked={lockedLayers.Quality}
+        />
       ) : (
-        <StockCard stock={item} onDelete={handleDeleteTicker} onBuy={handleBuyTicker} />
+        <StockCard
+          stock={item}
+          onDelete={handleDeleteTicker}
+          onBuy={handleBuyTicker}
+          isOverweightLocked={lockedLayers.Satellite}
+        />
       ),
-    [handleDeleteTicker, handleBuyTicker],
+    [handleDeleteTicker, handleBuyTicker, lockedLayers],
   );
 
   const renderSectionHeader = useCallback(
@@ -675,6 +711,23 @@ export default function AmbushRadarScreen() {
         </View>
       )}
 
+      {/* CIRCUIT BREAKER: one line per locked layer, with its live weight
+          and limit, so the dimmed cards below are self-explanatory. */}
+      {layerWeights !== null &&
+        (['Satellite', 'Quality'] as const)
+          .filter((layer) => lockedLayers[layer])
+          .map((layer) => (
+            <View key={layer} style={styles.overweightBanner}>
+              <Text style={styles.overweightBannerText}>
+                {t('overweightBanner', {
+                  layer: categoryLabel(t, layer),
+                  weight: layerWeights[layer].toFixed(1),
+                  limit: overweightLimitPct(layer, CATEGORY_TARGET_PCT),
+                })}
+              </Text>
+            </View>
+          ))}
+
       {isInitializing ? (
         <View style={styles.initializingContainer}>
           <PullToRefreshLogo isRefreshing overlay={false} />
@@ -801,6 +854,23 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     },
     syncWarningBannerText: {
       color: colors.warningText,
+      fontSize: 12,
+      fontWeight: '700',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
+    },
+    // CIRCUIT BREAKER banner: same shape as the sync banner above, in the
+    // bearish color the locked cards' badges use.
+    overweightBanner: {
+      backgroundColor: colors.bearish,
+      marginHorizontal: 16,
+      marginBottom: 12,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+    },
+    overweightBannerText: {
+      color: '#FFFFFF',
       fontSize: 12,
       fontWeight: '700',
       textAlign: isHebrew ? 'right' : 'left',

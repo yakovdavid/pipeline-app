@@ -68,3 +68,25 @@ export function computeAllocation(values: AllocationValues): AllocationBreakdown
   }
   return { weightsPct, totalValue };
 }
+
+// CIRCUIT BREAKER (Layer Overweight Lock): a layer whose cash-diluted
+// weight is STRICTLY above its target + 1 percentage point is locked, and
+// the Ambush Radar disables buying into it (Satellite > 21%, Quality > 11%,
+// Core > 71%). Evaluated on the same one-decimal weights the Portfolio
+// displays, so the lock never disagrees with what the user sees: 21.0% is
+// not locked, 21.1% is.
+export const OVERWEIGHT_TOLERANCE_PCT = 1;
+
+export type AllocationLayer = Exclude<AllocationBucket, 'Cash'>;
+
+export function overweightLimitPct(layer: AllocationLayer, targetPct: Record<AllocationLayer, number>): number {
+  return targetPct[layer] + OVERWEIGHT_TOLERANCE_PCT;
+}
+
+export function isLayerOverweight(
+  layer: AllocationLayer,
+  weightsPct: AllocationValues,
+  targetPct: Record<AllocationLayer, number>,
+): boolean {
+  return weightsPct[layer] > overweightLimitPct(layer, targetPct);
+}

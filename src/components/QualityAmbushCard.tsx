@@ -1,3 +1,4 @@
+import { Ionicons } from '@expo/vector-icons';
 import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
@@ -20,6 +21,9 @@ export type QualityAmbushCardProps = {
   onDelete: (ticker: string) => void;
   // Opens the Portfolio's Execute Trade flow (same handler StockCard uses).
   onBuy: (ticker: string) => void;
+  // CIRCUIT BREAKER: the Quality layer is above target + 1%, so the card
+  // is dimmed, badged and its Buy button disabled.
+  isOverweightLocked: boolean;
 };
 
 function moatLabel(t: TFunction, moat: QualityMoat | null): string {
@@ -56,6 +60,7 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
   zone,
   onDelete,
   onBuy,
+  isOverweightLocked,
 }: QualityAmbushCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
@@ -68,66 +73,78 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
 
   return (
     <View style={styles.card}>
-      <View style={styles.headerRow}>
-        {/* Ticker symbols stay LTR regardless of app language. */}
-        <Text style={styles.ticker}>{asset.ticker}</Text>
-        <View style={styles.headerRight}>
-          {isUnavailable ? (
-            <Text style={styles.priceUnavailable}>{t('priceUnavailable')}</Text>
-          ) : (
-            <Text style={styles.price}>
-              {formatUnitPrice(asset.ticker, asset.localPrice, asset.currencySymbol, t('ag'))}
-            </Text>
-          )}
-          <TouchableOpacity
-            style={styles.buyButton}
-            onPress={() => onBuy(asset.ticker)}
-            hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
-            accessibilityRole="button"
-            accessibilityLabel={`${t('buy')} ${asset.ticker}`}>
-            <Text style={styles.buyButtonText}>{t('buy')}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => onDelete(asset.ticker)}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel={`Remove ${asset.ticker} from Ambush Radar`}>
-            <Text style={styles.deleteButtonText}>✕</Text>
-          </TouchableOpacity>
+      <View style={isOverweightLocked ? styles.lockedContent : undefined}>
+        <View style={styles.headerRow}>
+          {/* Ticker symbols stay LTR regardless of app language. */}
+          <Text style={styles.ticker}>{asset.ticker}</Text>
+          <View style={styles.headerRight}>
+            {isUnavailable ? (
+              <Text style={styles.priceUnavailable}>{t('priceUnavailable')}</Text>
+            ) : (
+              <Text style={styles.price}>
+                {formatUnitPrice(asset.ticker, asset.localPrice, asset.currencySymbol, t('ag'))}
+              </Text>
+            )}
+            <TouchableOpacity
+              style={[styles.buyButton, isOverweightLocked && styles.buyButtonDisabled]}
+              onPress={() => onBuy(asset.ticker)}
+              disabled={isOverweightLocked}
+              hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: isOverweightLocked }}
+              accessibilityLabel={`${t('buy')} ${asset.ticker}`}>
+              <Text style={styles.buyButtonText}>{t('buy')}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => onDelete(asset.ticker)}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel={`Remove ${asset.ticker} from Ambush Radar`}>
+              <Text style={styles.deleteButtonText}>✕</Text>
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
 
-      {isUnavailable ? (
-        <Text style={styles.fetchFailedHint}>{t('priceFetchFailedHint')}</Text>
-      ) : (
-        <>
-          <View style={styles.fundamentalsRow}>
-            <View style={styles.metric}>
-              <Text style={styles.metricLabel}>{t('roicLabel')}</Text>
-              <Text style={[styles.metricValue, { color: roicColor }]}>
-                {asset.roic === null ? t('notAvailable') : `${asset.roic.toFixed(1)}%`}
+        {isUnavailable ? (
+          <Text style={styles.fetchFailedHint}>{t('priceFetchFailedHint')}</Text>
+        ) : (
+          <>
+            <View style={styles.fundamentalsRow}>
+              <View style={styles.metric}>
+                <Text style={styles.metricLabel}>{t('roicLabel')}</Text>
+                <Text style={[styles.metricValue, { color: roicColor }]}>
+                  {asset.roic === null ? t('notAvailable') : `${asset.roic.toFixed(1)}%`}
+                </Text>
+              </View>
+              <View style={styles.metric}>
+                <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
+                <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
+              </View>
+            </View>
+
+            {/* The statistical trigger, shown larger than the fundamentals. */}
+            <View style={styles.zScoreRow}>
+              <Text style={styles.zScoreLabel}>{t('zScoreLabel')}:</Text>
+              <Text style={styles.zScoreValue}>
+                {asset.zScore === null ? t('notAvailable') : asset.zScore.toFixed(2)}
               </Text>
             </View>
-            <View style={styles.metric}>
-              <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
-              <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
-            </View>
-          </View>
+          </>
+        )}
 
-          {/* The statistical trigger, shown larger than the fundamentals. */}
-          <View style={styles.zScoreRow}>
-            <Text style={styles.zScoreLabel}>{t('zScoreLabel')}:</Text>
-            <Text style={styles.zScoreValue}>
-              {asset.zScore === null ? t('notAvailable') : asset.zScore.toFixed(2)}
-            </Text>
-          </View>
-        </>
-      )}
-
-      <View style={[styles.statusStrip, { backgroundColor: zoneColors.badgeBackground }]}>
-        <Text style={[styles.statusStripText, { color: zoneColors.badgeText }]}>
-          {t(AMBUSH_ZONE_BADGE_KEY[zone])}
-        </Text>
+        <View style={[styles.statusStrip, { backgroundColor: zoneColors.badgeBackground }]}>
+          <Text style={[styles.statusStripText, { color: zoneColors.badgeText }]}>
+            {t(AMBUSH_ZONE_BADGE_KEY[zone])}
+          </Text>
+        </View>
       </View>
+      {isOverweightLocked && (
+        <View style={styles.lockOverlay}>
+          <View style={styles.lockBadge} accessibilityRole="text">
+            <Ionicons name="lock-closed" size={14} color="#FFFFFF" />
+            <Text style={styles.lockBadgeText}>{t('overweightLockBadge')}</Text>
+          </View>
+        </View>
+      )}
     </View>
   );
 });
@@ -194,6 +211,43 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.bearish,
       fontSize: 16,
       fontWeight: '700',
+    },
+    // CIRCUIT BREAKER (Layer Overweight Lock): the card's content is dimmed
+    // and a badge is overlaid in the middle. The overlay ignores touches
+    // (pointerEvents: 'none'), so the remove button underneath still works;
+    // only Buy is disabled.
+    lockedContent: {
+      opacity: 0.35,
+    },
+    lockOverlay: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      pointerEvents: 'none',
+    },
+    lockBadge: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      backgroundColor: colors.bearish,
+      borderRadius: 999,
+      paddingHorizontal: 14,
+      paddingVertical: 7,
+    },
+    // White on the saturated bearish color, legible in both themes.
+    lockBadgeText: {
+      color: '#FFFFFF',
+      fontSize: 13,
+      fontWeight: '800',
+      writingDirection: writingDirection,
+    },
+    buyButtonDisabled: {
+      backgroundColor: colors.textSecondary,
+      opacity: 0.6,
     },
     buyButton: {
       backgroundColor: colors.bullish,

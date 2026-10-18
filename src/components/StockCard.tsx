@@ -1,3 +1,4 @@
+import { Ionicons } from '@expo/vector-icons';
 import { memo, useMemo } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
@@ -60,6 +61,9 @@ export type StockCardProps = {
   // TRADE RECONCILIATION: opens the Portfolio's Execute Trade flow for
   // this ticker (see handleBuyTicker in ambush.tsx).
   onBuy: (ticker: string) => void;
+  // CIRCUIT BREAKER: this card's layer (Satellite) is above target + 1%,
+  // so the card is dimmed, badged and its Buy button disabled.
+  isOverweightLocked: boolean;
 };
 
 // Wrapped in memo() so a price/SMA update on one ticker doesn't re-render
@@ -69,7 +73,7 @@ export type StockCardProps = {
 // this comparison is meaningful, not a no-op. memo() only shallow-compares
 // props, not context, so this still re-renders correctly on a theme toggle
 // (usePipelineTheme() below is a context read, unaffected by memo).
-export const StockCard = memo(function StockCard({ stock, onDelete, onBuy }: StockCardProps) {
+export const StockCard = memo(function StockCard({ stock, onDelete, onBuy, isOverweightLocked }: StockCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read (like usePipelineTheme()
   // above), unaffected by this component's own memo() — a language switch
@@ -107,74 +111,86 @@ export const StockCard = memo(function StockCard({ stock, onDelete, onBuy }: Sto
 
   return (
     <View style={styles.card}>
-      {isNearStructuralStop && (
-        <View style={styles.warningBanner}>
-          <Text style={styles.warningBannerText}>{t('structuralStopWarning')}</Text>
-        </View>
-      )}
+      <View style={isOverweightLocked ? styles.lockedContent : undefined}>
+        {isNearStructuralStop && (
+          <View style={styles.warningBanner}>
+            <Text style={styles.warningBannerText}>{t('structuralStopWarning')}</Text>
+          </View>
+        )}
 
-      <View style={styles.row}>
-        <View style={styles.tickerGroup}>
-          {/* Ticker symbol: always LTR, regardless of app language — it's
-              an identifier, not translatable text. */}
-          <Text style={styles.ticker}>{ticker}</Text>
-          <View style={styles.assetTypeBadge}>
-            <Text style={styles.assetTypeBadgeText}>{assetTypeLabel(t, assetType)}</Text>
+        <View style={styles.row}>
+          <View style={styles.tickerGroup}>
+            {/* Ticker symbol: always LTR, regardless of app language — it's
+                an identifier, not translatable text. */}
+            <Text style={styles.ticker}>{ticker}</Text>
+            <View style={styles.assetTypeBadge}>
+              <Text style={styles.assetTypeBadgeText}>{assetTypeLabel(t, assetType)}</Text>
+            </View>
+          </View>
+          <View style={styles.priceGroup}>
+            {/* MULTI-CURRENCY DISPLAY: the instrument's own local-currency
+                value (e.g. ₪13.48), never the USD-normalized `price` used for
+                math — see the Stock type above. TASE AGOROT DISPLAY: for a
+                ".TA" ticker this instead reads e.g. "3985 אג'" — see
+                formatUnitPrice. Numeric, so left as LTR either way. */}
+            {isPriceUnavailable ? (
+              <Text style={styles.priceUnavailable}>{t('priceUnavailable')}</Text>
+            ) : (
+              <Text style={styles.price}>{priceDisplay}</Text>
+            )}
+            <TouchableOpacity
+              style={[styles.buyButton, isOverweightLocked && styles.buyButtonDisabled]}
+              onPress={() => onBuy(ticker)}
+              disabled={isOverweightLocked}
+              hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: isOverweightLocked }}
+              accessibilityLabel={`${t('buy')} ${ticker}`}>
+              <Text style={styles.buyButtonText}>{t('buy')}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => onDelete(ticker)}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel={`הסר את ${ticker} מרשימת המעקב`}>
+              <Text style={styles.deleteButtonText}>✕</Text>
+            </TouchableOpacity>
           </View>
         </View>
-        <View style={styles.priceGroup}>
-          {/* MULTI-CURRENCY DISPLAY: the instrument's own local-currency
-              value (e.g. ₪13.48), never the USD-normalized `price` used for
-              math — see the Stock type above. TASE AGOROT DISPLAY: for a
-              ".TA" ticker this instead reads e.g. "3985 אג'" — see
-              formatUnitPrice. Numeric, so left as LTR either way. */}
-          {isPriceUnavailable ? (
-            <Text style={styles.priceUnavailable}>{t('priceUnavailable')}</Text>
-          ) : (
-            <Text style={styles.price}>{priceDisplay}</Text>
-          )}
-          <TouchableOpacity
-            style={styles.buyButton}
-            onPress={() => onBuy(ticker)}
-            hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
-            accessibilityRole="button"
-            accessibilityLabel={`${t('buy')} ${ticker}`}>
-            <Text style={styles.buyButtonText}>{t('buy')}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => onDelete(ticker)}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel={`הסר את ${ticker} מרשימת המעקב`}>
-            <Text style={styles.deleteButtonText}>✕</Text>
-          </TouchableOpacity>
-        </View>
+
+        {/* Add SMA Visuals to Portfolio: this MomentumBar is the exact same
+            shared component PortfolioStockRow (index.tsx) renders — see
+            @/components/MomentumBar. */}
+        {isPriceUnavailable ? (
+          <Text style={styles.priceFetchFailedHint}>{t('priceFetchFailedHint')}</Text>
+        ) : (
+          <>
+            <View style={styles.bottomRow}>
+              <MomentumBar
+                ticker={ticker}
+                price={price}
+                sma50={sma50}
+                sma200={sma200}
+                localPrice={localPrice}
+                currencySymbol={currencySymbol}
+                tacticalMomentum={tacticalMomentum}
+              />
+            </View>
+
+            {/* Dashboard Trend Display: Macro Trend + Pullback Depth Indicator
+                (replacing the old binary Tactical Momentum badge), replacing the
+                even older single Bullish/Bearish badge — shared component, see
+                @/components/TrendBadges. */}
+            <TrendBadges macroTrend={macroTrend} pullbackDepth={pullbackDepth} />
+          </>
+        )}
       </View>
-
-      {/* Add SMA Visuals to Portfolio: this MomentumBar is the exact same
-          shared component PortfolioStockRow (index.tsx) renders — see
-          @/components/MomentumBar. */}
-      {isPriceUnavailable ? (
-        <Text style={styles.priceFetchFailedHint}>{t('priceFetchFailedHint')}</Text>
-      ) : (
-        <>
-          <View style={styles.bottomRow}>
-            <MomentumBar
-              ticker={ticker}
-              price={price}
-              sma50={sma50}
-              sma200={sma200}
-              localPrice={localPrice}
-              currencySymbol={currencySymbol}
-              tacticalMomentum={tacticalMomentum}
-            />
+      {isOverweightLocked && (
+        <View style={styles.lockOverlay}>
+          <View style={styles.lockBadge} accessibilityRole="text">
+            <Ionicons name="lock-closed" size={14} color="#FFFFFF" />
+            <Text style={styles.lockBadgeText}>{t('overweightLockBadge')}</Text>
           </View>
-
-          {/* Dashboard Trend Display: Macro Trend + Pullback Depth Indicator
-              (replacing the old binary Tactical Momentum badge), replacing the
-              even older single Bullish/Bearish badge — shared component, see
-              @/components/TrendBadges. */}
-          <TrendBadges macroTrend={macroTrend} pullbackDepth={pullbackDepth} />
-        </>
+        </View>
       )}
     </View>
   );
@@ -304,6 +320,43 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.bearish,
       fontSize: 16,
       fontWeight: '700',
+    },
+    // CIRCUIT BREAKER (Layer Overweight Lock): the card's content is dimmed
+    // and a badge is overlaid in the middle. The overlay ignores touches
+    // (pointerEvents: 'none'), so the remove button underneath still works;
+    // only Buy is disabled.
+    lockedContent: {
+      opacity: 0.35,
+    },
+    lockOverlay: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      pointerEvents: 'none',
+    },
+    lockBadge: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      backgroundColor: colors.bearish,
+      borderRadius: 999,
+      paddingHorizontal: 14,
+      paddingVertical: 7,
+    },
+    // White on the saturated bearish color, legible in both themes.
+    lockBadgeText: {
+      color: '#FFFFFF',
+      fontSize: 13,
+      fontWeight: '800',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
+    },
+    buyButtonDisabled: {
+      backgroundColor: colors.textSecondary,
+      opacity: 0.6,
     },
     buyButton: {
       backgroundColor: colors.bullish,

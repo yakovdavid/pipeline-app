@@ -46,6 +46,17 @@ export type PortfolioTickerEntry = {
   // never recorded), and it stays null if one of them is topped up, since
   // a partial sum would be wrong.
   costBasisUsd: number | null;
+  // PROTECTION STATE (HWM decoupling), both USD on the same basis as
+  // `price`, both captured by Execute Trade:
+  //   purchasePrice: the average executed price per unit (fees excluded).
+  //     A top-up re-averages it; a partial sale leaves it unchanged.
+  //   historicalHWM: the 52-week high when the position was opened (or the
+  //     execution-time price when none was reported, so the position
+  //     tracks at once). It's the level the price must reclaim before the
+  //     stop may trail; see @/utils/protectionState.
+  // Null for positions opened before trade logging (no recorded entry).
+  purchasePrice: number | null;
+  historicalHWM: number | null;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {

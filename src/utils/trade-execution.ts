@@ -92,6 +92,30 @@ function grossLocal(inputs: TradeInputs, basis: TradePricingBasis): number {
   return getEffectiveUnits(basis.ticker, basis.assetType, inputs.quantity) * unitPriceLocal;
 }
 
+// The executed price per pricing unit in USD, fees excluded: the same
+// basis as a position's live `price` (Agorot converted to Shekels, then
+// to USD). This is a position's `purchasePrice`.
+export function executedUnitPriceUsd(inputs: TradeInputs, basis: TradePricingBasis): number {
+  const unitPriceLocal = isPriceEnteredInAgorot(basis.ticker) ? inputs.price / AGOROT_PER_SHEKEL : inputs.price;
+  return unitPriceLocal * basis.usdPerLocal;
+}
+
+// A top-up's new average purchase price, weighted by quantity. An unknown
+// earlier average stays unknown (null) rather than pretending the new fill
+// is the whole position's price.
+export function averagePurchasePrice(
+  previousPrice: number | null,
+  previousUnits: number,
+  addedPrice: number,
+  addedUnits: number,
+): number | null {
+  const totalUnits = previousUnits + addedUnits;
+  if (previousPrice === null || totalUnits <= 0) {
+    return null;
+  }
+  return (previousPrice * previousUnits + addedPrice * addedUnits) / totalUnits;
+}
+
 // BUY: Total Cost = (Executed Quantity × Executed Price) + Broker Fee.
 export function computeTradeCost(inputs: TradeInputs, basis: TradePricingBasis): TradeCost {
   const totalLocal = grossLocal(inputs, basis) + inputs.fee;

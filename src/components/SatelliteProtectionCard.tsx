@@ -6,12 +6,15 @@ import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
-import { computeProtectionState, type ProtectionState } from '@/utils/protectionState';
+import type { ProtectionState } from '@/utils/protectionState';
 
 export interface SatelliteProtectionCardProps {
   ticker: string;
   currentPrice: number;
-  hwm: number;
+  // Computed once by the position row (computeSatelliteProtection in
+  // app/(tabs)/index.tsx), so this card and the row's own stop line can
+  // never disagree.
+  protection: ProtectionState;
 }
 
 // How long a copy button shows its "Copied!" feedback before reverting to
@@ -99,7 +102,7 @@ function CopyableValueRow({ label, value, fieldKey, copiedField, onCopy, colors,
 // NOT as a separate, standalone list item — so its own outer wrapper
 // deliberately carries no card chrome of its own (no background, no
 // shadow/elevation, no bottom margin): see the `wrapper` style below.
-export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: SatelliteProtectionCardProps) {
+export function SatelliteProtectionCard({ ticker, currentPrice, protection }: SatelliteProtectionCardProps) {
   const { colors } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read, same as usePipelineTheme
   // above — a language switch re-renders this card, and every translated
@@ -124,18 +127,17 @@ export function SatelliteProtectionCard({ ticker, currentPrice, hwm }: Satellite
     };
   }, []);
 
-  const protectionState: ProtectionState = useMemo(
-    () => computeProtectionState(currentPrice, hwm),
-    [currentPrice, hwm],
-  );
+  const protectionState = protection;
 
-  const isAutomatedTracking = protectionState.statusColor === 'green';
-  // Reuses the app's own established green/orange semantics (bullish =
-  // healthy/automated, warning = needs attention) rather than introducing
-  // new hardcoded hex colors — this is what gives the badge correct
-  // light/dark-mode contrast "for free."
+  // PROTECTION STATE labels: "Recovery State (Stop Market Required)" while
+  // the stop is locked at the entry price, "Automated Tracking" once it
+  // trails. Reuses the app's own established green/orange semantics
+  // (bullish = healthy/automated, warning = needs attention) rather than
+  // introducing new hardcoded hex colors — this is what gives the badge
+  // correct light/dark-mode contrast "for free."
+  const isAutomatedTracking = !protectionState.isRecoveryState;
   const statusBadgeColor = isAutomatedTracking ? colors.bullish : colors.warning;
-  const statusLabel = isAutomatedTracking ? t('automatedTracking') : t('manualSetupRequired');
+  const statusLabel = isAutomatedTracking ? t('automatedTracking') : t('recoveryStateLabel');
 
   const stopPriceDisplay =
     typeof protectionState.stopPriceTarget === 'number'
@@ -281,8 +283,10 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 10,
+      flexShrink: 1,
     },
     statusBadge: {
+      flexShrink: 1,
       borderRadius: 999,
       paddingHorizontal: 10,
       paddingVertical: 4,
@@ -291,9 +295,11 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
     // (colors.bullish / colors.warning) are saturated enough in both
     // light and dark mode for white to stay legible on top of either.
     // textAlign/writingDirection DO follow the active language — this is
-    // translated label text ("Automated Tracking" / "Manual Setup
-    // Required"), unlike ticker/currentPrice above.
+    // translated label text ("Automated Tracking" / "Recovery State (Stop
+    // Market Required)"), unlike ticker/currentPrice above. flexShrink lets
+    // the longer Recovery label wrap instead of pushing the row off screen.
     statusBadgeText: {
+      flexShrink: 1,
       color: '#FFFFFF',
       fontSize: 11,
       fontWeight: '700',

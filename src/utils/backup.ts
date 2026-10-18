@@ -66,6 +66,8 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
           highestWatermark: null,
           internalTargetPct: null,
           costBasisUsd: null,
+          purchasePrice: null,
+          historicalHWM: null,
         }
       : null;
   }
@@ -107,7 +109,15 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
     // or restoring a backup would erase every position's cost basis.
     costBasisUsd:
       typeof entry.costBasisUsd === 'number' && Number.isFinite(entry.costBasisUsd) ? entry.costBasisUsd : null,
+    // PROTECTION STATE: losing these on restore would silently switch a
+    // position in Recovery State to trailing off its watermark.
+    purchasePrice: positiveNumberOrNull(entry.purchasePrice),
+    historicalHWM: positiveNumberOrNull(entry.historicalHWM),
   };
+}
+
+function positiveNumberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 // Ambush entries only ever need ticker + assetType, so any Portfolio-only

@@ -59,7 +59,7 @@ export type TranslationKey =
   | 'internalTargetPlaceholder'
   // Satellite Protection State Tracker (SatelliteProtectionCard)
   | 'automatedTracking'
-  | 'manualSetupRequired'
+  | 'recoveryStateLabel'
   | 'protectionOrderType'
   | 'protectionStopPrice'
   | 'setBrokerPriceAlertAt'
@@ -204,6 +204,13 @@ export type TranslationKey =
   | 'unitsHeld'
   | 'sellAll'
   | 'cannotPriceTradeTitle'
+  | 'stopLockedAt'
+  | 'purchasePriceLabel'
+  | 'historicalHwmLabel'
+  | 'overweightLockBadge'
+  | 'overweightBanner'
+  | 'overweightBuyBlockedTitle'
+  | 'overweightBuyBlockedMessage'
   | 'netProceeds'
   | 'confirmSell'
   | 'sellQuantityTooHighTitle'
@@ -261,7 +268,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     internalAllocation: 'הקצאה פנימית',
     internalTargetPlaceholder: 'יעד פנימי % (ליבה) - אופציונלי',
     automatedTracking: 'מעקב אוטומטי',
-    manualSetupRequired: 'נדרשת הגדרה ידנית',
+    recoveryStateLabel: 'מצב התאוששות (נדרשת פקודת Stop Market)',
     protectionOrderType: 'סוג הוראה',
     protectionStopPrice: 'מחיר עצירה',
     setBrokerPriceAlertAt: 'הגדר התראת מחיר בברוקר ב: {{price}}',
@@ -394,6 +401,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     unitsHeld: 'יחידות מוחזקות: {{units}}',
     sellAll: 'מכור הכל',
     cannotPriceTradeTitle: 'לא ניתן לתמחר את העסקה',
+    stopLockedAt: 'סטופ נעול (מחיר כניסה -12%)',
+    purchasePriceLabel: 'מחיר כניסה',
+    historicalHwmLabel: 'שיא היסטורי (שיא 52 שבועות בכניסה)',
+    overweightLockBadge: 'מושבת - שכבה בחריגת משקל',
+    overweightBanner: '{{layer}} במשקל {{weight}}% (תקרה {{limit}}%): הקנייה נעולה',
+    overweightBuyBlockedTitle: 'שכבה בחריגת משקל',
+    overweightBuyBlockedMessage: '{{layer}} מעל התקרה של {{limit}}%. הקנייה מהמכ״ם נעולה עד לאיזון.',
     netProceeds: 'תמורה נטו',
     confirmSell: 'אשר מכירה',
     sellQuantityTooHighTitle: 'הכמות גבוהה מהמוחזק',
@@ -443,7 +457,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     internalAllocation: 'Internal Allocation',
     internalTargetPlaceholder: 'Internal Target % (Core) - optional',
     automatedTracking: 'Automated Tracking',
-    manualSetupRequired: 'Manual Setup Required',
+    recoveryStateLabel: 'Recovery State (Stop Market Required)',
     protectionOrderType: 'Order Type',
     protectionStopPrice: 'Stop Price',
     setBrokerPriceAlertAt: 'Set Broker Price Alert at: {{price}}',
@@ -577,6 +591,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     unitsHeld: 'Units held: {{units}}',
     sellAll: 'Sell All',
     cannotPriceTradeTitle: 'Cannot Price Trade',
+    stopLockedAt: 'Locked stop (entry -12%)',
+    purchasePriceLabel: 'Entry price',
+    historicalHwmLabel: 'Historical HWM (52-week high at entry)',
+    overweightLockBadge: 'Disabled - Layer Overweight',
+    overweightBanner: '{{layer}} is at {{weight}}% (limit {{limit}}%): buying is locked',
+    overweightBuyBlockedTitle: 'Layer Overweight',
+    overweightBuyBlockedMessage: '{{layer}} is above its {{limit}}% limit. Buying from the radar is locked until it rebalances.',
     netProceeds: 'Net Proceeds',
     confirmSell: 'Confirm Sale',
     sellQuantityTooHighTitle: 'Quantity Exceeds Holding',

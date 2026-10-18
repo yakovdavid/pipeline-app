@@ -55,5 +55,8 @@ export function toPortfolioTickerEntry(stock: PortfolioStock): PortfolioTickerEn
     internalTargetPct: stock.internalTargetPct,
     // TRADE RECONCILIATION: the recorded execution cost.
     costBasisUsd: stock.costBasisUsd,
+    // PROTECTION STATE: the entry anchors of the stop-loss.
+    purchasePrice: stock.purchasePrice,
+    historicalHWM: stock.historicalHWM,
   };
 }

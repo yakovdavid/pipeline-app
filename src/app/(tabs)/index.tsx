@@ -37,7 +37,6 @@ import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT, formatUnitsLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
-import { SATELLITE_TS_PCT } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
@@ -52,7 +51,7 @@ import {
 import type { AmbushAsset, AmbushLayer } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
-import { computeAllocation } from '@/utils/allocation';
+import { computeAllocation, isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
 import { buildUnavailableAmbushAsset, fetchAmbushAsset } from '@/utils/ambush-assets';
 import {
   addTickerToAmbushRadar,
@@ -82,11 +81,15 @@ import {
 } from '@/utils/portfolio-buy-handoff';
 import { formatAmbushLines, formatCashLines, formatPortfolioLines } from '@/utils/report-formatters';
 import { buildPortfolioStock, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
+import { getLayerWeights, publishLayerWeights } from '@/utils/layer-weights-store';
 import { applySale } from '@/utils/position-ledger';
+import { computeProtectionState, resolveHistoricalHWM, type ProtectionState } from '@/utils/protectionState';
 import { normalizeTickerInput } from '@/utils/ticker';
 import {
   computeSaleProceeds,
+  averagePurchasePrice,
   computeTradeCost,
+  executedUnitPriceUsd,
   exceedsHolding,
   formatSignedUsd,
   formatUsd,
@@ -224,29 +227,36 @@ function toAmbushStock(stock: PortfolioStock): Stock {
 
 
 // TRAILING STOP DEFENSE CONSTRAINTS: a hardcoded architectural guard, not
-// just a UI convenience gate — this is the ONLY function in the codebase
-// allowed to compute a trailing-stop trigger price, and it refuses to
-// return one for any category other than 'Satellite', no matter what
-// highWaterMark it's handed. Core is held through drawdowns by design;
-// Quality gets its own Fundamental Audit Kill Switch instead (see
+// just a UI convenience gate — this is the ONLY place in the codebase
+// allowed to compute a stop-loss, and it refuses to return one for any
+// category other than 'Satellite'. Core is held through drawdowns by
+// design; Quality gets its own Fundamental Audit Kill Switch instead (see
 // isFundamentalAuditRequired in PortfolioStockRow below) — neither may
-// ever show or calculate a trailing stop. PortfolioStockRow's JSX ALSO
-// gates its own render on `stock.category === 'Satellite'` independently
-// (belt and suspenders, per the PRD's explicit "Hardcode a block"
-// requirement) — this function existing at all is the second layer of
-// that same block. Mirrors backend/main.py's identical guard inside
+// ever show or calculate a stop. PortfolioStockRow's JSX ALSO gates its
+// own render on `stock.category === 'Satellite'` independently (belt and
+// suspenders, per the PRD's explicit "Hardcode a block" requirement).
+// Mirrors backend/main.py's identical guard inside
 // _with_request_scoped_fields.
-function computeSatelliteTrailingStopPrice(
-  category: PortfolioCategory,
-  highWaterMark: number | null,
-): number | null {
-  if (category !== 'Satellite') {
+//
+// PROTECTION STATE (HWM decoupling): the stop itself comes from
+// computeProtectionState — locked at purchasePrice × 0.88 in Recovery
+// State, trailing at activeHWM × 0.88 once the price has reclaimed the
+// position's historicalHWM. Null with no observed price yet (no watermark)
+// or while the price is unavailable (its placeholder 0 would read as a
+// triggered stop).
+function computeSatelliteProtection(stock: PortfolioStock): ProtectionState | null {
+  if (stock.category !== 'Satellite') {
     return null;
   }
-  if (highWaterMark === null) {
+  if (stock.highestWatermark === null || stock.priceStatus === 'unavailable') {
     return null;
   }
-  return highWaterMark * (1 - SATELLITE_TS_PCT);
+  return computeProtectionState({
+    currentPrice: stock.price,
+    purchasePrice: stock.purchasePrice,
+    historicalHWM: stock.historicalHWM,
+    activeHWM: stock.highestWatermark,
+  });
 }
 
 // ALLOCATION STATUS / Core "Allocation Tracking": the pure percentage
@@ -655,6 +665,12 @@ export default function PortfolioScreen() {
         // no recorded cost; null, never 0 (which would read as "free").
         costBasisUsd:
           typeof entry.costBasisUsd === 'number' && Number.isFinite(entry.costBasisUsd) ? entry.costBasisUsd : null,
+        // PROTECTION STATE: no recorded entry (null) for positions opened
+        // before trade logging; see @/utils/protectionState.
+        purchasePrice:
+          typeof entry.purchasePrice === 'number' && entry.purchasePrice > 0 ? entry.purchasePrice : null,
+        historicalHWM:
+          typeof entry.historicalHWM === 'number' && entry.historicalHWM > 0 ? entry.historicalHWM : null,
       }));
     } catch (error) {
       console.error(
@@ -969,6 +985,20 @@ export default function PortfolioScreen() {
   // the new position can't be overwritten by the initial load; the ref
   // makes sure each request is started exactly once.
   const startRadarBuy = async (request: PortfolioBuyRequest) => {
+    // CIRCUIT BREAKER, defense in depth: the radar already disables Buy on
+    // a locked layer, but the lock is re-checked here against the latest
+    // weights in case they changed between the tap and this point.
+    const weights = getLayerWeights();
+    if (weights !== null && isLayerOverweight(request.layer, weights, CATEGORY_TARGET_PCT)) {
+      Alert.alert(
+        t('overweightBuyBlockedTitle'),
+        t('overweightBuyBlockedMessage', {
+          layer: categoryLabel(t, request.layer),
+          limit: overweightLimitPct(request.layer, CATEGORY_TARGET_PCT),
+        }),
+      );
+      return;
+    }
     try {
       await startTrade({
         ticker: request.ticker,
@@ -1040,6 +1070,9 @@ export default function PortfolioScreen() {
   // The duplicate check runs again inside the state update, so a ticker
   // that became held in the meantime is topped up rather than duplicated.
   const commitTrade = (trade: PendingTrade, inputs: TradeInputs, costUsd: number) => {
+    // PROTECTION STATE: the executed price per unit (fees excluded), on the
+    // same USD basis as the live price.
+    const fillPriceUsd = executedUnitPriceUsd(inputs, trade.basis);
     setStocksTrusted((prevStocks) => {
       const heldIndex = prevStocks.findIndex((stock) => stock.ticker === trade.ticker);
       if (heldIndex >= 0) {
@@ -1052,6 +1085,11 @@ export default function PortfolioScreen() {
                 // An unknown earlier cost stays unknown: a partial sum
                 // would understate the position's real cost.
                 costBasisUsd: stock.costBasisUsd === null ? null : roundToCents(stock.costBasisUsd + costUsd),
+                // A top-up re-averages the entry price (which moves the
+                // Recovery stop with it) but keeps the position's original
+                // historicalHWM: the peak to reclaim is still the one from
+                // when the position was opened.
+                purchasePrice: averagePurchasePrice(stock.purchasePrice, stock.units, fillPriceUsd, inputs.quantity),
               },
         );
       }
@@ -1059,6 +1097,13 @@ export default function PortfolioScreen() {
         trade.calibrationTotalValue,
         inputs.quantity,
         trade.quote.localPrice,
+      );
+      // PROTECTION STATE: the quote's 52-week high, on the position's
+      // calibrated basis, or the execution-time price when the quote has
+      // none (the position then tracks immediately).
+      const historicalHWM = resolveHistoricalHWM(
+        trade.quote.high52 === null ? null : applyCalibration(trade.quote.high52, calibrationFactor),
+        applyCalibration(trade.quote.price, calibrationFactor),
       );
       const entry: PortfolioTickerEntry = {
         ticker: trade.ticker,
@@ -1069,6 +1114,8 @@ export default function PortfolioScreen() {
         calibrationFactor,
         internalTargetPct: trade.internalTargetPct,
         costBasisUsd: costUsd,
+        purchasePrice: fillPriceUsd,
+        historicalHWM,
       };
       // buildPortfolioStock calibrates the quote and seeds the watermark
       // from the live price, exactly like a freshly loaded position.
@@ -1426,6 +1473,14 @@ export default function PortfolioScreen() {
             calibrationFactor,
             highestWatermark: newUsdPrice,
             internalTargetPct,
+            // PROTECTION STATE: historicalHWM came from Yahoo (the quote's
+            // 52-week high), so it moves to the new scale like the other
+            // Yahoo-derived prices above. purchasePrice is the broker's
+            // real fill price, so it does not change.
+            historicalHWM:
+              stock.historicalHWM === null
+                ? null
+                : applyCalibration(stripCalibration(stock.historicalHWM, existingFactor), calibrationFactor),
           };
         }),
       );
@@ -1703,6 +1758,22 @@ export default function PortfolioScreen() {
   const coreWeightPct = allocation.weightsPct.Core;
   const satelliteWeightPct = allocation.weightsPct.Satellite;
   const qualityWeightPct = allocation.weightsPct.Quality;
+  const cashWeightPct = allocation.weightsPct.Cash;
+
+  // CIRCUIT BREAKER: hands the live weights to the Ambush Radar (see
+  // @/utils/layer-weights-store), which locks buying into any layer above
+  // target + 1%. Re-published on every change, so adding or withdrawing
+  // cash (which re-dilutes every layer) updates the lock at once. Until
+  // both the portfolio and the saved cash balance have loaded, the weights
+  // are unknown and published as null, which locks nothing.
+  const areWeightsReliable = !isInitializing && isCashLoaded;
+  useEffect(() => {
+    publishLayerWeights(
+      areWeightsReliable
+        ? { Core: coreWeightPct, Satellite: satelliteWeightPct, Quality: qualityWeightPct, Cash: cashWeightPct }
+        : null,
+    );
+  }, [areWeightsReliable, coreWeightPct, satelliteWeightPct, qualityWeightPct, cashWeightPct]);
 
   const allSections: PortfolioListSection[] = [
     {
@@ -2492,8 +2563,11 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // positions are held through drawdowns and Quality gets the Fundamental
   // Audit Kill Switch below instead, so neither ever computes a TS price —
   // enforced by a hardcoded architectural guard, not just this component's
-  // own JSX gate (see computeSatelliteTrailingStopPrice's own comment).
-  const trailingStopPrice = computeSatelliteTrailingStopPrice(stock.category, stock.highestWatermark);
+  // own JSX gate (see computeSatelliteProtection's own comment).
+  // PROTECTION STATE: Recovery State (locked at the entry price - 12%) or
+  // Automated Tracking (trailing 12% off the post-breakout peak).
+  const protection = computeSatelliteProtection(stock);
+  const trailingStopPrice = protection?.stopPrice ?? null;
   // Red/green, not just a triggered/untriggered binary: colors.bearish
   // once price has fallen to (or through) the trigger, colors.bullish while
   // it's still safely above it — see trailingStopPriceColor at the JSX
@@ -2764,7 +2838,20 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             </Text>
           )}
 
-          {trailingStopPrice !== null && (
+          {/* PROTECTION STATE: the two entry anchors captured by Execute
+              Trade (absent for positions opened before trade logging). */}
+          {stock.purchasePrice !== null && (
+            <Text style={styles.macroContextText}>
+              {t('purchasePriceLabel')}: ${stock.purchasePrice.toFixed(2)}
+            </Text>
+          )}
+          {stock.historicalHWM !== null && (
+            <Text style={styles.macroContextText}>
+              {t('historicalHwmLabel')}: ${stock.historicalHWM.toFixed(2)}
+            </Text>
+          )}
+
+          {protection !== null && trailingStopPrice !== null && (
             // Trailing Stop is a computed USD threshold (highestWatermark
             // is tracked in USD — see computeHighestWatermark above), not
             // a raw quoted price, so it stays displayed in USD ('$')
@@ -2778,7 +2865,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 isTrailingStopTriggered ? styles.trailingStopBearishText : styles.trailingStopBullishText,
               ]}>
               {isTrailingStopTriggered ? '⚠ ' : ''}
-              {t('trailingStopActivatedAt')}: ${trailingStopPrice.toFixed(2)}
+              {t(protection.isRecoveryState ? 'stopLockedAt' : 'trailingStopActivatedAt')}: $
+              {trailingStopPrice.toFixed(2)}
             </Text>
           )}
 
@@ -2802,18 +2890,13 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               above, not a separate list item). currentPrice is this
               row's live, already-calibrated/USD-normalized stock.price —
               the same basis trailingStopPrice/hwmDropPct above already
-              use. hwm is this position's own highestWatermark (the
-              "database" High Water Mark this feature is specified
-              against); gated on it being non-null for the same reason
-              trailingStopPrice/sma200Display above are — no watermark yet
-              means no live price has been fetched for this position at
-              all. */}
-          {stock.highestWatermark !== null && (
-            <SatelliteProtectionCard
-              ticker={stock.ticker}
-              currentPrice={stock.price}
-              hwm={stock.highestWatermark}
-            />
+              use. PROTECTION STATE: `protection` is the same object the
+              stop line above reads (computeSatelliteProtection), so the
+              card's "Recovery State (Stop Market Required)" / "Automated
+              Tracking" badge and that line can never disagree. Null (not
+              rendered) until a live price has been observed. */}
+          {protection !== null && (
+            <SatelliteProtectionCard ticker={stock.ticker} currentPrice={stock.price} protection={protection} />
           )}
         </>
       )}
