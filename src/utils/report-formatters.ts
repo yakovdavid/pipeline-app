@@ -1,7 +1,9 @@
 import type { AmbushAsset } from '@/types/ambush';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import type { PortfolioStock } from '@/types/portfolio';
+import type { AllocationBreakdown } from '@/utils/allocation';
 import { getEffectiveUnits } from '@/utils/currency';
+import { formatUsd } from '@/utils/trade-execution';
 
 // Shared by the Ambush Radar screen's own export and the Portfolio screen's
 // combined export, so the two reports describe Ambush data identically.
@@ -83,8 +85,10 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
         // computed total value uses the effective (real) unit count.
         const effectiveUnits = getEffectiveUnits(stock.ticker, stock.assetType, stock.units);
         const totalValue = effectiveUnits * stock.price;
+        // TRADE RECONCILIATION: the recorded execution cost, when known.
+        const costSuffix = stock.costBasisUsd === null ? '' : ` | cost basis ${formatUsd(stock.costBasisUsd)}`;
         lines.push(
-          `  ${stock.ticker}: ${stock.units} units @ $${stock.price.toFixed(2)} = $${totalValue.toFixed(2)}`,
+          `  ${stock.ticker}: ${stock.units} units @ $${stock.price.toFixed(2)} = $${totalValue.toFixed(2)}${costSuffix}`,
         );
         if (stock.anomalyReport) {
           lines.push(`    ${stock.anomalyReport}`);
@@ -98,4 +102,17 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
   });
 
   return lines;
+}
+
+// LIQUIDITY CORE: the buying power and the cash-diluted weights, in the
+// same terms the Portfolio's summary card shows them (weights sum to
+// exactly 100.0%, see computeAllocation).
+export function formatCashLines(cashBalance: number, allocation: AllocationBreakdown): string[] {
+  const { weightsPct } = allocation;
+  return [
+    `CASH (buying power): ${formatUsd(cashBalance)}`,
+    `ALLOCATION incl. cash (total ${formatUsd(allocation.totalValue)}): ` +
+      `Core ${weightsPct.Core.toFixed(1)}% | Satellite ${weightsPct.Satellite.toFixed(1)}% | ` +
+      `Quality ${weightsPct.Quality.toFixed(1)}% | Cash ${weightsPct.Cash.toFixed(1)}%`,
+  ];
 }

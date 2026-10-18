@@ -3,6 +3,11 @@
 export const AMBUSH_TICKERS_STORAGE_KEY = '@pipeline/watchlist_tickers';
 export const PORTFOLIO_TICKERS_STORAGE_KEY = '@pipeline/portfolio_tickers';
 
+// LIQUIDITY CORE: the available buying power in USD, stored as a plain
+// JSON number. The 30,000 ILS emergency reserve is never part of it: this
+// is only the cash that can actually be invested.
+export const CASH_BALANCE_STORAGE_KEY = '@pipeline/cash_balance';
+
 // User's Light/Dark mode preference for the Pipeline screens (see
 // ThemeContext). Stored as the literal string 'light' | 'dark' rather than
 // a boolean so the raw AsyncStorage value is self-describing if inspected.

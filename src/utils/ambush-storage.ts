@@ -73,6 +73,25 @@ export async function addTickerToAmbushRadar(entry: AmbushTickerEntry): Promise<
   return 'added';
 }
 
+// TRADE RECONCILIATION: removes a ticker (case-insensitive, either layer)
+// from the persisted Ambush Radar list once it has been bought into the
+// Portfolio. Same read-modify-write and same "throw without writing on an
+// unreadable list" rule as addTickerToAmbushRadar above. Returns whether
+// the ticker was there.
+export async function removeTickerFromAmbushRadar(ticker: string): Promise<boolean> {
+  const existing = await loadAmbushTickerEntries();
+  if (existing === null) {
+    return false;
+  }
+  const normalizedTicker = ticker.trim().toUpperCase();
+  const remaining = existing.filter((tracked) => tracked.ticker.trim().toUpperCase() !== normalizedTicker);
+  if (remaining.length === existing.length) {
+    return false;
+  }
+  await AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(remaining));
+  return true;
+}
+
 // In-memory notification for an already-mounted Ambush Radar screen. Tab
 // screens stay mounted after their first visit, and the Ambush screen
 // mirrors its own in-memory list back into storage whenever that list
@@ -94,4 +113,22 @@ export function subscribeToAmbushAdditions(listener: AmbushAdditionListener): ()
 
 export function notifyAmbushAddition(asset: AmbushAsset): void {
   ambushAdditionListeners.forEach((listener) => listener(asset));
+}
+
+// The removal counterpart, for the same reason: a mounted Ambush screen
+// mirrors its in-memory list back into storage, so it must drop the
+// ticker from memory too, or its next write would restore it.
+type AmbushRemovalListener = (ticker: string) => void;
+
+const ambushRemovalListeners = new Set<AmbushRemovalListener>();
+
+export function subscribeToAmbushRemovals(listener: AmbushRemovalListener): () => void {
+  ambushRemovalListeners.add(listener);
+  return () => {
+    ambushRemovalListeners.delete(listener);
+  };
+}
+
+export function notifyAmbushRemoval(ticker: string): void {
+  ambushRemovalListeners.forEach((listener) => listener(ticker));
 }

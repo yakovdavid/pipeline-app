@@ -18,6 +18,8 @@ export type QualityAmbushCardProps = {
   zone: AmbushReadinessZone;
   // Removes the ticker from the radar (same handler StockCard uses).
   onDelete: (ticker: string) => void;
+  // Opens the Portfolio's Execute Trade flow (same handler StockCard uses).
+  onBuy: (ticker: string) => void;
 };
 
 function moatLabel(t: TFunction, moat: QualityMoat | null): string {
@@ -49,7 +51,12 @@ function moatLabel(t: TFunction, moat: QualityMoat | null): string {
 // Follows the app's light/dark theme like every other card. Wrapped in
 // memo() so refreshing other rows doesn't re-render this one; theme and
 // language are context reads, which still re-render it.
-export const QualityAmbushCard = memo(function QualityAmbushCard({ asset, zone, onDelete }: QualityAmbushCardProps) {
+export const QualityAmbushCard = memo(function QualityAmbushCard({
+  asset,
+  zone,
+  onDelete,
+  onBuy,
+}: QualityAmbushCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
@@ -72,6 +79,14 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({ asset, zone, 
               {formatUnitPrice(asset.ticker, asset.localPrice, asset.currencySymbol, t('ag'))}
             </Text>
           )}
+          <TouchableOpacity
+            style={styles.buyButton}
+            onPress={() => onBuy(asset.ticker)}
+            hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+            accessibilityRole="button"
+            accessibilityLabel={`${t('buy')} ${asset.ticker}`}>
+            <Text style={styles.buyButtonText}>{t('buy')}</Text>
+          </TouchableOpacity>
           <TouchableOpacity
             onPress={() => onDelete(asset.ticker)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -179,6 +194,18 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.bearish,
       fontSize: 16,
       fontWeight: '700',
+    },
+    buyButton: {
+      backgroundColor: colors.bullish,
+      borderRadius: 12,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+    },
+    buyButtonText: {
+      color: colors.textPrimary,
+      fontSize: 13,
+      fontWeight: '700',
+      writingDirection,
     },
     fetchFailedHint: {
       color: colors.textSecondary,

@@ -53,5 +53,7 @@ export function toPortfolioTickerEntry(stock: PortfolioStock): PortfolioTickerEn
     // CORE INTERNAL ALLOCATION: user-entered, so it must survive every
     // save.
     internalTargetPct: stock.internalTargetPct,
+    // TRADE RECONCILIATION: the recorded execution cost.
+    costBasisUsd: stock.costBasisUsd,
   };
 }

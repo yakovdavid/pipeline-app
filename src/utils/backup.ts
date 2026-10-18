@@ -1,9 +1,14 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { AMBUSH_TICKERS_STORAGE_KEY, PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
+import {
+  AMBUSH_TICKERS_STORAGE_KEY,
+  CASH_BALANCE_STORAGE_KEY,
+  PORTFOLIO_TICKERS_STORAGE_KEY,
+} from '@/constants/storage-keys';
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioTickerEntry } from '@/types/portfolio';
+import { parseCashBalance, saveCashBalance } from '@/utils/cash-storage';
 
 const BACKUP_SCHEMA_VERSION = 1;
 const PORTFOLIO_CATEGORIES: PortfolioCategory[] = ['Core', 'Satellite', 'Quality'];
@@ -14,15 +19,20 @@ export type BackupPayload = {
   exportedAt: string;
   portfolio: PortfolioTickerEntry[];
   ambush: AmbushTickerEntry[];
+  // LIQUIDITY CORE: the USD buying power. Null when the backup predates
+  // cash tracking; restoring such a backup leaves the current balance
+  // untouched rather than zeroing it.
+  cashBalance: number | null;
 };
 
 // Reads both screens' persisted ticker lists directly from AsyncStorage
 // (not live component state, which this module has no access to) into one
 // exportable JSON object.
 export async function createBackupPayload(): Promise<BackupPayload> {
-  const [storedPortfolio, storedAmbush] = await Promise.all([
+  const [storedPortfolio, storedAmbush, storedCash] = await Promise.all([
     AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(AMBUSH_TICKERS_STORAGE_KEY),
+    AsyncStorage.getItem(CASH_BALANCE_STORAGE_KEY),
   ]);
 
   return {
@@ -30,6 +40,8 @@ export async function createBackupPayload(): Promise<BackupPayload> {
     exportedAt: new Date().toISOString(),
     portfolio: storedPortfolio ? (JSON.parse(storedPortfolio) as PortfolioTickerEntry[]) : [],
     ambush: storedAmbush ? (JSON.parse(storedAmbush) as AmbushTickerEntry[]) : [],
+    // Never-saved cash is a real balance of 0, not "unknown".
+    cashBalance: storedCash ? parseCashBalance(JSON.parse(storedCash)) : 0,
   };
 }
 
@@ -53,6 +65,7 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
           units: 0,
           highestWatermark: null,
           internalTargetPct: null,
+          costBasisUsd: null,
         }
       : null;
   }
@@ -90,6 +103,10 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
     // here would silently wipe out a user-defined internal target the
     // moment a backup is restored.
     internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
+    // TRADE RECONCILIATION: the recorded execution cost must round-trip,
+    // or restoring a backup would erase every position's cost basis.
+    costBasisUsd:
+      typeof entry.costBasisUsd === 'number' && Number.isFinite(entry.costBasisUsd) ? entry.costBasisUsd : null,
   };
 }
 
@@ -164,6 +181,7 @@ export function parseBackupPayload(rawText: string): BackupPayload {
     exportedAt: typeof payload.exportedAt === 'string' ? payload.exportedAt : new Date().toISOString(),
     portfolio,
     ambush,
+    cashBalance: parseCashBalance(payload.cashBalance),
   };
 }
 
@@ -176,5 +194,6 @@ export async function restoreBackupPayload(payload: BackupPayload): Promise<void
   await Promise.all([
     AsyncStorage.setItem(PORTFOLIO_TICKERS_STORAGE_KEY, JSON.stringify(payload.portfolio)),
     AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(payload.ambush)),
+    ...(payload.cashBalance !== null ? [saveCashBalance(payload.cashBalance)] : []),
   ]);
 }

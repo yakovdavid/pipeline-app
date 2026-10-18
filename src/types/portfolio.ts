@@ -40,6 +40,12 @@ export type PortfolioTickerEntry = {
   // "Internal Allocation" line), but tracked regardless of category, same
   // reasoning as highestWatermark above.
   internalTargetPct: number | null;
+  // TRADE RECONCILIATION: what this position actually cost, in USD,
+  // including broker fees: the sum of every "Execute Trade" total for it.
+  // Null for positions added before trade logging existed (their cost was
+  // never recorded), and it stays null if one of them is topped up, since
+  // a partial sum would be wrong.
+  costBasisUsd: number | null;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {

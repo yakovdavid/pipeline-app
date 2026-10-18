@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -42,7 +42,8 @@ import {
   refreshAmbushAsset,
   toAmbushTickerEntry,
 } from '@/utils/ambush-assets';
-import { loadAmbushTickerEntries, subscribeToAmbushAdditions } from '@/utils/ambush-storage';
+import { loadAmbushTickerEntries, subscribeToAmbushAdditions, subscribeToAmbushRemovals } from '@/utils/ambush-storage';
+import { requestPortfolioBuy } from '@/utils/portfolio-buy-handoff';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
 import { normalizeTickerInput } from '@/utils/ticker';
@@ -272,6 +273,22 @@ export default function AmbushRadarScreen() {
     [setAssetsTrusted],
   );
 
+  // TRADE RECONCILIATION: a ticker bought into the Portfolio from this
+  // radar is removed here too, the mirror image of the additions listener
+  // above. Without it, this screen's next storage write would put the
+  // bought ticker back. Skipped for the same untrusted-load reason: storage
+  // already reflects the removal.
+  useEffect(
+    () =>
+      subscribeToAmbushRemovals((removedTicker) => {
+        if (!canPersistRef.current) {
+          return;
+        }
+        setAssetsTrusted((previous) => previous.filter((asset) => !isSameTicker(asset.ticker, removedTicker)));
+      }),
+    [setAssetsTrusted],
+  );
+
   // Tracks whether this screen is still mounted — read from the AppState
   // foreground hook below, which (unlike the focus effect above) isn't
   // itself tied to a per-focus cancellation session: an OS-level
@@ -459,6 +476,31 @@ export default function AmbushRadarScreen() {
     [setAssetsTrusted],
   );
 
+  // TRADE RECONCILIATION: "Buy" hands the ticker (with its layer and
+  // asset type) to the Portfolio screen and switches to it, where the
+  // Execute Trade modal opens. The ticker stays on the radar until that
+  // trade is confirmed; cancelling leaves it here. Reads the list through
+  // a ref so the handler keeps a stable identity (StockCard/
+  // QualityAmbushCard are memo()'d); the ref is updated in an effect,
+  // never during render.
+  const router = useRouter();
+  const assetsRef = useRef(assets);
+  useEffect(() => {
+    assetsRef.current = assets;
+  }, [assets]);
+
+  const handleBuyTicker = useCallback(
+    (tickerToBuy: string) => {
+      const asset = assetsRef.current.find((candidate) => isSameTicker(candidate.ticker, tickerToBuy));
+      if (asset === undefined) {
+        return;
+      }
+      requestPortfolioBuy({ ticker: asset.ticker, assetType: asset.assetType, layer: asset.layer });
+      router.navigate('/');
+    },
+    [router],
+  );
+
   // COLLAPSIBLE SECTIONS: one flag per readiness zone; true means
   // collapsed. In-memory only, so every section starts expanded again
   // after an app restart.
@@ -492,11 +534,11 @@ export default function AmbushRadarScreen() {
   const renderRadarItem = useCallback<SectionListRenderItem<AmbushAsset, AmbushSectionInfo>>(
     ({ item, section }) =>
       item.layer === 'Quality' ? (
-        <QualityAmbushCard asset={item} zone={section.key} onDelete={handleDeleteTicker} />
+        <QualityAmbushCard asset={item} zone={section.key} onDelete={handleDeleteTicker} onBuy={handleBuyTicker} />
       ) : (
-        <StockCard stock={item} onDelete={handleDeleteTicker} />
+        <StockCard stock={item} onDelete={handleDeleteTicker} onBuy={handleBuyTicker} />
       ),
-    [handleDeleteTicker],
+    [handleDeleteTicker, handleBuyTicker],
   );
 
   const renderSectionHeader = useCallback(

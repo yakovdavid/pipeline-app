@@ -27,6 +27,9 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
+import { AdjustCashModal } from '@/components/AdjustCashModal';
+import { CashSummaryCard } from '@/components/CashSummaryCard';
+import { ExecuteTradeModal, type ExecuteTradeRequest } from '@/components/ExecuteTradeModal';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { SatelliteProtectionCard } from '@/components/SatelliteProtectionCard';
 import type { Stock } from '@/components/StockCard';
@@ -49,12 +52,18 @@ import {
 import type { AmbushAsset, AmbushLayer } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
+import { computeAllocation } from '@/utils/allocation';
 import { buildUnavailableAmbushAsset, fetchAmbushAsset } from '@/utils/ambush-assets';
-import { addTickerToAmbushRadar, loadAmbushTickerEntries, notifyAmbushAddition } from '@/utils/ambush-storage';
+import {
+  addTickerToAmbushRadar,
+  loadAmbushTickerEntries,
+  notifyAmbushAddition,
+  notifyAmbushRemoval,
+  removeTickerFromAmbushRadar,
+} from '@/utils/ambush-storage';
 import { createBackupPayload, parseBackupPayload, restoreBackupPayload, type BackupPayload } from '@/utils/backup';
 import {
   applyCalibration,
-  calibrateQuote,
   computeCalibrationFactor,
   DEFAULT_CALIBRATION_FACTOR,
   stripCalibration,
@@ -65,9 +74,27 @@ import {
   formatUnitPrice,
   getEffectiveUnits,
 } from '@/utils/currency';
-import { formatAmbushLines, formatPortfolioLines } from '@/utils/report-formatters';
-import { buildPortfolioStock, computeHighestWatermark, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
+import { loadCashBalance, saveCashBalance } from '@/utils/cash-storage';
+import {
+  subscribeToPortfolioBuyRequests,
+  takePendingPortfolioBuy,
+  type PortfolioBuyRequest,
+} from '@/utils/portfolio-buy-handoff';
+import { formatAmbushLines, formatCashLines, formatPortfolioLines } from '@/utils/report-formatters';
+import { buildPortfolioStock, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
+import { applySale } from '@/utils/position-ledger';
 import { normalizeTickerInput } from '@/utils/ticker';
+import {
+  computeSaleProceeds,
+  computeTradeCost,
+  exceedsHolding,
+  formatSignedUsd,
+  formatUsd,
+  isFullSale,
+  roundToCents,
+  usdPerLocalFromQuote,
+  type TradeInputs,
+} from '@/utils/trade-execution';
 
 type FilterOption = 'All' | PortfolioCategory;
 const FILTER_OPTIONS: FilterOption[] = ['All', 'Core', 'Satellite', 'Quality'];
@@ -97,7 +124,7 @@ type PortfolioListSection = {
   accentColor: string;
   data: PortfolioStock[];
   // Core "Allocation Tracking": this layer's live share of the whole
-  // portfolio (see computeLayerWeightPct) — computed once here, read by
+  // portfolio (see computeAllocation; cash-diluted) — computed once here, read by
   // every row in this section via the currentWeightPct prop, rather than
   // each row re-deriving it from the full stocks array.
   currentWeightPct: number;
@@ -113,6 +140,38 @@ type PortfolioListSection = {
 // The return type of createStyles (defined at the bottom of this file) —
 // aliased here so it can be used in prop types above that definition.
 type PortfolioStyles = ReturnType<typeof createStyles>;
+
+// TRADE RECONCILIATION: a buy waiting in the "Execute Trade" modal. Built
+// by startTrade once the live quote is in, consumed by commitTrade.
+type PendingTrade = Extract<ExecuteTradeRequest, { side: 'buy' }> & {
+  // Remount key for the modal, so each trade starts with empty fields.
+  id: number;
+  assetType: AssetType;
+  // The raw (uncalibrated) live quote, used to build a new position.
+  quote: StockQuote;
+  // Add Asset's optional "Total value in bank" (AUTO-CALIBRATION); only
+  // applied to a NEW position, never to a top-up.
+  calibrationTotalValue: number | null;
+  internalTargetPct: number | null;
+  // Started from the Ambush Radar's Buy button: the ticker leaves the
+  // radar once the trade is committed.
+  fromAmbushRadar: boolean;
+};
+
+// A sale waiting in the "Execute Sell" modal. Built by handleSellTicker,
+// consumed by commitSale.
+type PendingSale = Extract<ExecuteTradeRequest, { side: 'sell' }> & {
+  id: number;
+};
+
+type TradeStart = {
+  ticker: string;
+  category: PortfolioCategory;
+  assetType: AssetType;
+  calibrationTotalValue: number | null;
+  internalTargetPct: number | null;
+  fromAmbushRadar: boolean;
+};
 
 // Module-level (not defined inside the component) since it has no closure
 // dependencies at all — not even styles/colors — a stable identity across
@@ -225,7 +284,7 @@ function computeSatelliteTrailingStopPrice(
 // held quantity like 1433 would be multiplied straight through instead of
 // the ~14.33 real units it actually represents, inflating this layer's
 // (and the whole portfolio's) computed value ~100x.
-// Shared by computeLayerWeightPct (this layer's share of the WHOLE
+// Shared by the allocation weights (this layer's share of the WHOLE
 // portfolio) and computeInternalWeightPct below (one asset's share of
 // THIS layer alone) — both are "value / some total * 100", just with a
 // different denominator, so the value-summing half is factored out once
@@ -240,21 +299,22 @@ function computeLayerTotalValue(categoryStocks: PortfolioStock[]): number {
   );
 }
 
-function computeLayerWeightPct(categoryStocks: PortfolioStock[], totalPortfolioValue: number): number {
-  const categoryValue = computeLayerTotalValue(categoryStocks);
-  return totalPortfolioValue > 0 ? (categoryValue / totalPortfolioValue) * 100 : 0;
-}
+// ALLOCATION DENOMINATOR FIX: a layer's share of the WHOLE portfolio used
+// to be LayerValue / TotalInvested here, which ignored uninvested cash. It
+// is now computed by computeAllocation (@/utils/allocation) as
+// LayerValue / (TotalInvested + cashBalance), with Cash as a fourth
+// bucket and all four rounded to sum to exactly 100.0%.
 
 // CORE LAYER INTERNAL ALLOCATION FIX: one asset's share of its OWN layer's
 // total value — (Asset Total Value / Layer Total Value) * 100, exactly as
-// specified — as opposed to computeLayerWeightPct above, which is that
+// specified — as opposed to computeAllocation's layer weight, which is that
 // SAME layer's share of the WHOLE PORTFOLIO. Those are two genuinely
 // different numbers (e.g. Core might be 68% of the whole portfolio, while
 // one specific Core holding might be 40% of Core itself), and the bug
 // this fixes was PortfolioStockRow displaying the former on every Core
 // card when the latter is what actually tells a user how their own Core
 // holdings are balanced against EACH OTHER. Returns 0 (not NaN/Infinity)
-// when the layer is empty/worthless, matching computeLayerWeightPct's own
+// when the layer is empty/worthless, matching computeAllocation's own
 // zero-division guard.
 function computeInternalWeightPct(stock: PortfolioStock, layerTotalValue: number): number {
   const stockValue = getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price;
@@ -331,7 +391,6 @@ export default function PortfolioScreen() {
   // any subsequent load/refresh actually succeeds.
   const [syncWarning, setSyncWarning] = useState(false);
   const [ticker, setTicker] = useState('');
-  const [units, setUnits] = useState('1');
   // AUTO-CALIBRATION FOR BROKEN PRICES: optional — see handleAddTicker for
   // how this becomes a calibrationFactor. Left blank, the position is
   // added with no correction at all (factor 1.0, i.e. trust the API price
@@ -465,6 +524,88 @@ export default function PortfolioScreen() {
     };
   }, []);
 
+  // LIQUIDITY CORE: the USD buying power (never the 30,000 ILS emergency
+  // reserve, which this app doesn't track at all). State drives the UI;
+  // the refs give event handlers the current value without waiting for a
+  // re-render, so two quick actions can't both start from a stale balance.
+  //
+  // CACHE INTEGRITY, same rule as the portfolio list: until the saved
+  // balance has been read successfully (isCashLoaded), every action that
+  // changes it is blocked, so a failed read can never let a trade or a
+  // deposit overwrite the real saved balance with one computed from 0.
+  const [cashBalance, setCashBalance] = useState(0);
+  const [isCashLoaded, setIsCashLoaded] = useState(false);
+  const cashBalanceRef = useRef(0);
+  const isCashLoadedRef = useRef(false);
+  const [isAdjustCashModalVisible, setIsAdjustCashModalVisible] = useState(false);
+  const [adjustCashModalKey, setAdjustCashModalKey] = useState(0);
+
+  const loadCash = useCallback(async () => {
+    try {
+      const value = await loadCashBalance();
+      if (!isMountedRef.current) {
+        return;
+      }
+      cashBalanceRef.current = value;
+      isCashLoadedRef.current = true;
+      setCashBalance(value);
+      setIsCashLoaded(true);
+    } catch (error) {
+      console.error('[cash] Failed to read the saved cash balance; cash changes stay blocked until it loads.', error);
+    }
+  }, []);
+
+  // Started in a microtask so no state is set synchronously inside the
+  // effect body (same pattern as the radar Buy claim below).
+  useEffect(() => {
+    Promise.resolve().then(loadCash);
+  }, [loadCash]);
+
+  // Every cash change goes through here: state, refs and storage together.
+  const applyCashBalance = useCallback((next: number) => {
+    const rounded = roundToCents(next);
+    cashBalanceRef.current = rounded;
+    isCashLoadedRef.current = true;
+    setCashBalance(rounded);
+    setIsCashLoaded(true);
+    saveCashBalance(rounded).catch((error) => {
+      console.warn('Failed to save cash balance to storage:', error);
+    });
+  }, []);
+
+  // TRADE RECONCILIATION: the buy waiting in the Execute Trade modal, and
+  // a Buy request handed over from the Ambush Radar (see
+  // @/utils/portfolio-buy-handoff) that hasn't been started yet.
+  const [pendingTrade, setPendingTrade] = useState<PendingTrade | null>(null);
+  const tradeIdRef = useRef(0);
+  const [pendingSale, setPendingSale] = useState<PendingSale | null>(null);
+  const saleIdRef = useRef(0);
+  const [radarBuyRequest, setRadarBuyRequest] = useState<PortfolioBuyRequest | null>(null);
+  const handledRadarBuyRef = useRef<PortfolioBuyRequest | null>(null);
+
+  // Claims a radar Buy request, whether it arrived before this screen
+  // mounted (it waits in the handoff module) or while it's mounted. The
+  // initial claim runs in a microtask, so no state is set synchronously
+  // inside the effect body.
+  useEffect(() => {
+    let isActive = true;
+    const claim = () => {
+      if (!isActive) {
+        return;
+      }
+      const request = takePendingPortfolioBuy();
+      if (request !== null) {
+        setRadarBuyRequest(request);
+      }
+    };
+    const unsubscribe = subscribeToPortfolioBuyRequests(claim);
+    Promise.resolve().then(claim);
+    return () => {
+      isActive = false;
+      unsubscribe();
+    };
+  }, []);
+
   // Loads the saved portfolio: reads the ticker/category pairs from
   // AsyncStorage, then fetches a fresh live price for each from the Python
   // API. Used both on mount AND re-triggered from the AppState foreground
@@ -510,6 +651,10 @@ export default function PortfolioScreen() {
         // CORE LAYER INTERNAL ALLOCATION: null means "no internal target
         // defined", not 0%.
         internalTargetPct: typeof entry.internalTargetPct === 'number' ? entry.internalTargetPct : null,
+        // TRADE RECONCILIATION: positions saved before trade logging have
+        // no recorded cost; null, never 0 (which would read as "free").
+        costBasisUsd:
+          typeof entry.costBasisUsd === 'number' && Number.isFinite(entry.costBasisUsd) ? entry.costBasisUsd : null,
       }));
     } catch (error) {
       console.error(
@@ -696,6 +841,10 @@ export default function PortfolioScreen() {
     } else {
       loadPortfolioData();
     }
+    // LIQUIDITY CORE: retry a cash read that failed earlier.
+    if (!isCashLoadedRef.current) {
+      loadCash();
+    }
   });
 
   // CACHE INTEGRITY: keep AsyncStorage in sync with the current portfolio
@@ -724,20 +873,59 @@ export default function PortfolioScreen() {
     });
   }, [stocks, isInitializing]);
 
+  // TRADE RECONCILIATION, step 1: fetch a live quote (to validate the
+  // ticker and to price the trade in USD), then open the Execute Trade
+  // modal. Nothing is saved and no cash moves until the trade is confirmed
+  // (commitTrade). A ticker that's already held becomes a top-up of that
+  // position, keeping its layer and asset type. Returns whether the modal
+  // opened; a failed quote fetch throws, for the caller to report.
+  const startTrade = async (start: TradeStart): Promise<boolean> => {
+    if (!isCashLoadedRef.current) {
+      Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+      return false;
+    }
+    const held = stocks.find((stock) => stock.ticker === start.ticker);
+    const category = held?.category ?? start.category;
+    const assetType = held?.assetType ?? start.assetType;
+
+    // SSOT: a Quality position's Z-Score, ROIC and Moat come from
+    // /api/quality (see fetchPortfolioQuote); nothing is entered by hand.
+    const quote = await fetchPortfolioQuote(start.ticker, category);
+    const usdPerLocal = usdPerLocalFromQuote(quote.price, quote.localPrice);
+    if (usdPerLocal === null) {
+      Alert.alert(t('cannotAddTickerTitle'), t('tradeQuoteMissingMessage', { ticker: start.ticker }));
+      return false;
+    }
+
+    // The reference price as this position will display it: a held
+    // position's own calibration applies (AUTO-CALIBRATION).
+    const displayFactor = held?.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR;
+    tradeIdRef.current += 1;
+    setPendingTrade({
+      side: 'buy',
+      id: tradeIdRef.current,
+      ticker: start.ticker,
+      category,
+      assetType,
+      basis: { ticker: start.ticker, assetType, usdPerLocal, currencySymbol: quote.currencySymbol },
+      livePriceDisplay: formatUnitPrice(
+        start.ticker,
+        applyCalibration(quote.localPrice, displayFactor),
+        quote.currencySymbol,
+        t('ag'),
+      ),
+      isTopUp: held !== undefined,
+      quote,
+      calibrationTotalValue: held === undefined ? start.calibrationTotalValue : null,
+      internalTargetPct: start.internalTargetPct,
+      fromAmbushRadar: start.fromAmbushRadar,
+    });
+    return true;
+  };
+
   const handleAddTicker = async () => {
     const normalizedTicker = normalizeTickerInput(ticker);
     if (!normalizedTicker || isAdding) {
-      return;
-    }
-
-    const parsedUnits = Number(units);
-    if (!Number.isFinite(parsedUnits) || parsedUnits <= 0) {
-      Alert.alert(t('invalidUnitsTitle'), t('invalidUnitsMessage'));
-      return;
-    }
-
-    if (stocks.some((stock) => stock.ticker === normalizedTicker)) {
-      setTicker('');
       return;
     }
 
@@ -750,54 +938,24 @@ export default function PortfolioScreen() {
     const internalTargetPct =
       parsedInternalTarget !== null && Number.isFinite(parsedInternalTarget) ? parsedInternalTarget : null;
 
+    // AUTO-CALIBRATION FOR BROKEN PRICES: optional. An empty/invalid value
+    // degrades to no correction (see computeCalibrationFactor), applied in
+    // commitTrade against the Executed Quantity.
+    const parsedTotalValue = totalValueInput.trim() === '' ? null : Number(totalValueInput);
+
     setIsAdding(true);
     try {
-      // SSOT: a Quality position's Z-Score, ROIC and Moat come from
-      // /api/quality (see fetchPortfolioQuote); nothing is entered by hand.
-      const quote = await fetchPortfolioQuote(normalizedTicker, selectedCategory);
-
-      // AUTO-CALIBRATION FOR BROKEN PRICES: quote.localPrice here is the
-      // RAW, freshly-fetched API value — nothing has calibrated it yet, so
-      // it's exactly what computeCalibrationFactor needs as its reference
-      // price. An empty/invalid Total Value input degrades to
-      // DEFAULT_CALIBRATION_FACTOR (1.0, a no-op) rather than blocking the
-      // add — this field is explicitly optional.
-      const parsedTotalValue = totalValueInput.trim() === '' ? null : Number(totalValueInput);
-      const calibrationFactor = computeCalibrationFactor(parsedTotalValue, parsedUnits, quote.localPrice);
-      const calibratedQuote = calibrateQuote(quote, calibrationFactor);
-
-      setStocksTrusted((prevStocks) => [
-        ...prevStocks,
-        {
-          ticker: normalizedTicker,
-          category: selectedCategory,
-          assetType: selectedAssetType,
-          units: parsedUnits,
-          price: calibratedQuote.price,
-          localPrice: calibratedQuote.localPrice,
-          currencySymbol: calibratedQuote.currencySymbol,
-          anomalyReport: calibratedQuote.anomalyReport,
-          high52: calibratedQuote.high52,
-          drawdownPct: calibratedQuote.drawdownPct,
-          sma50: calibratedQuote.sma50,
-          sma200: calibratedQuote.sma200,
-          macroTrend: calibratedQuote.macroTrend,
-          tacticalMomentum: calibratedQuote.tacticalMomentum,
-          pullbackDepth: calibratedQuote.pullbackDepth,
-          qualityZScore: calibratedQuote.qualityZScore,
-          qualityZScoreAlert: calibratedQuote.qualityZScoreAlert,
-          // Always 'live': a ticker is only added after its fetch succeeds.
-          priceStatus: calibratedQuote.priceStatus,
-          highestWatermark: computeHighestWatermark(null, calibratedQuote.price),
-          calibrationFactor,
-          internalTargetPct,
-        },
-      ]);
-      setTicker('');
-      setUnits('1');
-      setTotalValueInput('');
-      setInternalTargetInput('');
-      setIsAddModalVisible(false);
+      const opened = await startTrade({
+        ticker: normalizedTicker,
+        category: selectedCategory,
+        assetType: selectedAssetType,
+        calibrationTotalValue: parsedTotalValue,
+        internalTargetPct,
+        fromAmbushRadar: false,
+      });
+      if (opened) {
+        setIsAddModalVisible(false);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: normalizedTicker });
       Alert.alert(t('cannotAddTickerTitle'), message);
@@ -805,6 +963,34 @@ export default function PortfolioScreen() {
       setIsAdding(false);
     }
   };
+
+  // AMBUSH → PORTFOLIO: a Buy from the radar goes through the same trade
+  // flow, in the radar layer. It waits until the portfolio has loaded, so
+  // the new position can't be overwritten by the initial load; the ref
+  // makes sure each request is started exactly once.
+  const startRadarBuy = async (request: PortfolioBuyRequest) => {
+    try {
+      await startTrade({
+        ticker: request.ticker,
+        category: request.layer,
+        assetType: request.assetType,
+        calibrationTotalValue: null,
+        internalTargetPct: null,
+        fromAmbushRadar: true,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: request.ticker });
+      Alert.alert(t('cannotAddTickerTitle'), message);
+    }
+  };
+
+  useEffect(() => {
+    if (radarBuyRequest === null || isInitializing || handledRadarBuyRef.current === radarBuyRequest) {
+      return;
+    }
+    handledRadarBuyRef.current = radarBuyRequest;
+    startRadarBuy(radarBuyRequest);
+  });
 
   // Stable identity (useCallback) is required for the React.memo on
   // PortfolioStockRow to actually skip re-renders — an inline function here
@@ -846,88 +1032,306 @@ export default function PortfolioScreen() {
     [toastOpacity],
   );
 
-  // CLOSED-LOOP WATCHLIST: deleting a position is a full liquidation.
-  //   1. The row leaves the portfolio immediately, so the UI never waits
-  //      on storage or the network.
-  //   2. The deletion is mirrored to the backend (DELETE /api/portfolio/
-  //      {ticker}) as fire-and-forget. That endpoint answers 503 until a
-  //      database is configured, which is expected and ignored here.
-  //   3. Satellite/Quality positions are added to the on-device Ambush
-  //      Radar list (the actual source of truth today), skipping
-  //      duplicates. A mounted Ambush screen is told directly (see
-  //      notifyAmbushAddition), and a toast confirms the result.
-  // A storage failure in step 3 does NOT undo the deletion: removing the
-  // position is what the user asked for, and the radar entry is a follow-
-  // on. The toast says plainly that the radar step failed.
-  const liquidatePosition = useCallback(
-    (stockToDelete: PortfolioStock) => {
-      const { ticker: deletedTicker, assetType, category } = stockToDelete;
-      setStocksTrusted((prevStocks) => prevStocks.filter((stock) => stock.ticker !== deletedTicker));
-
-      liquidatePortfolioAsset(deletedTicker, assetType).catch(() => {
-        // Expected today (503: no database configured). The on-device
-        // storage below is what the app actually reads.
-      });
-
-      if (!AMBUSH_MIGRATING_CATEGORIES.includes(category)) {
-        return;
+  // TRADE RECONCILIATION, step 2: the trade is confirmed. In one pass:
+  //   1. save the position with the executed quantity (a new position, or
+  //      added onto a held one) and record the cost as its cost basis;
+  //   2. deduct Total Cost from the buying power;
+  //   3. for a radar Buy, take the ticker off the Ambush Radar.
+  // The duplicate check runs again inside the state update, so a ticker
+  // that became held in the meantime is topped up rather than duplicated.
+  const commitTrade = (trade: PendingTrade, inputs: TradeInputs, costUsd: number) => {
+    setStocksTrusted((prevStocks) => {
+      const heldIndex = prevStocks.findIndex((stock) => stock.ticker === trade.ticker);
+      if (heldIndex >= 0) {
+        return prevStocks.map((stock, index) =>
+          index !== heldIndex
+            ? stock
+            : {
+                ...stock,
+                units: stock.units + inputs.quantity,
+                // An unknown earlier cost stays unknown: a partial sum
+                // would understate the position's real cost.
+                costBasisUsd: stock.costBasisUsd === null ? null : roundToCents(stock.costBasisUsd + costUsd),
+              },
+        );
       }
+      const calibrationFactor = computeCalibrationFactor(
+        trade.calibrationTotalValue,
+        inputs.quantity,
+        trade.quote.localPrice,
+      );
+      const entry: PortfolioTickerEntry = {
+        ticker: trade.ticker,
+        category: trade.category,
+        assetType: trade.assetType,
+        units: inputs.quantity,
+        highestWatermark: null,
+        calibrationFactor,
+        internalTargetPct: trade.internalTargetPct,
+        costBasisUsd: costUsd,
+      };
+      // buildPortfolioStock calibrates the quote and seeds the watermark
+      // from the live price, exactly like a freshly loaded position.
+      return [...prevStocks, buildPortfolioStock(entry, trade.quote)];
+    });
 
-      // UNIFIED RADAR: a Quality position keeps its layer on the radar, so
-      // it is tracked by Z-Score/ROIC/Moat (fetched from /api/quality; a
-      // failed fetch still delivers an 'unavailable' row) rather than by
-      // the Satellite technicals.
-      const layer: AmbushLayer = category === 'Quality' ? 'Quality' : 'Satellite';
-      addTickerToAmbushRadar({ ticker: deletedTicker, assetType, layer })
-        .then(async (result) => {
-          const asset: AmbushAsset =
-            layer === 'Quality'
-              ? await fetchAmbushAsset({ ticker: deletedTicker, assetType, layer })
-              : { ...toAmbushStock(stockToDelete), layer: 'Satellite' };
-          notifyAmbushAddition(asset);
-          showToast(
-            t(result === 'added' ? 'liquidatedMovedToAmbush' : 'liquidatedAlreadyOnAmbush', {
-              ticker: deletedTicker,
-            }),
-          );
-        })
+    const balanceAfter = roundToCents(cashBalanceRef.current - costUsd);
+    applyCashBalance(balanceAfter);
+
+    setPendingTrade(null);
+    setTicker('');
+    setTotalValueInput('');
+    setInternalTargetInput('');
+    showToast(t('tradeExecutedToast', { ticker: trade.ticker, cost: formatUsd(costUsd), balance: formatUsd(balanceAfter) }));
+
+    if (trade.fromAmbushRadar) {
+      removeTickerFromAmbushRadar(trade.ticker)
+        .then(() => notifyAmbushRemoval(trade.ticker))
         .catch((error) => {
-          console.error(`[ambush] Failed to add liquidated ${deletedTicker} to the Ambush Radar:`, error);
-          showToast(t('liquidatedAmbushFailed', { ticker: deletedTicker }));
+          console.error(`[ambush] Failed to remove bought ${trade.ticker} from the Ambush Radar:`, error);
+          showToast(t('tradeRadarRemovalFailed', { ticker: trade.ticker }));
         });
-    },
-    [setStocksTrusted, showToast, t],
-  );
+    }
+  };
 
-  // DELETE CONFIRMATION: the row's ✕ never deletes directly. Liquidation
-  // removes the position and (for Satellite/Quality) moves it to the Ambush
-  // Radar, so it only runs after a deliberate "Yes, Liquidate". Cancel,
-  // the Android back button, or tapping outside the dialog
-  // (cancelable: true) all leave the position untouched. Stable identity
-  // (useCallback) keeps PortfolioStockRow's memo() effective.
-  const handleDeleteTicker = useCallback(
-    (stockToDelete: PortfolioStock) => {
+  // QA RULE, shared by every cash movement: the buying power never goes
+  // (further) below zero silently. If an action would leave it negative and
+  // lower than it is now, the user sees the resulting balance and must
+  // explicitly choose Execute Anyway; otherwise the action runs at once.
+  const confirmIfBalanceGoesNegative = (balanceAfter: number, onConfirm: () => void) => {
+    if (balanceAfter >= 0 || balanceAfter >= cashBalanceRef.current) {
+      onConfirm();
+      return;
+    }
+    Alert.alert(t('insufficientCashTitle'), t('negativeBalanceConfirmMessage', { after: formatUsd(balanceAfter) }), [
+      { text: t('cancel'), style: 'cancel' },
+      { text: t('executeAnyway'), style: 'destructive', onPress: onConfirm },
+    ]);
+  };
+
+  // QA RULE: a trade costing more than the buying power is never applied
+  // silently. The user sees the cost, the balance and the resulting
+  // (negative) balance, and must explicitly choose Execute Anyway.
+  const handleConfirmTrade = (inputs: TradeInputs) => {
+    const trade = pendingTrade;
+    if (trade === null) {
+      return;
+    }
+    if (!isCashLoadedRef.current) {
+      Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+      return;
+    }
+    const { totalUsd } = computeTradeCost(inputs, trade.basis);
+    const available = cashBalanceRef.current;
+    if (totalUsd > available) {
       Alert.alert(
-        t('liquidateConfirmTitle'),
-        t('liquidateConfirmMessage', { ticker: stockToDelete.ticker }),
+        t('insufficientCashTitle'),
+        t('insufficientCashMessage', {
+          cost: formatUsd(totalUsd),
+          balance: formatUsd(available),
+          after: formatUsd(available - totalUsd),
+        }),
         [
           { text: t('cancel'), style: 'cancel' },
-          { text: t('yesLiquidate'), style: 'destructive', onPress: () => liquidatePosition(stockToDelete) },
+          { text: t('executeAnyway'), style: 'destructive', onPress: () => commitTrade(trade, inputs, totalUsd) },
         ],
-        { cancelable: true },
       );
+      return;
+    }
+    commitTrade(trade, inputs, totalUsd);
+  };
+
+  // YIELD LEDGER / CASH CORRECTION ("Adjust Cash"): a deposit or dividend
+  // (positive delta), or a withdrawal from the broker or the correction of
+  // a wrong entry (negative delta).
+  const handleOpenAdjustCash = useCallback(() => {
+    if (!isCashLoadedRef.current) {
+      Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+      return;
+    }
+    setAdjustCashModalKey((key) => key + 1);
+    setIsAdjustCashModalVisible(true);
+  }, [t]);
+
+  const handleAdjustCash = (deltaUsd: number) => {
+    if (!isCashLoadedRef.current) {
+      Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+      return;
+    }
+    confirmIfBalanceGoesNegative(roundToCents(cashBalanceRef.current + deltaUsd), () => {
+      // Recomputed from the ref at apply time, in case the confirmation
+      // dialog was open while something else moved the balance.
+      const balanceAfter = roundToCents(cashBalanceRef.current + deltaUsd);
+      applyCashBalance(balanceAfter);
+      setIsAdjustCashModalVisible(false);
+      const amount = formatUsd(Math.abs(deltaUsd));
+      showToast(
+        t(deltaUsd >= 0 ? 'cashAddedToast' : 'cashWithdrawnToast', { amount, balance: formatUsd(balanceAfter) }),
+      );
+    });
+  };
+
+  // CLOSED-LOOP WATCHLIST: what follows a sale that closes a position
+  // (the row itself is removed by commitSale):
+  //   1. The closure is mirrored to the backend (DELETE /api/portfolio/
+  //      {ticker}) as fire-and-forget. That endpoint answers 503 until a
+  //      database is configured, which is expected and ignored here.
+  //   2. Satellite/Quality positions are added to the on-device Ambush
+  //      Radar list (the actual source of truth today), skipping
+  //      duplicates. A mounted Ambush screen is told directly (see
+  //      notifyAmbushAddition).
+  // Resolves to the radar message for the toast (null for Core, which
+  // doesn't move to the radar). Never rejects: a storage failure in step 2
+  // doesn't undo the sale, it's reported in the message instead.
+  const migrateLiquidatedPosition = (liquidated: PortfolioStock): Promise<string | null> => {
+    const { ticker: liquidatedTicker, assetType, category } = liquidated;
+
+    liquidatePortfolioAsset(liquidatedTicker, assetType).catch(() => {
+      // Expected today (503: no database configured). The on-device
+      // storage below is what the app actually reads.
+    });
+
+    if (!AMBUSH_MIGRATING_CATEGORIES.includes(category)) {
+      return Promise.resolve(null);
+    }
+
+    // UNIFIED RADAR: a Quality position keeps its layer on the radar, so
+    // it is tracked by Z-Score/ROIC/Moat (fetched from /api/quality; a
+    // failed fetch still delivers an 'unavailable' row) rather than by
+    // the Satellite technicals.
+    const layer: AmbushLayer = category === 'Quality' ? 'Quality' : 'Satellite';
+    return addTickerToAmbushRadar({ ticker: liquidatedTicker, assetType, layer })
+      .then(async (result) => {
+        const asset: AmbushAsset =
+          layer === 'Quality'
+            ? await fetchAmbushAsset({ ticker: liquidatedTicker, assetType, layer })
+            : { ...toAmbushStock(liquidated), layer: 'Satellite' };
+        notifyAmbushAddition(asset);
+        return t(result === 'added' ? 'liquidatedMovedToAmbush' : 'liquidatedAlreadyOnAmbush', {
+          ticker: liquidatedTicker,
+        });
+      })
+      .catch((error) => {
+        console.error(`[ambush] Failed to add liquidated ${liquidatedTicker} to the Ambush Radar:`, error);
+        return t('liquidatedAmbushFailed', { ticker: liquidatedTicker });
+      });
+  };
+
+  // TRADE RECONCILIATION, SELL: the row's Sell button (which replaced the
+  // old delete) opens the Execute Sell modal. Pricing the sale in USD needs
+  // the local-to-USD rate: a live row already has it (price / localPrice;
+  // calibration scales both alike, so the ratio is the pure exchange
+  // rate). An 'unavailable' row fetches a fresh quote first. Stable
+  // identity (useCallback) keeps PortfolioStockRow's memo() effective.
+  const handleSellTicker = useCallback(
+    async (stock: PortfolioStock) => {
+      if (!isCashLoadedRef.current) {
+        Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+        return;
+      }
+      let usdPerLocal = stock.priceStatus === 'live' ? usdPerLocalFromQuote(stock.price, stock.localPrice) : null;
+      let currencySymbol = stock.currencySymbol;
+      let displayLocalPrice = stock.localPrice;
+      if (usdPerLocal === null) {
+        try {
+          const quote = await fetchPortfolioQuote(stock.ticker, stock.category);
+          usdPerLocal = usdPerLocalFromQuote(quote.price, quote.localPrice);
+          currencySymbol = quote.currencySymbol;
+          displayLocalPrice = applyCalibration(quote.localPrice, stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: stock.ticker });
+          Alert.alert(t('cannotPriceTradeTitle'), message);
+          return;
+        }
+      }
+      if (usdPerLocal === null) {
+        Alert.alert(t('cannotPriceTradeTitle'), t('tradeQuoteMissingMessage', { ticker: stock.ticker }));
+        return;
+      }
+      saleIdRef.current += 1;
+      setPendingSale({
+        side: 'sell',
+        id: saleIdRef.current,
+        ticker: stock.ticker,
+        category: stock.category,
+        basis: { ticker: stock.ticker, assetType: stock.assetType, usdPerLocal, currencySymbol },
+        livePriceDisplay: formatUnitPrice(stock.ticker, displayLocalPrice, currencySymbol, t('ag')),
+        unitsHeld: stock.units,
+      });
     },
-    [liquidatePosition, t],
+    [t],
   );
 
+  // The sale is confirmed. In one pass:
+  //   1. selling every unit held removes the position (and runs the
+  //      liquidation follow-ups above); selling fewer reduces its units,
+  //      and its cost basis by the same proportion (average cost);
+  //   2. Net Proceeds are added to the buying power.
+  // applySale (@/utils/position-ledger) runs again inside the state
+  // update, against the units held at that moment.
+  const commitSale = (sale: PendingSale, inputs: TradeInputs, proceedsUsd: number, held: PortfolioStock) => {
+    const closesPosition = isFullSale(inputs.quantity, held.units);
+    setStocksTrusted((prevStocks) => applySale(prevStocks, sale.ticker, inputs.quantity).positions);
+
+    const balanceAfter = roundToCents(cashBalanceRef.current + proceedsUsd);
+    applyCashBalance(balanceAfter);
+    setPendingSale(null);
+
+    const saleMessage = closesPosition
+      ? t('positionClosedToast', {
+          ticker: sale.ticker,
+          proceeds: formatSignedUsd(proceedsUsd),
+          balance: formatUsd(balanceAfter),
+        })
+      : t('positionReducedToast', {
+          units: inputs.quantity,
+          ticker: sale.ticker,
+          proceeds: formatSignedUsd(proceedsUsd),
+          balance: formatUsd(balanceAfter),
+        });
+    showToast(saleMessage);
+
+    if (closesPosition) {
+      migrateLiquidatedPosition(held).then((radarMessage) => {
+        if (radarMessage !== null) {
+          showToast(`${saleMessage}\n${radarMessage}`);
+        }
+      });
+    }
+  };
+
+  const handleConfirmSale = (inputs: TradeInputs) => {
+    const sale = pendingSale;
+    if (sale === null) {
+      return;
+    }
+    if (!isCashLoadedRef.current) {
+      Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+      return;
+    }
+    const held = stocks.find((stock) => stock.ticker === sale.ticker);
+    if (held === undefined) {
+      setPendingSale(null);
+      Alert.alert(t('invalidTradeTitle'), t('positionNotFoundMessage'));
+      return;
+    }
+    if (exceedsHolding(inputs.quantity, held.units)) {
+      Alert.alert(
+        t('sellQuantityTooHighTitle'),
+        t('sellQuantityTooHighMessage', { units: held.units, ticker: held.ticker }),
+      );
+      return;
+    }
+    const { totalUsd } = computeSaleProceeds(inputs, sale.basis);
+    // Net Proceeds are only negative when the fee exceeds the sale itself;
+    // that case gets the same negative-balance guard as a withdrawal.
+    confirmIfBalanceGoesNegative(roundToCents(cashBalanceRef.current + totalUsd), () =>
+      commitSale(sale, inputs, totalUsd, held),
+    );
+  };
+
   const handleSaveEdit = useCallback(
-    (
-      tickerToUpdate: string,
-      newUnits: number,
-      newAssetType: AssetType,
-      newTotalValueInput: string,
-      newInternalTargetInput: string,
-    ) => {
+    (tickerToUpdate: string, newAssetType: AssetType, newTotalValueInput: string, newInternalTargetInput: string) => {
       setStocksTrusted((prevStocks) =>
         prevStocks.map((stock) => {
           if (stock.ticker !== tickerToUpdate) {
@@ -960,17 +1364,19 @@ export default function PortfolioScreen() {
           // calibrationFactor unchanged, rather than resetting it to 1.0 —
           // unlike the Add Asset flow (where blank truly means "no
           // correction was ever entered"), on Edit the user is very often
-          // here only to bump the unit count, and silently un-calibrating
-          // an already-corrected position just because they left this
-          // unrelated field blank would quietly wipe out a correction they
-          // made earlier. A calibrationFactor is only ever REPLACED when
+          // here only to change the asset type or internal target, and
+          // silently un-calibrating an already-corrected position just
+          // because they left this unrelated field blank would quietly
+          // wipe out a correction they made earlier. (Units are not
+          // editable here: they only change through Execute Trade and
+          // Execute Sell, so every unit change moves cash.) A calibrationFactor is only ever REPLACED when
           // the user explicitly enters a new Total Value.
           const parsedTotalValue = newTotalValueInput.trim() === '' ? null : Number(newTotalValueInput);
           // DATA-LOSS FIX: recalibrating needs the real fetched price. On
           // an 'unavailable' row it would compute against the placeholder
           // 0, reset calibrationFactor to 1.0, and set the watermark to 0,
           // destroying both. So a Total Value entered while the price is
-          // unavailable is ignored; units/type/target still save.
+          // unavailable is ignored; type/target still save.
           if (
             stock.priceStatus === 'unavailable' ||
             parsedTotalValue === null ||
@@ -979,7 +1385,6 @@ export default function PortfolioScreen() {
           ) {
             return {
               ...stock,
-              units: newUnits,
               assetType: newAssetType,
               highestWatermark,
               internalTargetPct,
@@ -1003,7 +1408,7 @@ export default function PortfolioScreen() {
           const rawSma50 = stock.sma50 !== null ? stripCalibration(stock.sma50, existingFactor) : null;
           const rawSma200 = stock.sma200 !== null ? stripCalibration(stock.sma200, existingFactor) : null;
 
-          const calibrationFactor = computeCalibrationFactor(parsedTotalValue, newUnits, rawLocalPrice);
+          const calibrationFactor = computeCalibrationFactor(parsedTotalValue, stock.units, rawLocalPrice);
           const newLocalPrice = applyCalibration(rawLocalPrice, calibrationFactor);
           const newUsdPrice = applyCalibration(rawUsdPrice, calibrationFactor);
           const newHigh52 = rawHigh52 !== null ? applyCalibration(rawHigh52, calibrationFactor) : null;
@@ -1012,7 +1417,6 @@ export default function PortfolioScreen() {
 
           return {
             ...stock,
-            units: newUnits,
             assetType: newAssetType,
             price: newUsdPrice,
             localPrice: newLocalPrice,
@@ -1035,7 +1439,7 @@ export default function PortfolioScreen() {
         stock={item}
         accentColor={section.accentColor}
         layerTotalValue={section.layerTotalValue}
-        onDelete={handleDeleteTicker}
+        onSell={handleSellTicker}
         onSaveEdit={handleSaveEdit}
         colors={colors}
         styles={styles}
@@ -1043,14 +1447,18 @@ export default function PortfolioScreen() {
         t={t}
       />
     ),
-    [handleDeleteTicker, handleSaveEdit, colors, styles, language, t],
+    [handleSellTicker, handleSaveEdit, colors, styles, language, t],
   );
 
   const handleCopyPortfolioData = async () => {
     const timestamp = new Date().toLocaleString();
-    const report = [`Pipeline Portfolio Report — ${timestamp}`, '', ...formatPortfolioLines(stocks)].join(
-      '\n',
-    );
+    const report = [
+      `Pipeline Portfolio Report — ${timestamp}`,
+      '',
+      ...formatPortfolioLines(stocks),
+      '',
+      ...formatCashLines(cashBalance, allocation),
+    ].join('\n');
 
     try {
       await Clipboard.setStringAsync(report);
@@ -1083,6 +1491,8 @@ export default function PortfolioScreen() {
         '',
         '=== PORTFOLIO ===',
         ...formatPortfolioLines(stocks),
+        '',
+        ...formatCashLines(cashBalance, allocation),
         '',
         '=== AMBUSH RADAR ===',
         ...formatAmbushLines(ambushStocks),
@@ -1155,6 +1565,12 @@ export default function PortfolioScreen() {
       setIsImportModalVisible(false);
       setImportText('');
       setStocksTrusted(hydratedStocks);
+      // LIQUIDITY CORE: restoreBackupPayload already saved the backup's
+      // balance; mirror it into state. An older backup without one leaves
+      // the current balance as it is.
+      if (payload.cashBalance !== null) {
+        applyCashBalance(payload.cashBalance);
+      }
       setSyncWarning(allFetchesFailed);
 
       if (allFetchesFailed) {
@@ -1260,14 +1676,15 @@ export default function PortfolioScreen() {
   const coreStocks = stocks.filter((stock) => stock.category === 'Core');
   const satelliteStocks = stocks.filter((stock) => stock.category === 'Satellite');
   const qualityStocks = stocks.filter((stock) => stock.category === 'Quality');
-  const totalPortfolioValue = stocks.reduce(
-    (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
-    0,
-  );
 
-  // Computed ONCE per layer here (see computeLayerWeightPct's own comment
-  // for why this stays client-side rather than a literal backend JSON
-  // read) — reused for this section's header string. CORE LAYER INTERNAL
+  // Computed ONCE per layer here (see the ALLOCATION STATUS note above
+  // computeLayerTotalValue for why this stays client-side rather than a
+  // literal backend JSON read) — reused for this section's header string.
+  // ALLOCATION DENOMINATOR FIX: weights are cash-diluted,
+  // LayerValue / (TotalInvested + cashBalance), via computeAllocation,
+  // which also gives Cash its own weight and rounds all four to sum to
+  // exactly 100.0%. Until the saved balance has loaded, cash counts as 0
+  // (the summary card shows a dash, not $0.00). CORE LAYER INTERNAL
   // ALLOCATION FIX: each layer's OWN total value (computeLayerTotalValue)
   // is now ALSO computed once here and threaded through as
   // layerTotalValue, so every row can derive ITS OWN internal share of the
@@ -1277,9 +1694,15 @@ export default function PortfolioScreen() {
   const coreLayerTotalValue = computeLayerTotalValue(coreStocks);
   const satelliteLayerTotalValue = computeLayerTotalValue(satelliteStocks);
   const qualityLayerTotalValue = computeLayerTotalValue(qualityStocks);
-  const coreWeightPct = computeLayerWeightPct(coreStocks, totalPortfolioValue);
-  const satelliteWeightPct = computeLayerWeightPct(satelliteStocks, totalPortfolioValue);
-  const qualityWeightPct = computeLayerWeightPct(qualityStocks, totalPortfolioValue);
+  const allocation = computeAllocation({
+    Core: coreLayerTotalValue,
+    Satellite: satelliteLayerTotalValue,
+    Quality: qualityLayerTotalValue,
+    Cash: isCashLoaded ? cashBalance : 0,
+  });
+  const coreWeightPct = allocation.weightsPct.Core;
+  const satelliteWeightPct = allocation.weightsPct.Satellite;
+  const qualityWeightPct = allocation.weightsPct.Quality;
 
   const allSections: PortfolioListSection[] = [
     {
@@ -1386,6 +1809,17 @@ export default function PortfolioScreen() {
           <Text style={styles.syncWarningBannerText}>{t('syncFailedWarning')}</Text>
         </View>
       )}
+
+      {/* LIQUIDITY CORE: buying power, the cash-diluted weights (Core,
+          Satellite, Quality and Cash, summing to 100.0%) and the Yield
+          Ledger's "Add Cash / Dividend" button. Fixed above the list so
+          it stays visible while scrolling. */}
+      <CashSummaryCard
+        cashBalance={cashBalance}
+        allocation={allocation}
+        isCashLoaded={isCashLoaded}
+        onAdjustCash={handleOpenAdjustCash}
+      />
 
       {isInitializing ? (
         <View style={styles.initializingContainer}>
@@ -1622,27 +2056,14 @@ export default function PortfolioScreen() {
                     />
                   </View>
 
-                  {/* Units and the optional Total Value now share their OWN
-                      smaller row (flex: 1 each — see unitsInput's style),
-                      no longer competing with the ticker input for space.
-                      TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (not a
-                      fixed pixel width) so a large unit count like 11347 is
-                      never truncated — maxLength=15 is a generous ceiling,
-                      not a practical limit for any real position size. */}
+                  {/* TRADE RECONCILIATION: there is no Units field here any
+                      more. The quantity is the Executed Quantity entered in
+                      the Execute Trade step that follows, so the saved
+                      position always matches the broker's fill.
+                      AUTO-CALIBRATION FOR BROKEN PRICES: optional — see
+                      handleAddTicker/commitTrade for how a value here
+                      becomes a calibrationFactor. */}
                   <View style={styles.unitsValueRow}>
-                    <TextInput
-                      style={styles.unitsInput}
-                      value={units}
-                      onChangeText={setUnits}
-                      placeholder={t('unitsPlaceholder')}
-                      placeholderTextColor={colors.textSecondary}
-                      keyboardType="numeric"
-                      maxLength={15}
-                      editable={!isAdding}
-                    />
-                    {/* AUTO-CALIBRATION FOR BROKEN PRICES: optional — see
-                        handleAddTicker for how a value here becomes a
-                        calibrationFactor. */}
                     <TextInput
                       style={styles.unitsInput}
                       value={totalValueInput}
@@ -1734,7 +2155,7 @@ export default function PortfolioScreen() {
                       {isAdding ? (
                         <ActivityIndicator size="small" color={colors.textPrimary} />
                       ) : (
-                        <Text style={styles.addButtonText}>{t('addToPortfolio')}</Text>
+                        <Text style={styles.addButtonText}>{t('continueToExecution')}</Text>
                       )}
                     </TouchableOpacity>
                   </View>
@@ -1744,6 +2165,35 @@ export default function PortfolioScreen() {
           </KeyboardAvoidingView>
         </Pressable>
       </Modal>
+
+      {/* TRADE RECONCILIATION: every buy (Add Asset or a radar Buy) ends
+          here. Keyed per trade so each one starts with empty fields. */}
+      <ExecuteTradeModal
+        key={pendingTrade?.id ?? 0}
+        request={pendingTrade}
+        cashBalance={cashBalance}
+        onConfirm={handleConfirmTrade}
+        onCancel={() => setPendingTrade(null)}
+      />
+
+      {/* TRADE RECONCILIATION, SELL. Keyed per sale. */}
+      <ExecuteTradeModal
+        key={`sell-${pendingSale?.id ?? 0}`}
+        request={pendingSale}
+        cashBalance={cashBalance}
+        onConfirm={handleConfirmSale}
+        onCancel={() => setPendingSale(null)}
+      />
+
+      {/* YIELD LEDGER / CASH CORRECTION. Keyed per opening so it always
+          starts on Deposit with an empty amount. */}
+      <AdjustCashModal
+        key={adjustCashModalKey}
+        visible={isAdjustCashModalVisible}
+        cashBalance={cashBalance}
+        onSubmit={handleAdjustCash}
+        onCancel={() => setIsAdjustCashModalVisible(false)}
+      />
 
       <Modal
         visible={isImportModalVisible}
@@ -1939,17 +2389,10 @@ type PortfolioStockRowProps = {
   // itself lives on PortfolioListSection still, for the section HEADER,
   // which legitimately does want the layer's whole-portfolio share.
   layerTotalValue: number;
-  // Receives the whole position, not just its ticker: the delete handler
-  // needs its category (does it move to the Ambush Radar?) and its quote
-  // data (the Ambush row it hands over).
-  onDelete: (stock: PortfolioStock) => void;
-  onSaveEdit: (
-    ticker: string,
-    units: number,
-    assetType: AssetType,
-    totalValueInput: string,
-    internalTargetInput: string,
-  ) => void;
+  // TRADE RECONCILIATION: opens Execute Sell. Receives the whole position,
+  // not just its ticker: the sale needs its units, currency and price.
+  onSell: (stock: PortfolioStock) => void;
+  onSaveEdit: (ticker: string, assetType: AssetType, totalValueInput: string, internalTargetInput: string) => void;
   colors: PipelineColorScheme;
   styles: PortfolioStyles;
   language: Language;
@@ -1959,8 +2402,8 @@ type PortfolioStockRowProps = {
 // Wrapped in memo() so updating one position (price refresh, edit, delete)
 // doesn't re-render every other row in the SectionList — stocks state
 // updates already keep unaffected PortfolioStock objects referentially
-// stable (see onRefresh/handleSaveEdit/handleDeleteTicker above), and
-// accentColor/layerTotalValue/onDelete/onSaveEdit/colors/styles/language/t
+// stable (see onRefresh/handleSaveEdit/handleSellTicker above), and
+// accentColor/layerTotalValue/onSell/onSaveEdit/colors/styles/language/t
 // are all stable across renders too (a fixed per-theme accent color, a
 // number that only changes when the layer's actual composition changes,
 // useCallback-wrapped handlers, the parent's own useMemo-derived theme
@@ -1976,7 +2419,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   stock,
   accentColor,
   layerTotalValue,
-  onDelete,
+  onSell,
   onSaveEdit,
   colors,
   styles,
@@ -1984,7 +2427,6 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   t,
 }: PortfolioStockRowProps) {
   const [isEditing, setIsEditing] = useState(false);
-  const [unitsText, setUnitsText] = useState(String(stock.units));
   const [editedAssetType, setEditedAssetType] = useState<AssetType>(stock.assetType);
   // AUTO-CALIBRATION FOR BROKEN PRICES: deliberately starts (and resets on
   // every re-entry into edit mode, see handleStartEditing) BLANK rather
@@ -1992,7 +2434,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // PortfolioScreen for why: a blank field here means "leave this
   // position's existing calibration alone," which would break if it were
   // pre-filled with a value that then got silently resubmitted alongside
-  // an unrelated units change.
+  // an unrelated change.
   const [totalValueText, setTotalValueText] = useState('');
   // CORE LAYER INTERNAL ALLOCATION: same "starts blank, means leave
   // unchanged" pattern as totalValueText above.
@@ -2112,7 +2554,6 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const isQualityZScoreAlertActive = stock.category === 'Quality' && stock.qualityZScoreAlert === true;
 
   const handleStartEditing = () => {
-    setUnitsText(String(stock.units));
     setEditedAssetType(stock.assetType);
     setTotalValueText('');
     setInternalTargetText('');
@@ -2120,12 +2561,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   };
 
   const handleSaveEdit = () => {
-    const parsedUnits = Number(unitsText);
-    if (!Number.isFinite(parsedUnits) || parsedUnits <= 0) {
-      Alert.alert(t('invalidUnitsTitle'), t('invalidUnitsMessage'));
-      return;
-    }
-    onSaveEdit(stock.ticker, parsedUnits, editedAssetType, totalValueText, internalTargetText);
+    onSaveEdit(stock.ticker, editedAssetType, totalValueText, internalTargetText);
     setIsEditing(false);
   };
 
@@ -2140,29 +2576,41 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           <View style={[styles.categoryBadge, { backgroundColor: accentColor }]}>
             <Text style={styles.categoryBadgeText}>{categoryLabel(t, stock.category)}</Text>
           </View>
+          {/* TRADE RECONCILIATION: Sell replaces the old ✕ delete. Every
+              exit (partial or full) goes through Execute Sell, so the
+              proceeds always reach the buying power. */}
           <TouchableOpacity
-            onPress={() => onDelete(stock)}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            accessibilityLabel={`הסר את ${stock.ticker} מהתיק`}>
-            <Text style={styles.deleteButtonText}>✕</Text>
+            style={styles.sellButton}
+            onPress={() => onSell(stock)}
+            hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+            accessibilityRole="button"
+            accessibilityLabel={`${t('sell')} ${stock.ticker}`}>
+            <Text style={styles.sellButtonText}>{t('sell')}</Text>
           </TouchableOpacity>
         </View>
       </View>
 
       {isEditing ? (
         <View style={styles.editContainer}>
+          {/* TRADE RECONCILIATION: no units field. Units change only
+              through Execute Trade / Execute Sell, so a unit change can
+              never bypass the buying power.
+              AUTO-CALIBRATION FOR BROKEN PRICES: optional — see onSaveEdit
+              in PortfolioScreen for how a value here recalibrates this
+              position. Left blank (the default every time editing starts —
+              see handleStartEditing), the existing calibration (if any) is
+              preserved unchanged. TEXT INPUT WIDTH FIX: flex: 1 +
+              minWidth: '45%' (see unitsEditInput's style), never a fixed
+              pixel width. */}
           <View style={styles.unitsEditRow}>
-            {/* TEXT INPUT WIDTH FIX: flex: 1 + minWidth: '45%' (see
-                unitsEditInput's style) so a large unit count like 11347 is
-                never truncated by a fixed pixel width. */}
             <TextInput
               style={styles.unitsEditInput}
-              value={unitsText}
-              onChangeText={setUnitsText}
+              value={totalValueText}
+              onChangeText={setTotalValueText}
+              placeholder={t('totalValueInBank')}
+              placeholderTextColor={colors.textSecondary}
               keyboardType="numeric"
               maxLength={15}
-              autoFocus
-              selectTextOnFocus
               onSubmitEditing={handleSaveEdit}
             />
             <TouchableOpacity
@@ -2172,21 +2620,6 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               <Ionicons name="checkmark" size={20} color={colors.bullish} />
             </TouchableOpacity>
           </View>
-          {/* AUTO-CALIBRATION FOR BROKEN PRICES: optional — see onSaveEdit
-              in PortfolioScreen for how a value here recalibrates this
-              position. Left blank (the default every time editing starts —
-              see handleStartEditing), the existing calibration (if any) is
-              preserved unchanged. Same width fix as the units field above. */}
-          <TextInput
-            style={[styles.unitsEditInput, styles.totalValueEditInput]}
-            value={totalValueText}
-            onChangeText={setTotalValueText}
-            placeholder={t('totalValueInBank')}
-            placeholderTextColor={colors.textSecondary}
-            keyboardType="numeric"
-            maxLength={15}
-            onSubmitEditing={handleSaveEdit}
-          />
           {/* CORE LAYER INTERNAL ALLOCATION: only shown for Core positions
               — an internal target is meaningless to the Trailing Stop/Kill
               Switch mechanisms the other two layers use. Same "blank
@@ -2455,6 +2888,14 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           {t('internalAllocation')}: {internalWeightPct.toFixed(1)}%
           {stock.internalTargetPct !== null &&
             ` / ${t('target')}: ${stock.internalTargetPct.toFixed(1)}%`}
+        </Text>
+      )}
+      {/* TRADE RECONCILIATION: the recorded execution cost (fees
+          included), every layer. Not shown for positions added before
+          trade logging, whose cost was never recorded. */}
+      {!isEditing && stock.costBasisUsd !== null && (
+        <Text style={styles.allocationText}>
+          {t('costBasis')}: {formatUsd(stock.costBasisUsd)}
         </Text>
       )}
     </View>
@@ -2871,10 +3312,19 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fontWeight: '700',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
-  deleteButtonText: {
+  // TRADE RECONCILIATION: the row's Sell button (replaced the ✕ delete).
+  sellButton: {
+    borderWidth: 1,
+    borderColor: colors.bearish,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+  },
+  sellButtonText: {
     color: colors.bearish,
-    fontSize: 16,
+    fontSize: 13,
     fontWeight: '700',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   stockBottomRow: {
     flexDirection: 'row',

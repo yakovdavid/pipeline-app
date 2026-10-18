@@ -89,9 +89,6 @@ export type TranslationKey =
   | 'priceUnavailable'
   | 'priceFetchFailedHint'
   // Liquidation confirmation dialog
-  | 'liquidateConfirmTitle'
-  | 'liquidateConfirmMessage'
-  | 'yesLiquidate'
   | 'cancel'
   // Loading states
   | 'loadingPortfolio'
@@ -163,7 +160,57 @@ export type TranslationKey =
   | 'intelCopiedMessage'
   | 'intelCopyFailedMessage'
   | 'ambushDataCopiedMessage'
-  | 'ambushCopyFailedMessage';
+  | 'ambushCopyFailedMessage'
+  | 'buyingPower'
+  | 'totalWithCash'
+  | 'cash'
+  | 'allocationWithCash'
+  | 'negativeCashWarning'
+  | 'cashAmountLabel'
+  | 'cashAmountPlaceholder'
+  | 'invalidAmountTitle'
+  | 'invalidAmountMessage'
+  | 'cashAddedToast'
+  | 'cashUnavailableTitle'
+  | 'cashUnavailableMessage'
+  | 'continueToExecution'
+  | 'executeTrade'
+  | 'buyMoreNote'
+  | 'executedQuantity'
+  | 'executedPrice'
+  | 'brokerFee'
+  | 'livePriceHint'
+  | 'totalCost'
+  | 'cashAfterTrade'
+  | 'confirmExecution'
+  | 'invalidTradeTitle'
+  | 'invalidTradeMessage'
+  | 'tradeQuoteMissingMessage'
+  | 'insufficientCashTitle'
+  | 'insufficientCashMessage'
+  | 'executeAnyway'
+  | 'tradeExecutedToast'
+  | 'tradeRadarRemovalFailed'
+  | 'costBasis'
+  | 'buy'
+  | 'adjustCash'
+  | 'depositOrDividend'
+  | 'withdrawOrCorrect'
+  | 'applyAdjustment'
+  | 'cashWithdrawnToast'
+  | 'negativeBalanceConfirmMessage'
+  | 'executeSell'
+  | 'sell'
+  | 'unitsHeld'
+  | 'sellAll'
+  | 'cannotPriceTradeTitle'
+  | 'netProceeds'
+  | 'confirmSell'
+  | 'sellQuantityTooHighTitle'
+  | 'sellQuantityTooHighMessage'
+  | 'positionClosedToast'
+  | 'positionReducedToast'
+  | 'positionNotFoundMessage';
 
 // t(key, params?) — params are substituted into `{{paramName}}` tokens in
 // the resolved string (e.g. 'fetchFailedForTicker': "Failed to fetch data
@@ -237,9 +284,6 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     liquidatedAmbushFailed: '{{ticker}} מומש, אך לא ניתן היה להוסיף אותו למכ״ם המארבים',
     priceUnavailable: 'המחיר אינו זמין',
     priceFetchFailedHint: '⚠ שליפת המחיר נכשלה — משוך למטה לניסיון חוזר. נתוני הפוזיציה שמורים.',
-    liquidateConfirmTitle: 'לממש את הפוזיציה?',
-    liquidateConfirmMessage: 'לסגור את הפוזיציה ב-{{ticker}}?',
-    yesLiquidate: 'כן, לממש',
     cancel: 'ביטול',
     loadingPortfolio: 'טוען את התיק שלך...',
     loadingAmbush: 'טוען את רשימת המעקב שלך...',
@@ -307,6 +351,56 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     intelCopyFailedMessage: 'לא ניתן היה להעתיק את המודיעין ללוח.',
     ambushDataCopiedMessage: 'נתוני מכ״ם המארבים הועתקו ללוח.',
     ambushCopyFailedMessage: 'לא ניתן היה להעתיק את נתוני מכ״ם המארבים ללוח.',
+    buyingPower: 'כוח קנייה',
+    totalWithCash: 'שווי כולל (כולל מזומן)',
+    cash: 'מזומן',
+    allocationWithCash: 'הקצאה (כולל מזומן)',
+    negativeCashWarning: 'יתרה שלילית — רשום הפקדה כדי להתאים לברוקר',
+    cashAmountLabel: 'סכום (USD)',
+    cashAmountPlaceholder: 'לדוגמה 250.00',
+    invalidAmountTitle: 'סכום לא תקין',
+    invalidAmountMessage: 'הזן סכום חיובי בדולרים.',
+    cashAddedToast: 'נוספו {{amount}}. כוח קנייה: {{balance}}',
+    cashUnavailableTitle: 'יתרת המזומן לא נטענה',
+    cashUnavailableMessage: 'לא ניתן היה לקרוא את יתרת המזומן השמורה. נסה שוב בעוד רגע, כדי שהפעולה לא תדרוס את היתרה השמורה.',
+    continueToExecution: 'המשך לביצוע',
+    executeTrade: 'ביצוע עסקה',
+    buyMoreNote: 'כבר מוחזק — הכמות תתווסף לפוזיציה הקיימת.',
+    executedQuantity: 'כמות שבוצעה',
+    executedPrice: 'מחיר ביצוע ({{unit}})',
+    brokerFee: 'עמלת ברוקר ({{unit}})',
+    livePriceHint: 'מחיר חי: {{price}}',
+    totalCost: 'עלות כוללת',
+    cashAfterTrade: 'כוח קנייה אחרי העסקה',
+    confirmExecution: 'אשר ביצוע',
+    invalidTradeTitle: 'נתוני עסקה לא תקינים',
+    invalidTradeMessage: 'הזן כמות ומחיר חיוביים, ועמלה של 0 ומעלה.',
+    tradeQuoteMissingMessage: 'לא ניתן לתמחר את העסקה בדולרים: אין מחיר חי עבור {{ticker}}.',
+    insufficientCashTitle: 'אין מספיק כוח קנייה',
+    insufficientCashMessage: 'העסקה עולה {{cost}}, יותר מכוח הקנייה ({{balance}}). היתרה תהיה {{after}}.',
+    executeAnyway: 'בצע בכל זאת',
+    tradeExecutedToast: 'נקנה {{ticker}}: ‎-{{cost}}. כוח קנייה: {{balance}}',
+    tradeRadarRemovalFailed: '{{ticker}} נקנה, אך לא ניתן היה להסיר אותו ממכ״ם המארבים.',
+    costBasis: 'עלות',
+    buy: 'קנה',
+    adjustCash: 'התאמת מזומן',
+    depositOrDividend: 'הפקדה / דיבידנד',
+    withdrawOrCorrect: 'משיכה / תיקון',
+    applyAdjustment: 'עדכן יתרה',
+    cashWithdrawnToast: 'הופחתו {{amount}}. כוח קנייה: {{balance}}',
+    negativeBalanceConfirmMessage: 'הפעולה תשאיר כוח קנייה של {{after}}.',
+    executeSell: 'ביצוע מכירה',
+    sell: 'מכור',
+    unitsHeld: 'יחידות מוחזקות: {{units}}',
+    sellAll: 'מכור הכל',
+    cannotPriceTradeTitle: 'לא ניתן לתמחר את העסקה',
+    netProceeds: 'תמורה נטו',
+    confirmSell: 'אשר מכירה',
+    sellQuantityTooHighTitle: 'הכמות גבוהה מהמוחזק',
+    sellQuantityTooHighMessage: 'אפשר למכור עד {{units}} יחידות של {{ticker}}.',
+    positionClosedToast: '{{ticker}} נמכר במלואו: {{proceeds}}. כוח קנייה: {{balance}}',
+    positionReducedToast: 'נמכרו {{units}} {{ticker}}: {{proceeds}}. כוח קנייה: {{balance}}',
+    positionNotFoundMessage: 'הפוזיציה כבר לא נמצאת בתיק.',
   },
   en: {
     portfolio: 'Portfolio',
@@ -372,9 +466,6 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     liquidatedAmbushFailed: "{{ticker}} liquidated, but couldn't be added to Ambush Radar",
     priceUnavailable: 'Price unavailable',
     priceFetchFailedHint: '⚠ Price fetch failed — pull down to retry. Your position data is safe.',
-    liquidateConfirmTitle: 'Liquidate Position?',
-    liquidateConfirmMessage: 'Are you sure you want to close your position in {{ticker}}?',
-    yesLiquidate: 'Yes, Liquidate',
     cancel: 'Cancel',
     loadingPortfolio: 'Loading your portfolio...',
     loadingAmbush: 'Loading ambush radar...',
@@ -443,6 +534,56 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     intelCopyFailedMessage: 'Could not copy the intel to the clipboard.',
     ambushDataCopiedMessage: 'Ambush Radar data copied to the clipboard.',
     ambushCopyFailedMessage: 'Could not copy the Ambush Radar data to the clipboard.',
+    buyingPower: 'Buying Power',
+    totalWithCash: 'Total (incl. cash)',
+    cash: 'Cash',
+    allocationWithCash: 'Allocation (incl. cash)',
+    negativeCashWarning: 'Negative balance — log a deposit to match your broker',
+    cashAmountLabel: 'Amount (USD)',
+    cashAmountPlaceholder: 'e.g. 250.00',
+    invalidAmountTitle: 'Invalid Amount',
+    invalidAmountMessage: 'Enter a positive dollar amount.',
+    cashAddedToast: '{{amount}} added. Buying power: {{balance}}',
+    cashUnavailableTitle: 'Cash Balance Not Loaded',
+    cashUnavailableMessage: 'The saved cash balance could not be read. Try again in a moment, so this action cannot overwrite the saved balance.',
+    continueToExecution: 'Continue to Execution',
+    executeTrade: 'Execute Trade',
+    buyMoreNote: 'Already held — the quantity is added to the existing position.',
+    executedQuantity: 'Executed Quantity',
+    executedPrice: 'Executed Price ({{unit}})',
+    brokerFee: 'Broker Fee ({{unit}})',
+    livePriceHint: 'Live price: {{price}}',
+    totalCost: 'Total Cost',
+    cashAfterTrade: 'Buying Power After Trade',
+    confirmExecution: 'Confirm Execution',
+    invalidTradeTitle: 'Invalid Trade Details',
+    invalidTradeMessage: 'Enter a positive quantity and price, and a fee of 0 or more.',
+    tradeQuoteMissingMessage: 'Cannot price this trade in USD: no live quote for {{ticker}}.',
+    insufficientCashTitle: 'Insufficient Buying Power',
+    insufficientCashMessage: 'This trade costs {{cost}}, more than your buying power ({{balance}}). The balance would become {{after}}.',
+    executeAnyway: 'Execute Anyway',
+    tradeExecutedToast: 'Bought {{ticker}}: -{{cost}}. Buying power: {{balance}}',
+    tradeRadarRemovalFailed: '{{ticker}} bought, but it could not be removed from the Ambush Radar.',
+    costBasis: 'Cost basis',
+    buy: 'Buy',
+    adjustCash: 'Adjust Cash',
+    depositOrDividend: 'Deposit / Dividend',
+    withdrawOrCorrect: 'Withdraw / Correction',
+    applyAdjustment: 'Update Balance',
+    cashWithdrawnToast: '{{amount}} withdrawn. Buying power: {{balance}}',
+    negativeBalanceConfirmMessage: 'This leaves your buying power at {{after}}.',
+    executeSell: 'Execute Sell',
+    sell: 'Sell',
+    unitsHeld: 'Units held: {{units}}',
+    sellAll: 'Sell All',
+    cannotPriceTradeTitle: 'Cannot Price Trade',
+    netProceeds: 'Net Proceeds',
+    confirmSell: 'Confirm Sale',
+    sellQuantityTooHighTitle: 'Quantity Exceeds Holding',
+    sellQuantityTooHighMessage: 'You can sell at most {{units}} units of {{ticker}}.',
+    positionClosedToast: 'Sold all {{ticker}}: {{proceeds}}. Buying power: {{balance}}',
+    positionReducedToast: 'Sold {{units}} {{ticker}}: {{proceeds}}. Buying power: {{balance}}',
+    positionNotFoundMessage: 'This position is no longer in the portfolio.',
   },
 };
 

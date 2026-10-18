@@ -57,6 +57,9 @@ export type Stock = {
 export type StockCardProps = {
   stock: Stock;
   onDelete: (ticker: string) => void;
+  // TRADE RECONCILIATION: opens the Portfolio's Execute Trade flow for
+  // this ticker (see handleBuyTicker in ambush.tsx).
+  onBuy: (ticker: string) => void;
 };
 
 // Wrapped in memo() so a price/SMA update on one ticker doesn't re-render
@@ -66,7 +69,7 @@ export type StockCardProps = {
 // this comparison is meaningful, not a no-op. memo() only shallow-compares
 // props, not context, so this still re-renders correctly on a theme toggle
 // (usePipelineTheme() below is a context read, unaffected by memo).
-export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardProps) {
+export const StockCard = memo(function StockCard({ stock, onDelete, onBuy }: StockCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read (like usePipelineTheme()
   // above), unaffected by this component's own memo() — a language switch
@@ -130,6 +133,14 @@ export const StockCard = memo(function StockCard({ stock, onDelete }: StockCardP
           ) : (
             <Text style={styles.price}>{priceDisplay}</Text>
           )}
+          <TouchableOpacity
+            style={styles.buyButton}
+            onPress={() => onBuy(ticker)}
+            hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+            accessibilityRole="button"
+            accessibilityLabel={`${t('buy')} ${ticker}`}>
+            <Text style={styles.buyButtonText}>{t('buy')}</Text>
+          </TouchableOpacity>
           <TouchableOpacity
             onPress={() => onDelete(ticker)}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -293,6 +304,18 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       color: colors.bearish,
       fontSize: 16,
       fontWeight: '700',
+    },
+    buyButton: {
+      backgroundColor: colors.bullish,
+      borderRadius: 12,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+    },
+    buyButtonText: {
+      color: colors.textPrimary,
+      fontSize: 13,
+      fontWeight: '700',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
   });
 }
