@@ -130,14 +130,15 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
       borderRadius: 6,
       marginLeft: -6,
     },
+    // COMPACT (radar cards): tight label spacing.
     labelRow: {
       flexDirection: 'row',
       justifyContent: 'space-between',
-      marginTop: 6,
+      marginTop: 4,
     },
     labelText: {
       color: colors.textSecondary,
-      fontSize: 11,
+      fontSize: 10,
     },
   });
 }

@@ -82,3 +82,34 @@ export function usdPerLocalForTrade(
   }
   return usdPerLocalFromQuote(quoteUsdPrice, quoteLocalPrice);
 }
+
+// LEGACY ENTRY DATA: converts a price typed the way the broker shows it
+// (Agorot for ".TA", otherwise the instrument's currency, i.e. dollars) to
+// USD on the same basis as a position's live price, and back for display.
+// A USD instrument converts 1:1 even while its live price is unavailable;
+// an Israeli one needs the live rate (or, without it, the quote's own
+// ratio), and returns null when neither exists.
+const AGOROT_PER_SHEKEL = 100;
+
+function usdPerLocalForEntry(position: PricedPosition, usdIlsRate: number | null): number | null {
+  if (!isIlsQuoted(position.ticker, position.currencySymbol)) {
+    return 1;
+  }
+  return usdPerLocalForTrade(position.ticker, position.currencySymbol, position.price, position.localPrice, usdIlsRate);
+}
+
+export function brokerQuoteToUsd(value: number, position: PricedPosition, usdIlsRate: number | null): number | null {
+  const usdPerLocal = usdPerLocalForEntry(position, usdIlsRate);
+  if (usdPerLocal === null) {
+    return null;
+  }
+  const localValue = isTaseTicker(position.ticker) ? value / AGOROT_PER_SHEKEL : value;
+  return localValue * usdPerLocal;
+}
+
+// The inverse, in the instrument's local currency (Shekels for Israeli
+// instruments), ready for formatUnitPrice.
+export function usdToLocalPrice(usdValue: number, position: PricedPosition, usdIlsRate: number | null): number | null {
+  const usdPerLocal = usdPerLocalForEntry(position, usdIlsRate);
+  return usdPerLocal === null || usdPerLocal <= 0 ? null : usdValue / usdPerLocal;
+}

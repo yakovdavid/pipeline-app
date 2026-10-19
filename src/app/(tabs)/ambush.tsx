@@ -33,7 +33,12 @@ import { useAppForegroundRefresh } from '@/hooks/useAppForegroundRefresh';
 import { fetchInChunks, fetchQualityMetrics, fetchStockData } from '@/services/api';
 import type { AmbushAsset, AmbushLayer, AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
-import { AMBUSH_READINESS_ORDER, groupAmbushByReadiness, type AmbushReadinessZone } from '@/utils/ambush-grouping';
+import {
+  AMBUSH_READINESS_ORDER,
+  classifyAmbushReadiness,
+  groupAmbushByReadiness,
+  type AmbushReadinessZone,
+} from '@/utils/ambush-grouping';
 import {
   buildQualityAmbushAsset,
   buildSatelliteAmbushAsset,
@@ -514,9 +519,13 @@ export default function AmbushRadarScreen() {
   const handleBuyTicker = useCallback(
     (tickerToBuy: string) => {
       const asset = assetsRef.current.find((candidate) => isSameTicker(candidate.ticker, tickerToBuy));
-      // The card's Buy button is already disabled on a locked layer; this
-      // is the second layer of that block.
-      if (asset === undefined || lockedLayersRef.current[asset.layer]) {
+      // The card only shows Buy in the Value Zone and disables it on a
+      // locked layer; this is the second layer of both blocks.
+      if (
+        asset === undefined ||
+        classifyAmbushReadiness(asset) !== 'valueZone' ||
+        lockedLayersRef.current[asset.layer]
+      ) {
         return;
       }
       requestPortfolioBuy({ ticker: asset.ticker, assetType: asset.assetType, layer: asset.layer });
@@ -571,6 +580,7 @@ export default function AmbushRadarScreen() {
           stock={item}
           onDelete={handleDeleteTicker}
           onBuy={handleBuyTicker}
+          canBuy={section.key === 'valueZone'}
           isOverweightLocked={lockedLayers.Satellite}
         />
       ),

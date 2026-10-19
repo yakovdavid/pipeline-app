@@ -20,6 +20,7 @@ export type QualityAmbushCardProps = {
   // Removes the ticker from the radar (same handler StockCard uses).
   onDelete: (ticker: string) => void;
   // Opens the Portfolio's Execute Trade flow (same handler StockCard uses).
+  // SAFE BUTTONS: the Buy button only exists in the Value Zone; see canBuy.
   onBuy: (ticker: string) => void;
   // CIRCUIT BREAKER: the Quality layer is above target + 1%, so the card
   // is dimmed, badged and its Buy button disabled.
@@ -40,11 +41,11 @@ function moatLabel(t: TFunction, moat: QualityMoat | null): string {
 }
 
 // UNIFIED RADAR: the Quality (fundamental) counterpart of StockCard,
-// populated from GET /api/quality/{ticker}. Three rows, top to bottom:
-// ticker and price; fundamentals (ROIC, green at or above the 15% gate and
-// red below it, plus the moat); the Z-Score as the statistical trigger. A
-// status strip along the bottom shows the readiness zone in that zone's
-// color.
+// populated from GET /api/quality/{ticker}. COMPACT LAYOUT, two rows: ticker
+// and price; then ROIC (green at or above the 15% gate, red below), Moat,
+// and the Z-Score (the statistical trigger, slightly larger and bolder) side
+// by side. A thin status strip along the bottom shows the readiness zone in
+// that zone's color.
 //
 // Missing values show as "N/A": ROIC when the company has no financial
 // statements (e.g. an ETF), the Z-Score when there isn't enough price
@@ -70,6 +71,9 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
   const isUnavailable = asset.priceStatus === 'unavailable';
   const roicColor =
     asset.roic === null ? colors.textSecondary : asset.roic >= QUALITY_MIN_ROIC_PCT ? colors.bullish : colors.bearish;
+  // SAFE BUTTONS: Buy is rendered only for a Value Zone asset. In Watch or
+  // Invalidated it doesn't exist at all, so it can't be hit by accident.
+  const canBuy = zone === 'valueZone';
 
   return (
     <View style={styles.card}>
@@ -85,16 +89,18 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
                 {formatUnitPrice(asset.ticker, asset.localPrice, asset.currencySymbol, t('ag'))}
               </Text>
             )}
-            <TouchableOpacity
-              style={[styles.buyButton, isOverweightLocked && styles.buyButtonDisabled]}
-              onPress={() => onBuy(asset.ticker)}
-              disabled={isOverweightLocked}
-              hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
-              accessibilityRole="button"
-              accessibilityState={{ disabled: isOverweightLocked }}
-              accessibilityLabel={`${t('buy')} ${asset.ticker}`}>
-              <Text style={styles.buyButtonText}>{t('buy')}</Text>
-            </TouchableOpacity>
+            {canBuy && (
+              <TouchableOpacity
+                style={[styles.buyButton, isOverweightLocked && styles.buyButtonDisabled]}
+                onPress={() => onBuy(asset.ticker)}
+                disabled={isOverweightLocked}
+                hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: isOverweightLocked }}
+                accessibilityLabel={`${t('buy')} ${asset.ticker}`}>
+                <Text style={styles.buyButtonText}>{t('buy')}</Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               onPress={() => onDelete(asset.ticker)}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -107,28 +113,26 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
         {isUnavailable ? (
           <Text style={styles.fetchFailedHint}>{t('priceFetchFailedHint')}</Text>
         ) : (
-          <>
-            <View style={styles.fundamentalsRow}>
-              <View style={styles.metric}>
-                <Text style={styles.metricLabel}>{t('roicLabel')}</Text>
-                <Text style={[styles.metricValue, { color: roicColor }]}>
-                  {asset.roic === null ? t('notAvailable') : `${asset.roic.toFixed(1)}%`}
-                </Text>
-              </View>
-              <View style={styles.metric}>
-                <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
-                <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
-              </View>
+          <View style={styles.fundamentalsRow}>
+            <View style={styles.metric}>
+              <Text style={styles.metricLabel}>{t('roicLabel')}</Text>
+              <Text style={[styles.metricValue, { color: roicColor }]}>
+                {asset.roic === null ? t('notAvailable') : `${asset.roic.toFixed(1)}%`}
+              </Text>
             </View>
-
-            {/* The statistical trigger, shown larger than the fundamentals. */}
-            <View style={styles.zScoreRow}>
-              <Text style={styles.zScoreLabel}>{t('zScoreLabel')}:</Text>
+            <View style={styles.metric}>
+              <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
+              <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
+            </View>
+            {/* The statistical trigger, slightly larger than the
+                fundamentals beside it. */}
+            <View style={styles.metric}>
+              <Text style={styles.metricLabel}>{t('zScoreLabel')}</Text>
               <Text style={styles.zScoreValue}>
                 {asset.zScore === null ? t('notAvailable') : asset.zScore.toFixed(2)}
               </Text>
             </View>
-          </>
+          </View>
         )}
 
         <View style={[styles.statusStrip, { backgroundColor: zoneColors.badgeBackground }]}>
@@ -156,13 +160,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   const writingDirection = isHebrew ? 'rtl' : 'ltr';
 
   return StyleSheet.create({
-    // Same outer metrics as StockCard (16px side margin, 12px radius, 12px
-    // gap) so Quality and Satellite cards line up in one list.
+    // Same outer metrics as StockCard (16px side margin, 12px radius, 8px
+    // gap) so Quality and Satellite cards line up in one list. COMPACT:
+    // tighter spacing throughout, so 4-5 cards fit on one screen.
     card: {
       backgroundColor: colors.cardBackground,
       borderRadius: 12,
       marginHorizontal: 16,
-      marginBottom: 12,
+      marginBottom: 8,
       overflow: 'hidden',
       borderWidth: 1,
       borderColor: colors.quality,
@@ -180,8 +185,8 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'space-between',
-      paddingHorizontal: 16,
-      paddingTop: 14,
+      paddingHorizontal: 12,
+      paddingTop: 8,
     },
     headerRight: {
       flexDirection: 'row',
@@ -190,13 +195,13 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     },
     ticker: {
       color: colors.textPrimary,
-      fontSize: 18,
+      fontSize: 16,
       fontWeight: '700',
       writingDirection: 'ltr',
     },
     price: {
       color: colors.textPrimary,
-      fontSize: 18,
+      fontSize: 16,
       fontWeight: '600',
       writingDirection: 'ltr',
     },
@@ -264,24 +269,26 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     fetchFailedHint: {
       color: colors.textSecondary,
       fontSize: 12,
-      paddingHorizontal: 16,
-      marginTop: 10,
-      marginBottom: 12,
+      paddingHorizontal: 12,
+      marginTop: 4,
+      marginBottom: 6,
       textAlign,
       writingDirection,
     },
     fundamentalsRow: {
       flexDirection: rowDirection,
-      gap: 24,
-      paddingHorizontal: 16,
-      marginTop: 12,
+      gap: 20,
+      paddingHorizontal: 12,
+      marginTop: 4,
+      marginBottom: 6,
+      alignItems: 'flex-end',
     },
     metric: {
       alignItems: isHebrew ? 'flex-end' : 'flex-start',
     },
     metricLabel: {
       color: colors.textSecondary,
-      fontSize: 11,
+      fontSize: 10,
       fontWeight: '700',
       textTransform: 'uppercase',
       textAlign,
@@ -289,39 +296,26 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     },
     metricValue: {
       color: colors.textPrimary,
-      fontSize: 15,
-      fontWeight: '700',
-      marginTop: 2,
-      textAlign,
-      writingDirection,
-    },
-    zScoreRow: {
-      flexDirection: rowDirection,
-      alignItems: 'baseline',
-      gap: 8,
-      paddingHorizontal: 16,
-      marginTop: 10,
-      marginBottom: 12,
-    },
-    zScoreLabel: {
-      color: colors.textSecondary,
       fontSize: 14,
-      fontWeight: '600',
+      fontWeight: '700',
+      marginTop: 1,
+      textAlign,
       writingDirection,
     },
     // The number itself: large and LTR, since it may carry a minus sign.
     zScoreValue: {
       color: colors.textPrimary,
-      fontSize: 26,
+      fontSize: 17,
       fontWeight: '800',
+      marginTop: 1,
       writingDirection: 'ltr',
     },
     statusStrip: {
-      paddingHorizontal: 16,
-      paddingVertical: 6,
+      paddingHorizontal: 12,
+      paddingVertical: 3,
     },
     statusStripText: {
-      fontSize: 12,
+      fontSize: 11,
       fontWeight: '800',
       textTransform: 'uppercase',
       letterSpacing: 0.5,

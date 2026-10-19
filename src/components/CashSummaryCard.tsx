@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import { memo, useMemo } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { categoryLabel } from '@/constants/labels';
@@ -53,16 +53,30 @@ export const CashSummaryCard = memo(function CashSummaryCard({
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, language), [colors, language]);
   const isNegative = isCashLoaded && cashBalance < 0;
+  // COLLAPSIBLE SUMMARY: collapsed by default (in memory only, so it starts
+  // collapsed again on every launch), showing just the buying power and
+  // the Adjust Cash button. Tapping the buying-power area toggles the
+  // details: total, FX rate and the allocation pills.
+  const [isExpanded, setIsExpanded] = useState(false);
 
   return (
     <View style={styles.card}>
       <View style={styles.topRow}>
-        <View style={styles.balanceGroup}>
-          <Text style={styles.caption}>{t('buyingPower')}</Text>
+        <TouchableOpacity
+          style={styles.balanceGroup}
+          onPress={() => setIsExpanded((previous) => !previous)}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: isExpanded }}
+          accessibilityLabel={t('buyingPower')}>
+          <View style={styles.captionRow}>
+            <Text style={styles.caption}>{t('buyingPower')}</Text>
+            <Ionicons name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} color={colors.textSecondary} />
+          </View>
           <Text style={[styles.balance, isNegative && styles.negative]}>
             {isCashLoaded ? formatUsd(cashBalance) : '—'}
           </Text>
-        </View>
+        </TouchableOpacity>
         <TouchableOpacity
           style={[styles.adjustCashButton, !isCashLoaded && styles.adjustCashButtonDisabled]}
           onPress={onAdjustCash}
@@ -74,26 +88,32 @@ export const CashSummaryCard = memo(function CashSummaryCard({
         </TouchableOpacity>
       </View>
 
+      {/* Shown even when collapsed: a negative balance is a reconciliation
+          problem the user must see without having to expand anything. */}
       {isNegative && <Text style={styles.warning}>{t('negativeCashWarning')}</Text>}
 
-      <Text style={styles.caption}>
-        {t('totalWithCash')}: <Text style={styles.total}>{formatUsd(allocation.totalValue)}</Text>
-      </Text>
-      {/* GAP 3: the live rate every Israeli position is valued with. */}
-      {usdIlsRate !== null && (
-        <Text style={styles.caption}>{t('fxRateCaption', { rate: usdIlsRate.toFixed(4) })}</Text>
-      )}
+      {isExpanded && (
+        <>
+          <Text style={styles.caption}>
+            {t('totalWithCash')}: <Text style={styles.total}>{formatUsd(allocation.totalValue)}</Text>
+          </Text>
+          {/* GAP 3: the live rate every Israeli position is valued with. */}
+          {usdIlsRate !== null && (
+            <Text style={styles.caption}>{t('fxRateCaption', { rate: usdIlsRate.toFixed(4) })}</Text>
+          )}
 
-      <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>
-      <View style={styles.weightsRow}>
-        {ALLOCATION_BUCKETS.map((bucket) => (
-          <View key={bucket} style={styles.weightChip}>
-            <View style={[styles.weightDot, { backgroundColor: bucketColor(colors, bucket) }]} />
-            <Text style={styles.weightLabel}>{bucketLabel(t, bucket)}</Text>
-            <Text style={styles.weightValue}>{`${allocation.weightsPct[bucket].toFixed(1)}%`}</Text>
+          <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>
+          <View style={styles.weightsRow}>
+            {ALLOCATION_BUCKETS.map((bucket) => (
+              <View key={bucket} style={styles.weightChip}>
+                <View style={[styles.weightDot, { backgroundColor: bucketColor(colors, bucket) }]} />
+                <Text style={styles.weightLabel}>{bucketLabel(t, bucket)}</Text>
+                <Text style={styles.weightValue}>{`${allocation.weightsPct[bucket].toFixed(1)}%`}</Text>
+              </View>
+            ))}
           </View>
-        ))}
-      </View>
+        </>
+      )}
     </View>
   );
 });
@@ -121,6 +141,12 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
     balanceGroup: {
       flexShrink: 1,
       alignItems: isHebrew ? 'flex-end' : 'flex-start',
+    },
+    // "Buying Power" plus the expand/collapse chevron.
+    captionRow: {
+      flexDirection: isHebrew ? 'row-reverse' : 'row',
+      alignItems: 'center',
+      gap: 4,
     },
     caption: {
       color: colors.textSecondary,

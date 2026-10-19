@@ -122,20 +122,25 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
   return StyleSheet.create({
     row: {
       flexDirection: 'row',
-      gap: 8,
-      marginTop: 10,
+      gap: 6,
+      marginTop: 6,
     },
+    // COMPACT (radar cards): label and value on ONE line inside each badge
+    // (they used to stack), wrapping only if a translation doesn't fit.
     badge: {
       flex: 1,
-      borderRadius: 8,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      alignItems: isHebrew ? 'flex-end' : 'flex-start',
+      flexDirection: isHebrew ? 'row-reverse' : 'row',
+      flexWrap: 'wrap',
+      alignItems: 'baseline',
+      columnGap: 4,
+      borderRadius: 6,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
     },
     badgeLabel: {
       color: colors.textPrimary,
       opacity: 0.85,
-      fontSize: 10,
+      fontSize: 9,
       fontWeight: '700',
       textTransform: 'uppercase',
       textAlign: isHebrew ? 'right' : 'left',
@@ -143,9 +148,8 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
     },
     badgeValue: {
       color: colors.textPrimary,
-      fontSize: 13,
+      fontSize: 12,
       fontWeight: '700',
-      marginTop: 2,
       textAlign: isHebrew ? 'right' : 'left',
       writingDirection: isHebrew ? 'rtl' : 'ltr',
     },

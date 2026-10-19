@@ -1,4 +1,3 @@
-import type { TrendLabel } from '@/types/asset';
 import type { PortfolioCategory } from '@/types/portfolio';
 
 // The depth that turns a pullback into a Structural Breakdown for a HELD
@@ -9,26 +8,28 @@ import type { PortfolioCategory } from '@/types/portfolio';
 // position, and stays unchanged.
 export const STRUCTURAL_BREAKDOWN_DEPTH_PCT = -11.5;
 
-// GAP 4: STRUCTURAL BREAKDOWN vs. TECHNICAL PULLBACK.
+// GAP 4: STRUCTURAL BREAKDOWN vs. TECHNICAL PULLBACK, for positions already
+// held.
 //
-// A technical pullback is a dip inside an intact uptrend: Macro Trend still
-// Bullish and the pullback shallower than -11.50%. It is a normal part of
-// holding a position.
+// A Structural Breakdown requires liquidation. It applies (to Satellite
+// positions only, see isStructuralBreakdownLayer below) when, and only
+// when, pullbackDepth <= -11.50% (STRUCTURAL_BREAKDOWN_DEPTH_PCT).
+// Anything shallower is a technical pullback, a normal part of holding a
+// position.
 //
-// A Structural Breakdown is the trend itself failing, and requires
-// liquidation. It applies (to Satellite positions only, see
-// isStructuralBreakdownLayer below) when EITHER holds:
-//   - macroTrend === 'Bearish' (price below its SMA200), or
-//   - pullbackDepth <= -11.50% (STRUCTURAL_BREAKDOWN_DEPTH_PCT).
+// Macro Trend plays no part here. A held position's downside is governed
+// by its own stop-loss (see @/utils/protectionState); an SMA200 cross on
+// its own isn't a reason to sell. (The Ambush Radar still requires a
+// Bullish Macro Trend to ENTER a position; that rule is separate and
+// unchanged.)
+//
 // The depth is compared on the 2-decimal value shown on screen (the
 // backend already rounds pullback_depth to 2 decimals), so a displayed
 // "-11.50%" always counts and "-11.49%" never does.
 //
-// Missing data never triggers it: a null Macro Trend or pullback depth
-// (too little price history, or a failed fetch) is "unknown", not a
-// breakdown. This differs on purpose from the radar's Invalidated zone,
-// which treats unknown as disqualifying for a NEW entry: telling the user
-// to sell a position they hold requires positive evidence.
+// Missing data never triggers it: a null pullback depth (too little price
+// history, or a failed fetch) is "unknown", not a breakdown. Telling the
+// user to sell a position they hold requires positive evidence.
 
 // SCOPE: Satellite ONLY. Core is an index-tracking long-term hold: by
 // design it rides through SMA200 crosses and deep pullbacks, so a
@@ -40,14 +41,10 @@ export function isStructuralBreakdownLayer(category: PortfolioCategory): boolean
 }
 
 export type StructuralSignals = {
-  macroTrend: TrendLabel | null;
   pullbackDepth: number | null;
 };
 
-export function isStructuralBreakdown({ macroTrend, pullbackDepth }: StructuralSignals): boolean {
-  if (macroTrend === 'Bearish') {
-    return true;
-  }
+export function isStructuralBreakdown({ pullbackDepth }: StructuralSignals): boolean {
   if (pullbackDepth === null) {
     return false;
   }

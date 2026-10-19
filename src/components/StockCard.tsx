@@ -61,6 +61,9 @@ export type StockCardProps = {
   // TRADE RECONCILIATION: opens the Portfolio's Execute Trade flow for
   // this ticker (see handleBuyTicker in ambush.tsx).
   onBuy: (ticker: string) => void;
+  // SAFE BUTTONS: true only in the Value Zone. Anywhere else the Buy button
+  // isn't rendered at all, so it can't be hit by accident.
+  canBuy: boolean;
   // CIRCUIT BREAKER: this card's layer (Satellite) is above target + 1%,
   // so the card is dimmed, badged and its Buy button disabled.
   isOverweightLocked: boolean;
@@ -73,7 +76,13 @@ export type StockCardProps = {
 // this comparison is meaningful, not a no-op. memo() only shallow-compares
 // props, not context, so this still re-renders correctly on a theme toggle
 // (usePipelineTheme() below is a context read, unaffected by memo).
-export const StockCard = memo(function StockCard({ stock, onDelete, onBuy, isOverweightLocked }: StockCardProps) {
+export const StockCard = memo(function StockCard({
+  stock,
+  onDelete,
+  onBuy,
+  canBuy,
+  isOverweightLocked,
+}: StockCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read (like usePipelineTheme()
   // above), unaffected by this component's own memo() — a language switch
@@ -138,16 +147,18 @@ export const StockCard = memo(function StockCard({ stock, onDelete, onBuy, isOve
             ) : (
               <Text style={styles.price}>{priceDisplay}</Text>
             )}
-            <TouchableOpacity
-              style={[styles.buyButton, isOverweightLocked && styles.buyButtonDisabled]}
-              onPress={() => onBuy(ticker)}
-              disabled={isOverweightLocked}
-              hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
-              accessibilityRole="button"
-              accessibilityState={{ disabled: isOverweightLocked }}
-              accessibilityLabel={`${t('buy')} ${ticker}`}>
-              <Text style={styles.buyButtonText}>{t('buy')}</Text>
-            </TouchableOpacity>
+            {canBuy && (
+              <TouchableOpacity
+                style={[styles.buyButton, isOverweightLocked && styles.buyButtonDisabled]}
+                onPress={() => onBuy(ticker)}
+                disabled={isOverweightLocked}
+                hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: isOverweightLocked }}
+                accessibilityLabel={`${t('buy')} ${ticker}`}>
+                <Text style={styles.buyButtonText}>{t('buy')}</Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               onPress={() => onDelete(ticker)}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -211,10 +222,11 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     card: {
       backgroundColor: colors.cardBackground,
       borderRadius: 12,
-      paddingHorizontal: 16,
-      paddingVertical: 14,
+      // COMPACT: tighter padding and gaps, so 4-5 cards fit on one screen.
+      paddingHorizontal: 12,
+      paddingVertical: 8,
       marginHorizontal: 16,
-      marginBottom: 12,
+      marginBottom: 8,
       overflow: 'hidden',
       // Light theme's white cards need a subtle shadow to read as
       // distinct/elevated against the light-gray page background; dark
@@ -233,11 +245,11 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     },
     warningBanner: {
       backgroundColor: colors.warning,
-      marginHorizontal: -16,
-      marginTop: -14,
-      marginBottom: 10,
-      paddingHorizontal: 16,
-      paddingVertical: 6,
+      marginHorizontal: -12,
+      marginTop: -8,
+      marginBottom: 6,
+      paddingHorizontal: 12,
+      paddingVertical: 4,
     },
     warningBannerText: {
       color: colors.warningText,
@@ -257,7 +269,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     },
     bottomRow: {
       flexDirection: 'row',
-      marginTop: 12,
+      marginTop: 6,
       alignItems: 'flex-start',
     },
     tickerGroup: {
@@ -269,7 +281,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       // Ticker symbols stay LTR regardless of app language — they're
       // identifiers, not translatable text.
       color: colors.textPrimary,
-      fontSize: 18,
+      fontSize: 16,
       fontWeight: '700',
       writingDirection: 'ltr',
     },
@@ -296,7 +308,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       // as the ticker above — a currency symbol/Agorot suffix prefixing or
       // trailing a number doesn't change that.
       color: colors.textPrimary,
-      fontSize: 18,
+      fontSize: 16,
       fontWeight: '600',
       writingDirection: 'ltr',
     },
@@ -312,7 +324,7 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     priceFetchFailedHint: {
       color: colors.textSecondary,
       fontSize: 12,
-      marginTop: 10,
+      marginTop: 4,
       textAlign: isHebrew ? 'right' : 'left',
       writingDirection: isHebrew ? 'rtl' : 'ltr',
     },

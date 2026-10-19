@@ -206,6 +206,13 @@ export type TranslationKey =
   | 'cannotPriceTradeTitle'
   | 'structuralBreakdownBanner'
   | 'fxRateCaption'
+  | 'editEntryData'
+  | 'entryDataHint'
+  | 'purchasePriceInput'
+  | 'historicalHwmInput'
+  | 'invalidEntryDataTitle'
+  | 'invalidEntryDataMessage'
+  | 'entryDataMissingHint'
   | 'stopLockedAt'
   | 'purchasePriceLabel'
   | 'historicalHwmLabel'
@@ -405,6 +412,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     cannotPriceTradeTitle: 'לא ניתן לתמחר את העסקה',
     structuralBreakdownBanner: 'שבירה מבנית - נדרש מימוש',
     fxRateCaption: 'שער דולר/שקל: {{rate}}',
+    editEntryData: 'עריכת נתוני כניסה',
+    entryDataHint: 'הזן כפי שמופיע אצל הברוקר ({{unit}}). שדה ריק נשאר ללא שינוי.',
+    purchasePriceInput: 'מחיר כניסה ({{unit}}) - כעת: {{current}}',
+    historicalHwmInput: 'שיא היסטורי ({{unit}}) - כעת: {{current}}',
+    invalidEntryDataTitle: 'נתוני כניסה לא תקינים',
+    invalidEntryDataMessage: 'הזן מספר חיובי ב-{{unit}}, או השאר את השדה ריק.',
+    entryDataMissingHint: 'חסרים נתוני כניסה: מוצג כמעקב אוטומטי. עריכה > עריכת נתוני כניסה.',
     stopLockedAt: 'סטופ נעול (מחיר כניסה -12%)',
     purchasePriceLabel: 'מחיר כניסה',
     historicalHwmLabel: 'שיא היסטורי (שיא 52 שבועות בכניסה)',
@@ -597,6 +611,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     cannotPriceTradeTitle: 'Cannot Price Trade',
     structuralBreakdownBanner: 'STRUCTURAL BREAKDOWN - LIQUIDATION REQUIRED',
     fxRateCaption: 'USD/ILS: {{rate}}',
+    editEntryData: 'Edit Entry Data',
+    entryDataHint: 'Enter as your broker shows it ({{unit}}). A blank field stays unchanged.',
+    purchasePriceInput: 'Entry price ({{unit}}) - now: {{current}}',
+    historicalHwmInput: 'Historical HWM ({{unit}}) - now: {{current}}',
+    invalidEntryDataTitle: 'Invalid Entry Data',
+    invalidEntryDataMessage: 'Enter a positive number in {{unit}}, or leave the field blank.',
+    entryDataMissingHint: 'Entry data missing: shown as Automated Tracking. Edit > Edit Entry Data.',
     stopLockedAt: 'Locked stop (entry -12%)',
     purchasePriceLabel: 'Entry price',
     historicalHwmLabel: 'Historical HWM (52-week high at entry)',

@@ -73,6 +73,7 @@ import {
   formatTotalValue,
   formatUnitPrice,
   getEffectiveUnits,
+  isTaseTicker,
 } from '@/utils/currency';
 import { loadCashBalance, saveCashBalance } from '@/utils/cash-storage';
 import {
@@ -83,7 +84,7 @@ import {
 import { formatAmbushLines, formatCashLines, formatPortfolioLines } from '@/utils/report-formatters';
 import { buildPortfolioStock, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
 import { getLayerWeights, publishLayerWeights } from '@/utils/layer-weights-store';
-import { positionUsdValue, usdPerLocalForTrade } from '@/utils/fx';
+import { brokerQuoteToUsd, positionUsdValue, usdPerLocalForTrade, usdToLocalPrice } from '@/utils/fx';
 import { applySale } from '@/utils/position-ledger';
 import { computeProtectionState, resolveHistoricalHWM, type ProtectionState } from '@/utils/protectionState';
 import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
@@ -167,6 +168,14 @@ type PendingTrade = Extract<ExecuteTradeRequest, { side: 'buy' }> & {
 // consumed by commitSale.
 type PendingSale = Extract<ExecuteTradeRequest, { side: 'sell' }> & {
   id: number;
+};
+
+// LEGACY ENTRY DATA: what the row's "Edit Entry Data" fields hand to
+// handleSaveEdit, already converted to USD on the live-price basis. Null
+// means "leave unchanged" (the field was left blank).
+type EntryDataEdit = {
+  purchasePriceUsd: number | null;
+  historicalHwmUsd: number | null;
 };
 
 type TradeStart = {
@@ -1439,7 +1448,13 @@ export default function PortfolioScreen() {
   };
 
   const handleSaveEdit = useCallback(
-    (tickerToUpdate: string, newAssetType: AssetType, newTotalValueInput: string, newInternalTargetInput: string) => {
+    (
+      tickerToUpdate: string,
+      newAssetType: AssetType,
+      newTotalValueInput: string,
+      newInternalTargetInput: string,
+      entryEdit: EntryDataEdit,
+    ) => {
       setStocksTrusted((prevStocks) =>
         prevStocks.map((stock) => {
           if (stock.ticker !== tickerToUpdate) {
@@ -1496,6 +1511,10 @@ export default function PortfolioScreen() {
               assetType: newAssetType,
               highestWatermark,
               internalTargetPct,
+              // LEGACY ENTRY DATA: a filled-in field replaces the stored
+              // value; a blank one keeps it.
+              purchasePrice: entryEdit.purchasePriceUsd ?? stock.purchasePrice,
+              historicalHWM: entryEdit.historicalHwmUsd ?? stock.historicalHWM,
             };
           }
 
@@ -1534,14 +1553,18 @@ export default function PortfolioScreen() {
             calibrationFactor,
             highestWatermark: newUsdPrice,
             internalTargetPct,
-            // PROTECTION STATE: historicalHWM came from Yahoo (the quote's
-            // 52-week high), so it moves to the new scale like the other
-            // Yahoo-derived prices above. purchasePrice is the broker's
-            // real fill price, so it does not change.
+            // PROTECTION STATE: a stored historicalHWM came from Yahoo (the
+            // quote's 52-week high), so it moves to the new scale like the
+            // other Yahoo-derived prices above. purchasePrice is the
+            // broker's real fill price, so it does not change. Values typed
+            // into "Edit Entry Data" in this same save are real broker
+            // prices too, and are used as entered.
+            purchasePrice: entryEdit.purchasePriceUsd ?? stock.purchasePrice,
             historicalHWM:
-              stock.historicalHWM === null
+              entryEdit.historicalHwmUsd ??
+              (stock.historicalHWM === null
                 ? null
-                : applyCalibration(stripCalibration(stock.historicalHWM, existingFactor), calibrationFactor),
+                : applyCalibration(stripCalibration(stock.historicalHWM, existingFactor), calibrationFactor)),
           };
         }),
       );
@@ -2529,7 +2552,13 @@ type PortfolioStockRowProps = {
   // TRADE RECONCILIATION: opens Execute Sell. Receives the whole position,
   // not just its ticker: the sale needs its units, currency and price.
   onSell: (stock: PortfolioStock) => void;
-  onSaveEdit: (ticker: string, assetType: AssetType, totalValueInput: string, internalTargetInput: string) => void;
+  onSaveEdit: (
+    ticker: string,
+    assetType: AssetType,
+    totalValueInput: string,
+    internalTargetInput: string,
+    entryEdit: EntryDataEdit,
+  ) => void;
   colors: PipelineColorScheme;
   styles: PortfolioStyles;
   language: Language;
@@ -2577,6 +2606,13 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // CORE LAYER INTERNAL ALLOCATION: same "starts blank, means leave
   // unchanged" pattern as totalValueText above.
   const [internalTargetText, setInternalTargetText] = useState('');
+  // LEGACY ENTRY DATA: purchase price and historical HWM, typed the way the
+  // broker shows them (Agorot for ".TA", otherwise the instrument's
+  // currency). Same "blank means leave unchanged" pattern as above. The
+  // section opens by itself for a position that is missing either value.
+  const [isEntryEditorOpen, setIsEntryEditorOpen] = useState(false);
+  const [purchasePriceText, setPurchasePriceText] = useState('');
+  const [historicalHwmText, setHistoricalHwmText] = useState('');
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
   // `units` is a Nominal Value quantity — 100 nominal units = 1 real
@@ -2643,15 +2679,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
   // GAP 4: STRUCTURAL BREAKDOWN (Satellite only — Core is a long-term index
   // hold that deliberately ignores SMA200 crosses and deep pullbacks; see
-  // isStructuralBreakdownLayer): Macro Trend Bearish or a pullback at/below
-  // the -7% crash limit means the trend itself has failed, not a normal
-  // pullback (see @/utils/structural-breakdown). It replaces this row's
-  // mild warnings (the stop line's ⚠ prefix) with one unmistakable
-  // liquidation banner. Never on a stale/unavailable price.
+  // isStructuralBreakdownLayer): a pullback at/below -11.50% (depth only;
+  // Macro Trend plays no part for a held position — see
+  // @/utils/structural-breakdown). It replaces this row's mild warnings
+  // (the stop line's ⚠ prefix) with one unmistakable liquidation banner.
+  // Never on a stale/unavailable price.
   const isBreakdown =
     !isPriceUnavailable &&
     isStructuralBreakdownLayer(stock.category) &&
-    isStructuralBreakdown({ macroTrend: stock.macroTrend, pullbackDepth: stock.pullbackDepth });
+    isStructuralBreakdown({ pullbackDepth: stock.pullbackDepth });
 
   // SATELLITE CARD FIX (HWM vs. Drawdown): the card used to show
   // stock.drawdownPct here (distance from the 52-WEEK HIGH) under a "Drop"
@@ -2710,11 +2746,52 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     setEditedAssetType(stock.assetType);
     setTotalValueText('');
     setInternalTargetText('');
+    setPurchasePriceText('');
+    setHistoricalHwmText('');
+    setIsEntryEditorOpen(stock.purchasePrice === null || stock.historicalHWM === null);
     setIsEditing(true);
   };
 
+  // LEGACY ENTRY DATA: the unit the two fields are typed in, and their
+  // current values in that unit (shown as placeholders), via the same
+  // live-rate conversion the rest of the app uses.
+  const entryUnit = isTaseTicker(stock.ticker) ? t('ag') : stock.currencySymbol;
+  const formatEntryValue = (usdValue: number | null): string => {
+    if (usdValue === null) {
+      return '—';
+    }
+    const localValue = usdToLocalPrice(usdValue, stock, usdIlsRate);
+    return localValue === null
+      ? `$${usdValue.toFixed(2)}`
+      : formatUnitPrice(stock.ticker, localValue, stock.currencySymbol, t('ag'));
+  };
+
+  // Parses one entry field: blank -> unchanged (null), a positive number ->
+  // its USD value, anything else -> 'invalid'.
+  const parseEntryField = (text: string): number | null | 'invalid' => {
+    const trimmed = text.trim().replace(/,/g, '');
+    if (trimmed === '') {
+      return null;
+    }
+    const value = Number(trimmed);
+    if (!Number.isFinite(value) || value <= 0) {
+      return 'invalid';
+    }
+    return brokerQuoteToUsd(value, stock, usdIlsRate) ?? 'invalid';
+  };
+
   const handleSaveEdit = () => {
-    onSaveEdit(stock.ticker, editedAssetType, totalValueText, internalTargetText);
+    const purchasePriceUsd = parseEntryField(purchasePriceText);
+    const historicalHwmUsd = parseEntryField(historicalHwmText);
+    if (purchasePriceUsd === 'invalid' || historicalHwmUsd === 'invalid') {
+      // Stays in edit mode so nothing typed is lost.
+      Alert.alert(t('invalidEntryDataTitle'), t('invalidEntryDataMessage', { unit: entryUnit }));
+      return;
+    }
+    onSaveEdit(stock.ticker, editedAssetType, totalValueText, internalTargetText, {
+      purchasePriceUsd,
+      historicalHwmUsd,
+    });
     setIsEditing(false);
   };
 
@@ -2820,6 +2897,55 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               <Text style={styles.editAssetTypeButtonText}>{assetTypeLabel(t, 'ETF')}</Text>
             </TouchableOpacity>
           </View>
+
+          {/* LEGACY ENTRY DATA: lets a position opened before trade logging
+              get the purchasePrice/historicalHWM the Protection State
+              Tracker needs to tell Recovery State from Automated Tracking
+              (see @/utils/protectionState). Also usable to correct either
+              value later. Blank fields keep the stored value. */}
+          <TouchableOpacity
+            style={styles.entryToggle}
+            onPress={() => setIsEntryEditorOpen((previous) => !previous)}
+            accessibilityRole="button"
+            accessibilityState={{ expanded: isEntryEditorOpen }}>
+            <Ionicons
+              name={isEntryEditorOpen ? 'chevron-up' : 'chevron-down'}
+              size={14}
+              color={colors.textSecondary}
+            />
+            <Text style={styles.entryToggleText}>{t('editEntryData')}</Text>
+          </TouchableOpacity>
+          {isEntryEditorOpen && (
+            <View style={styles.entryEditor}>
+              <Text style={styles.entryHint}>{t('entryDataHint', { unit: entryUnit })}</Text>
+              <TextInput
+                style={[styles.unitsEditInput, styles.totalValueEditInput]}
+                value={purchasePriceText}
+                onChangeText={setPurchasePriceText}
+                placeholder={t('purchasePriceInput', {
+                  unit: entryUnit,
+                  current: formatEntryValue(stock.purchasePrice),
+                })}
+                placeholderTextColor={colors.textSecondary}
+                keyboardType="decimal-pad"
+                maxLength={15}
+                onSubmitEditing={handleSaveEdit}
+              />
+              <TextInput
+                style={[styles.unitsEditInput, styles.totalValueEditInput]}
+                value={historicalHwmText}
+                onChangeText={setHistoricalHwmText}
+                placeholder={t('historicalHwmInput', {
+                  unit: entryUnit,
+                  current: formatEntryValue(stock.historicalHWM),
+                })}
+                placeholderTextColor={colors.textSecondary}
+                keyboardType="decimal-pad"
+                maxLength={15}
+                onSubmitEditing={handleSaveEdit}
+              />
+            </View>
+          )}
         </View>
       ) : (
         <View style={styles.stockBottomRow}>
@@ -2929,6 +3055,11 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
           {/* PROTECTION STATE: the two entry anchors captured by Execute
               Trade (absent for positions opened before trade logging). */}
+          {/* LEGACY ENTRY DATA: without both anchors the position can only
+              be in Automated Tracking; point the user at the fix. */}
+          {(stock.purchasePrice === null || stock.historicalHWM === null) && (
+            <Text style={styles.entryMissingText}>{t('entryDataMissingHint')}</Text>
+          )}
           {stock.purchasePrice !== null && (
             <Text style={styles.macroContextText}>
               {t('purchasePriceLabel')}: ${stock.purchasePrice.toFixed(2)}
@@ -3630,6 +3761,38 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   editAssetTypeRow: {
     flexDirection: 'row',
     gap: 8,
+  },
+  // LEGACY ENTRY DATA: the collapsible "Edit Entry Data" section of the
+  // inline edit form.
+  entryToggle: {
+    flexDirection: isHebrew ? 'row-reverse' : 'row',
+    alignItems: 'center',
+    gap: 4,
+    alignSelf: isHebrew ? 'flex-end' : 'flex-start',
+    paddingVertical: 2,
+  },
+  entryToggleText: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    fontWeight: '700',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  entryEditor: {
+    gap: 6,
+  },
+  entryHint: {
+    color: colors.textSecondary,
+    fontSize: 11,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  entryMissingText: {
+    color: colors.warning,
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 6,
+    textAlign: isHebrew ? 'right' : 'left',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   editAssetTypeButton: {
     borderWidth: 1.5,
