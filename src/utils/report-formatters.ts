@@ -2,7 +2,7 @@ import type { AmbushAsset } from '@/types/ambush';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import type { PortfolioStock } from '@/types/portfolio';
 import type { AllocationBreakdown } from '@/utils/allocation';
-import { getEffectiveUnits } from '@/utils/currency';
+import { positionUsdValue, usdUnitPrice } from '@/utils/fx';
 import { formatUsd } from '@/utils/trade-execution';
 
 // Shared by the Ambush Radar screen's own export and the Portfolio screen's
@@ -59,7 +59,9 @@ const PORTFOLIO_SECTIONS: { category: PortfolioStock['category']; title: string 
   { category: 'Quality', title: 'QUALITY (10%)' },
 ];
 
-export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
+// GAP 3: `usdIlsRate` is the live USD/ILS rate; Israeli positions are
+// valued with it (see positionUsdValue), exactly as on screen.
+export function formatPortfolioLines(stocks: PortfolioStock[], usdIlsRate: number | null): string[] {
   const lines: string[] = [];
 
   PORTFOLIO_SECTIONS.forEach(({ category, title }, index) => {
@@ -83,12 +85,16 @@ export function formatPortfolioLines(stocks: PortfolioStock[]): string[] {
         // total in PortfolioStockRow (index.tsx). The report still displays
         // the RAW units held (what the user actually entered), only the
         // computed total value uses the effective (real) unit count.
-        const effectiveUnits = getEffectiveUnits(stock.ticker, stock.assetType, stock.units);
-        const totalValue = effectiveUnits * stock.price;
+        // GAP 3: the USD unit price and total come from the same explicit
+        // FX conversion the screen uses. Four decimals on the unit price,
+        // so a sub-dollar fund unit isn't shown rounded to $1.00.
+        const unitPriceUsd = usdUnitPrice(stock, usdIlsRate);
+        const totalValue = positionUsdValue(stock, usdIlsRate);
+        const unitPriceText = unitPriceUsd < 10 ? unitPriceUsd.toFixed(4) : unitPriceUsd.toFixed(2);
         // TRADE RECONCILIATION: the recorded execution cost, when known.
         const costSuffix = stock.costBasisUsd === null ? '' : ` | cost basis ${formatUsd(stock.costBasisUsd)}`;
         lines.push(
-          `  ${stock.ticker}: ${stock.units} units @ $${stock.price.toFixed(2)} = $${totalValue.toFixed(2)}${costSuffix}`,
+          `  ${stock.ticker}: ${stock.units} units @ $${unitPriceText} = $${totalValue.toFixed(2)}${costSuffix}`,
         );
         if (stock.anomalyReport) {
           lines.push(`    ${stock.anomalyReport}`);

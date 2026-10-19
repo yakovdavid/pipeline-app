@@ -204,6 +204,8 @@ export type TranslationKey =
   | 'unitsHeld'
   | 'sellAll'
   | 'cannotPriceTradeTitle'
+  | 'structuralBreakdownBanner'
+  | 'fxRateCaption'
   | 'stopLockedAt'
   | 'purchasePriceLabel'
   | 'historicalHwmLabel'
@@ -401,6 +403,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     unitsHeld: 'יחידות מוחזקות: {{units}}',
     sellAll: 'מכור הכל',
     cannotPriceTradeTitle: 'לא ניתן לתמחר את העסקה',
+    structuralBreakdownBanner: 'שבירה מבנית - נדרש מימוש',
+    fxRateCaption: 'שער דולר/שקל: {{rate}}',
     stopLockedAt: 'סטופ נעול (מחיר כניסה -12%)',
     purchasePriceLabel: 'מחיר כניסה',
     historicalHwmLabel: 'שיא היסטורי (שיא 52 שבועות בכניסה)',
@@ -591,6 +595,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     unitsHeld: 'Units held: {{units}}',
     sellAll: 'Sell All',
     cannotPriceTradeTitle: 'Cannot Price Trade',
+    structuralBreakdownBanner: 'STRUCTURAL BREAKDOWN - LIQUIDATION REQUIRED',
+    fxRateCaption: 'USD/ILS: {{rate}}',
     stopLockedAt: 'Locked stop (entry -12%)',
     purchasePriceLabel: 'Entry price',
     historicalHwmLabel: 'Historical HWM (52-week high at entry)',

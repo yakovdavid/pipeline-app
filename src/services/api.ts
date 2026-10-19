@@ -479,3 +479,33 @@ export async function searchTickers(query: string): Promise<TickerSearchResult[]
     return [];
   }
 }
+
+// GAP 3 (explicit FX): the live USD/ILS rate from GET /api/fx/usd-ils — the
+// same rate the backend uses to convert Israeli quotes (one shared cache,
+// see backend/fx.py). rate = shekels per one US dollar; lastUpdated = when
+// the backend fetched it (ISO-8601). Throws on any failure or a malformed
+// payload; the caller keeps its previous rate.
+export type UsdIlsRate = {
+  rate: number;
+  lastUpdated: string;
+};
+
+export async function fetchUsdIlsRate(): Promise<UsdIlsRate> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/fx/usd-ils`);
+  } catch {
+    throw new Error(`Could not reach the Pipeline API at ${API_BASE_URL}.`);
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to fetch the USD/ILS rate: HTTP ${response.status}.`);
+  }
+  const data = (await response.json()) as { rate?: unknown; last_updated?: unknown };
+  if (typeof data.rate !== 'number' || !Number.isFinite(data.rate) || data.rate <= 0) {
+    throw new Error('Received a malformed USD/ILS rate.');
+  }
+  return {
+    rate: data.rate,
+    lastUpdated: typeof data.last_updated === 'string' ? data.last_updated : new Date().toISOString(),
+  };
+}

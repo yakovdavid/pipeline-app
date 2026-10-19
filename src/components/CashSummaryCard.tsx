@@ -15,6 +15,8 @@ export type CashSummaryCardProps = {
   // False until the saved balance has been read; the button is disabled
   // and the balance shows a dash rather than a misleading $0.00.
   isCashLoaded: boolean;
+  // GAP 3: the live USD/ILS rate (null until fetched).
+  usdIlsRate: number | null;
   onAdjustCash: () => void;
 };
 
@@ -44,6 +46,7 @@ export const CashSummaryCard = memo(function CashSummaryCard({
   cashBalance,
   allocation,
   isCashLoaded,
+  usdIlsRate,
   onAdjustCash,
 }: CashSummaryCardProps) {
   const { colors } = usePipelineTheme();
@@ -76,6 +79,10 @@ export const CashSummaryCard = memo(function CashSummaryCard({
       <Text style={styles.caption}>
         {t('totalWithCash')}: <Text style={styles.total}>{formatUsd(allocation.totalValue)}</Text>
       </Text>
+      {/* GAP 3: the live rate every Israeli position is valued with. */}
+      {usdIlsRate !== null && (
+        <Text style={styles.caption}>{t('fxRateCaption', { rate: usdIlsRate.toFixed(4) })}</Text>
+      )}
 
       <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>
       <View style={styles.weightsRow}>

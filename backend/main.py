@@ -168,6 +168,20 @@ MAX_SEARCH_RESULTS = 6
 TASE_TICKER_SUFFIX = ".TA"
 AGOROT_PER_SHEKEL = 100
 
+# PRICE PRECISION: every price in a /api/stock response (USD price, local
+# price, SMAs, 52-week high, watermark, trailing stop) carries 4 decimal
+# places, not 2. Rounding a USD price to cents is a real distortion for
+# low-priced units: an Israeli fund unit at 3.08 ILS is $0.9935 at 3.10
+# ILS/USD, and as $1.00 it overstated every position in it by 0.65%, and
+# put its stop levels on a different basis than its own history.
+# Percentages (drawdown_pct, pullback_depth) stay at 2 decimals on purpose:
+# the frontend's crash rule compares the 2-decimal value it displays.
+PRICE_DECIMALS = 4
+
+
+def _round_price(value: float) -> float:
+    return round(float(value), PRICE_DECIMALS)
+
 # --- Multi-Currency engine -----------------------------------------------
 # Every price-like field this file returns (price, sma50, sma200, high_52)
 # gets normalized into USD. ".TA"-suffixed symbols are always treated as
@@ -1579,7 +1593,7 @@ def _with_request_scoped_fields(
     assert isinstance(current_price, (int, float))  # always set by get_stock
 
     updated_high_water_mark = _update_high_water_mark(high_water_mark, float(current_price))
-    result["high_water_mark"] = round(updated_high_water_mark, 2)
+    result["high_water_mark"] = _round_price(updated_high_water_mark)
 
     # TRAILING STOP DEFENSE CONSTRAINTS: a hardcoded architectural block —
     # Core/Quality get None here UNCONDITIONALLY, never a computed price,
@@ -1589,7 +1603,7 @@ def _with_request_scoped_fields(
     # "Hardcode a block preventing this from ever showing or calculating
     # for 'Core' or 'Quality' assets" requirement.
     result["trailing_stop_price"] = (
-        round(updated_high_water_mark * (1 - SATELLITE_TRAILING_STOP_PCT), 2)
+        _round_price(updated_high_water_mark * (1 - SATELLITE_TRAILING_STOP_PCT))
         if normalized_category == "Satellite"
         else None
     )
@@ -1741,7 +1755,7 @@ def get_stock(
     else:
         drawdown_pct = None
 
-    high_52_rounded = round(float(high_52), 2) if high_52 is not None else None
+    high_52_rounded = _round_price(high_52) if high_52 is not None else None
 
     # PULLBACK DEPTH CALCULATION: how far price sits below (or above) its
     # own SMA50, as a percentage — the continuous, graduated sibling of
@@ -1786,18 +1800,22 @@ def get_stock(
         # JSON EXPORT: normalized USD price — this MUST stay the portfolio-
         # math value (allocation totals, drawdown, trailing stops, ...), so
         # the frontend never has to know or care what currency a given
-        # instrument actually trades in.
-        "price": round(float(price), 2),
+        # instrument actually trades in. PRICE PRECISION: 4 decimals, see
+        # PRICE_DECIMALS.
+        "price": _round_price(price),
         # The instrument's own actual local-currency value (e.g. 13.48),
-        # for display alongside currency_symbol — never used in math.
-        "local_price": round(float(local_price), 2),
+        # shown alongside currency_symbol. Also 4 decimals: the frontend
+        # values Israeli positions as local_price / the live USD/ILS rate
+        # (GAP 3 in src/utils/fx.ts), so its precision matters as much as
+        # price's.
+        "local_price": _round_price(local_price),
         "currency_symbol": currency_symbol,
         # Named with the same snake_case + underscore convention as every
         # other multi-word key in this response (local_price, high_52,
         # drawdown_pct) — for BOTH Portfolio and Ambush Radar callers alike,
         # since both hit this same endpoint.
-        "sma_50": round(float(sma50), 2) if sma50 is not None else None,
-        "sma_200": round(float(sma200), 2) if sma200 is not None else None,
+        "sma_50": _round_price(sma50) if sma50 is not None else None,
+        "sma_200": _round_price(sma200) if sma200 is not None else None,
         "high_52": high_52_rounded,
         "drawdown_pct": drawdown_pct,
         # PULLBACK DEPTH CALCULATION: see its own comment above.

@@ -44,6 +44,7 @@ import {
   fetchInChunks,
   fetchIntel,
   fetchPortfolioQuote,
+  fetchUsdIlsRate,
   liquidatePortfolioAsset,
   type IntelBatchResponse,
   type StockQuote,
@@ -82,8 +83,10 @@ import {
 import { formatAmbushLines, formatCashLines, formatPortfolioLines } from '@/utils/report-formatters';
 import { buildPortfolioStock, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
 import { getLayerWeights, publishLayerWeights } from '@/utils/layer-weights-store';
+import { positionUsdValue, usdPerLocalForTrade } from '@/utils/fx';
 import { applySale } from '@/utils/position-ledger';
 import { computeProtectionState, resolveHistoricalHWM, type ProtectionState } from '@/utils/protectionState';
+import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
 import { normalizeTickerInput } from '@/utils/ticker';
 import {
   computeSaleProceeds,
@@ -95,7 +98,6 @@ import {
   formatUsd,
   isFullSale,
   roundToCents,
-  usdPerLocalFromQuote,
   type TradeInputs,
 } from '@/utils/trade-execution';
 
@@ -302,11 +304,12 @@ function computeSatelliteProtection(stock: PortfolioStock): ProtectionState | nu
 // Nominal Value / Erech Nakuv ÷100 conversion (see @/utils/currency) —
 // without it, a TASE ETF's raw nominal `units` would be multiplied
 // straight through, inflating this total ~100x.
-function computeLayerTotalValue(categoryStocks: PortfolioStock[]): number {
-  return categoryStocks.reduce(
-    (sum, stock) => sum + getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price,
-    0,
-  );
+//
+// GAP 3 (explicit FX): an Israeli position's USD value is computed from its
+// Shekel price and the live USD/ILS rate (positionUsdValue in @/utils/fx),
+// not from the API's cent-rounded pre-converted price.
+function computeLayerTotalValue(categoryStocks: PortfolioStock[], usdIlsRate: number | null): number {
+  return categoryStocks.reduce((sum, stock) => sum + positionUsdValue(stock, usdIlsRate), 0);
 }
 
 // ALLOCATION DENOMINATOR FIX: a layer's share of the WHOLE portfolio used
@@ -326,8 +329,8 @@ function computeLayerTotalValue(categoryStocks: PortfolioStock[]): number {
 // holdings are balanced against EACH OTHER. Returns 0 (not NaN/Infinity)
 // when the layer is empty/worthless, matching computeAllocation's own
 // zero-division guard.
-function computeInternalWeightPct(stock: PortfolioStock, layerTotalValue: number): number {
-  const stockValue = getEffectiveUnits(stock.ticker, stock.assetType, stock.units) * stock.price;
+function computeInternalWeightPct(stock: PortfolioStock, layerTotalValue: number, usdIlsRate: number | null): number {
+  const stockValue = positionUsdValue(stock, usdIlsRate);
   return layerTotalValue > 0 ? (stockValue / layerTotalValue) * 100 : 0;
 }
 
@@ -571,6 +574,32 @@ export default function PortfolioScreen() {
     Promise.resolve().then(loadCash);
   }, [loadCash]);
 
+  // GAP 3 (explicit FX): the live USD/ILS rate (GET /api/fx/usd-ils), used
+  // to value every Israeli position and to price Israeli trades. Fetched on
+  // mount, on every pull-to-refresh and when the app returns to the
+  // foreground. A failed fetch keeps the previous rate; with none at all,
+  // valuation falls back to the API's own USD price (see @/utils/fx). The
+  // ref gives trade handlers the current rate without a re-render.
+  const [usdIlsRate, setUsdIlsRate] = useState<number | null>(null);
+  const usdIlsRateRef = useRef<number | null>(null);
+
+  const loadFxRate = useCallback(async () => {
+    try {
+      const { rate } = await fetchUsdIlsRate();
+      if (!isMountedRef.current) {
+        return;
+      }
+      usdIlsRateRef.current = rate;
+      setUsdIlsRate(rate);
+    } catch (error) {
+      console.warn('[fx] Failed to fetch the USD/ILS rate; keeping the previous one.', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    Promise.resolve().then(loadFxRate);
+  }, [loadFxRate]);
+
   // Every cash change goes through here: state, refs and storage together.
   const applyCashBalance = useCallback((next: number) => {
     const rounded = roundToCents(next);
@@ -763,6 +792,8 @@ export default function PortfolioScreen() {
   // executing for that render).
   const onRefresh = async () => {
     setRefreshing(true);
+    // GAP 3: refresh the rate alongside the quotes (never blocks them).
+    loadFxRate();
     try {
       // Refreshes from the live `stocks` array (not just a plain ticker
       // string list) so each request can carry that position's own
@@ -861,6 +892,11 @@ export default function PortfolioScreen() {
     if (!isCashLoadedRef.current) {
       loadCash();
     }
+    // onRefresh refreshes the FX rate itself; a first load that never got
+    // that far fetches it here.
+    if (!canPersistRef.current) {
+      loadFxRate();
+    }
   });
 
   // CACHE INTEGRITY: keep AsyncStorage in sync with the current portfolio
@@ -907,7 +943,15 @@ export default function PortfolioScreen() {
     // SSOT: a Quality position's Z-Score, ROIC and Moat come from
     // /api/quality (see fetchPortfolioQuote); nothing is entered by hand.
     const quote = await fetchPortfolioQuote(start.ticker, category);
-    const usdPerLocal = usdPerLocalFromQuote(quote.price, quote.localPrice);
+    // GAP 3: an Israeli trade is priced with the live rate (the same one
+    // its valuation uses), not a rate inferred from the quote.
+    const usdPerLocal = usdPerLocalForTrade(
+      start.ticker,
+      quote.currencySymbol,
+      quote.price,
+      quote.localPrice,
+      usdIlsRateRef.current,
+    );
     if (usdPerLocal === null) {
       Alert.alert(t('cannotAddTickerTitle'), t('tradeQuoteMissingMessage', { ticker: start.ticker }));
       return false;
@@ -1276,13 +1320,30 @@ export default function PortfolioScreen() {
         Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
         return;
       }
-      let usdPerLocal = stock.priceStatus === 'live' ? usdPerLocalFromQuote(stock.price, stock.localPrice) : null;
+      // GAP 3: priced with the live rate for an Israeli position (see
+      // usdPerLocalForTrade), else the quote's own ratio.
+      let usdPerLocal =
+        stock.priceStatus === 'live'
+          ? usdPerLocalForTrade(
+              stock.ticker,
+              stock.currencySymbol,
+              stock.price,
+              stock.localPrice,
+              usdIlsRateRef.current,
+            )
+          : null;
       let currencySymbol = stock.currencySymbol;
       let displayLocalPrice = stock.localPrice;
       if (usdPerLocal === null) {
         try {
           const quote = await fetchPortfolioQuote(stock.ticker, stock.category);
-          usdPerLocal = usdPerLocalFromQuote(quote.price, quote.localPrice);
+          usdPerLocal = usdPerLocalForTrade(
+            stock.ticker,
+            quote.currencySymbol,
+            quote.price,
+            quote.localPrice,
+            usdIlsRateRef.current,
+          );
           currencySymbol = quote.currencySymbol;
           displayLocalPrice = applyCalibration(quote.localPrice, stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR);
         } catch (error) {
@@ -1494,6 +1555,7 @@ export default function PortfolioScreen() {
         stock={item}
         accentColor={section.accentColor}
         layerTotalValue={section.layerTotalValue}
+        usdIlsRate={usdIlsRate}
         onSell={handleSellTicker}
         onSaveEdit={handleSaveEdit}
         colors={colors}
@@ -1502,7 +1564,7 @@ export default function PortfolioScreen() {
         t={t}
       />
     ),
-    [handleSellTicker, handleSaveEdit, colors, styles, language, t],
+    [handleSellTicker, handleSaveEdit, usdIlsRate, colors, styles, language, t],
   );
 
   const handleCopyPortfolioData = async () => {
@@ -1510,7 +1572,7 @@ export default function PortfolioScreen() {
     const report = [
       `Pipeline Portfolio Report — ${timestamp}`,
       '',
-      ...formatPortfolioLines(stocks),
+      ...formatPortfolioLines(stocks, usdIlsRate),
       '',
       ...formatCashLines(cashBalance, allocation),
     ].join('\n');
@@ -1545,7 +1607,7 @@ export default function PortfolioScreen() {
         `Pipeline Full Data Export — ${timestamp}`,
         '',
         '=== PORTFOLIO ===',
-        ...formatPortfolioLines(stocks),
+        ...formatPortfolioLines(stocks, usdIlsRate),
         '',
         ...formatCashLines(cashBalance, allocation),
         '',
@@ -1746,9 +1808,9 @@ export default function PortfolioScreen() {
   // layer (see computeInternalWeightPct in PortfolioStockRow) instead of
   // every Core card showing this same coreWeightPct (the layer's share of
   // the WHOLE portfolio) like the old bug did.
-  const coreLayerTotalValue = computeLayerTotalValue(coreStocks);
-  const satelliteLayerTotalValue = computeLayerTotalValue(satelliteStocks);
-  const qualityLayerTotalValue = computeLayerTotalValue(qualityStocks);
+  const coreLayerTotalValue = computeLayerTotalValue(coreStocks, usdIlsRate);
+  const satelliteLayerTotalValue = computeLayerTotalValue(satelliteStocks, usdIlsRate);
+  const qualityLayerTotalValue = computeLayerTotalValue(qualityStocks, usdIlsRate);
   const allocation = computeAllocation({
     Core: coreLayerTotalValue,
     Satellite: satelliteLayerTotalValue,
@@ -1889,6 +1951,7 @@ export default function PortfolioScreen() {
         cashBalance={cashBalance}
         allocation={allocation}
         isCashLoaded={isCashLoaded}
+        usdIlsRate={usdIlsRate}
         onAdjustCash={handleOpenAdjustCash}
       />
 
@@ -2460,6 +2523,9 @@ type PortfolioStockRowProps = {
   // itself lives on PortfolioListSection still, for the section HEADER,
   // which legitimately does want the layer's whole-portfolio share.
   layerTotalValue: number;
+  // GAP 3: the live USD/ILS rate, for this row's own USD value (the
+  // internal-weight numerator must use the same FX as layerTotalValue).
+  usdIlsRate: number | null;
   // TRADE RECONCILIATION: opens Execute Sell. Receives the whole position,
   // not just its ticker: the sale needs its units, currency and price.
   onSell: (stock: PortfolioStock) => void;
@@ -2490,6 +2556,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   stock,
   accentColor,
   layerTotalValue,
+  usdIlsRate,
   onSell,
   onSaveEdit,
   colors,
@@ -2538,7 +2605,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // Computed for every category (harmless — same reasoning as
   // highestWatermark being tracked regardless of category), but only
   // actually rendered for Core today (see the JSX below).
-  const internalWeightPct = computeInternalWeightPct(stock, layerTotalValue);
+  const internalWeightPct = computeInternalWeightPct(stock, layerTotalValue, usdIlsRate);
 
   // TASE AGOROT DISPLAY: the UNIT price, Agorot-formatted for a ".TA"
   // ticker (e.g. "3985 אג'") — the position TOTAL above/below always stays
@@ -2573,6 +2640,18 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // it's still safely above it — see trailingStopPriceColor at the JSX
   // call site.
   const isTrailingStopTriggered = trailingStopPrice !== null && stock.price <= trailingStopPrice;
+
+  // GAP 4: STRUCTURAL BREAKDOWN (Satellite only — Core is a long-term index
+  // hold that deliberately ignores SMA200 crosses and deep pullbacks; see
+  // isStructuralBreakdownLayer): Macro Trend Bearish or a pullback at/below
+  // the -7% crash limit means the trend itself has failed, not a normal
+  // pullback (see @/utils/structural-breakdown). It replaces this row's
+  // mild warnings (the stop line's ⚠ prefix) with one unmistakable
+  // liquidation banner. Never on a stale/unavailable price.
+  const isBreakdown =
+    !isPriceUnavailable &&
+    isStructuralBreakdownLayer(stock.category) &&
+    isStructuralBreakdown({ macroTrend: stock.macroTrend, pullbackDepth: stock.pullbackDepth });
 
   // SATELLITE CARD FIX (HWM vs. Drawdown): the card used to show
   // stock.drawdownPct here (distance from the 52-WEEK HIGH) under a "Drop"
@@ -2640,7 +2719,17 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   };
 
   return (
-    <View style={styles.stockCard}>
+    <View style={[styles.stockCard, isBreakdown && styles.stockCardBreakdown]}>
+      {/* GAP 4: the liquidation directive, above everything else on the
+          card. Solid red with white bold text and a red card border, so it
+          can't be mistaken for a mild warning or the radar's Invalidated
+          state. Hidden while editing, like the other live signals. */}
+      {isBreakdown && !isEditing && (
+        <View style={styles.breakdownBanner} accessibilityRole="alert">
+          <Ionicons name="alert-circle" size={18} color="#FFFFFF" />
+          <Text style={styles.breakdownBannerText}>{`[${t('structuralBreakdownBanner')}]`}</Text>
+        </View>
+      )}
       <View style={styles.stockTopRow}>
         <Text style={styles.stockTicker}>{stock.ticker}</Text>
         <View style={styles.stockTopRight}>
@@ -2864,7 +2953,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 styles.trailingStopText,
                 isTrailingStopTriggered ? styles.trailingStopBearishText : styles.trailingStopBullishText,
               ]}>
-              {isTrailingStopTriggered ? '⚠ ' : ''}
+              {isTrailingStopTriggered && !isBreakdown ? '⚠ ' : ''}
               {t(protection.isRecoveryState ? 'stopLockedAt' : 'trailingStopActivatedAt')}: $
               {trailingStopPrice.toFixed(2)}
             </Text>
@@ -3393,6 +3482,36 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '700',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  // GAP 4: STRUCTURAL BREAKDOWN. A full-bleed strip across the top of the
+  // card (negative margins cancel stockCard's padding) plus a thick red
+  // border: deliberately louder than every other state on the card.
+  stockCardBreakdown: {
+    borderWidth: 2,
+    borderColor: colors.bearish,
+  },
+  breakdownBanner: {
+    flexDirection: isHebrew ? 'row-reverse' : 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: colors.bearish,
+    marginHorizontal: -16,
+    marginTop: -12,
+    marginBottom: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderTopLeftRadius: 10,
+    borderTopRightRadius: 10,
+  },
+  breakdownBannerText: {
+    flexShrink: 1,
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '900',
+    letterSpacing: 0.3,
+    textTransform: 'uppercase',
+    textAlign: isHebrew ? 'right' : 'left',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   // TRADE RECONCILIATION: the row's Sell button (replaced the ✕ delete).
