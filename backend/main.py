@@ -76,6 +76,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from fx import USD_ILS_SYMBOL, FxRateUnavailableError, UsdIlsRateProvider, create_fx_router
 from quality import create_quality_router
 
 # yfinance itself prefers curl_cffi (TLS/JA3 fingerprint impersonation) over
@@ -165,7 +166,6 @@ MAX_SEARCH_RESULTS = 6
 # roughly 100x. The fix: ANY symbol ending in TASE_TICKER_SUFFIX is always
 # treated as Agorot-quoted, regardless of what Yahoo's currency field says.
 TASE_TICKER_SUFFIX = ".TA"
-USD_ILS_FX_SYMBOL = "ILS=X"
 AGOROT_PER_SHEKEL = 100
 
 # --- Multi-Currency engine -----------------------------------------------
@@ -578,7 +578,9 @@ def fetch_with_retry(
     raise last_error
 
 
-# --- Short-lived in-memory cache (formatted responses / FX / news) ------
+# --- Short-lived in-memory cache (formatted responses / news) -----------
+# (The USD/ILS rate has its own 60-minute cache in fx.py, shared with
+# GET /api/fx/usd-ils; see usd_ils_rate_provider below.)
 CACHE_TTL_SECONDS = 900.0  # 15 minutes — aligned with TICKER_CACHE below.
 
 
@@ -605,7 +607,6 @@ class TTLCache:
 
 
 stock_cache = TTLCache(CACHE_TTL_SECONDS)
-fx_rate_cache = TTLCache(CACHE_TTL_SECONDS)
 intel_cache = TTLCache(CACHE_TTL_SECONDS)
 
 
@@ -705,6 +706,26 @@ app.add_middleware(
 # a circular import. The client is None until SUPABASE_URL/
 # SUPABASE_SERVICE_KEY are set, in which case quality.py caches in memory.
 app.include_router(create_quality_router(lambda: _supabase_client))
+
+
+def _fetch_usd_ils_from_yahoo() -> float | None:
+    """One raw USD/ILS read for fx.py's provider: fast_info (not .info, which
+    pulls the full quoteSummary payload and is by far the most
+    rate-limit-prone endpoint yfinance exposes) through the shared
+    browser-impersonating session and retry/throttle layer. fx.py validates
+    the value and owns the caching and the stale fallback."""
+    fast_info = fetch_with_retry(
+        lambda: yf.Ticker(USD_ILS_SYMBOL, session=_yahoo_session).fast_info,
+        description="USD/ILS FX rate fetch",
+    )
+    return getattr(fast_info, "last_price", None)
+
+
+# FX: the single USD/ILS rate (60-minute cache, last-known-rate fallback),
+# served at GET /api/fx/usd-ils AND used by _fetch_usd_ils_rate to convert
+# every Israeli quote, so both always agree. See fx.py.
+usd_ils_rate_provider = UsdIlsRateProvider(_fetch_usd_ils_from_yahoo)
+app.include_router(create_fx_router(usd_ils_rate_provider))
 
 
 # PERFORMANCE OPTIMIZATION (ANTI-COLD-START): a deliberately trivial
@@ -1422,42 +1443,20 @@ def check_mean_reversion_anomaly(
 
 
 def _fetch_usd_ils_rate() -> float:
-    """Fetch the current USD/ILS exchange rate (shekels per one US dollar),
-    using the shared cache (15-minute TTL — see CACHE_TTL_SECONDS/
-    fx_rate_cache) and the shared retry/throttle layer.
+    """The current USD/ILS exchange rate (shekels per one US dollar), from
+    the shared provider in fx.py: the exact rate GET /api/fx/usd-ils
+    reports, cached for 60 minutes, with the last known rate served if a
+    refresh fails. Only ever called for ILS/Agorot-quoted instruments (see
+    _resolve_currency_converters) — a USD-quoted ticker, the overwhelming
+    majority, never triggers an FX lookup at all, cached or not.
 
-    Uses fast_info, not .info, for the same reason every other fetch in
-    this file does: .info pulls the full quoteSummary payload and is by far
-    the most rate-limit-prone endpoint yfinance exposes, whereas fast_info
-    is much lighter. Only ever called for ILS/Agorot-quoted instruments
-    (see _resolve_currency_converters) — a USD-quoted ticker, the
-    overwhelming majority, never triggers this fetch at all, cached or not.
+    Raises 502 only when no rate has ever been fetched: an Israeli quote
+    can't be converted to USD without one.
     """
-    cached_rate = fx_rate_cache.get(USD_ILS_FX_SYMBOL)
-    if cached_rate is not None:
-        return cached_rate
-
     try:
-        fast_info = fetch_with_retry(
-            lambda: yf.Ticker(USD_ILS_FX_SYMBOL, session=_yahoo_session).fast_info,
-            description="USD/ILS FX rate fetch",
-        )
-    except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch the USD/ILS exchange rate: {error}",
-        ) from error
-
-    raw_rate = getattr(fast_info, "last_price", None)
-    if not raw_rate or raw_rate <= 0:
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to fetch a valid USD/ILS exchange rate.",
-        )
-
-    fx_rate = float(raw_rate)
-    fx_rate_cache.set(USD_ILS_FX_SYMBOL, fx_rate)
-    return fx_rate
+        return usd_ils_rate_provider.get_rate().rate
+    except FxRateUnavailableError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from None
 
 
 def _resolve_currency_converters(
