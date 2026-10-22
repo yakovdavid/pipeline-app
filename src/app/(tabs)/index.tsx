@@ -81,7 +81,7 @@ import {
   takePendingPortfolioBuy,
   type PortfolioBuyRequest,
 } from '@/utils/portfolio-buy-handoff';
-import { formatAmbushLines, formatCashLines, formatPortfolioLines } from '@/utils/report-formatters';
+import { formatAmbushLines, formatPortfolioLines, formatSnapshotHeader } from '@/utils/report-formatters';
 import { buildPortfolioStock, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
 import { getLayerWeights, publishLayerWeights } from '@/utils/layer-weights-store';
 import { brokerQuoteToUsd, positionUsdValue, usdPerLocalForTrade, usdToLocalPrice } from '@/utils/fx';
@@ -992,6 +992,50 @@ export default function PortfolioScreen() {
     return true;
   };
 
+  // PORTFOLIO "BUY MORE": the row's Buy button tops up that position
+  // through the same startTrade path Add Asset uses (startTrade sees the
+  // ticker is held and opens Execute Trade as a top-up, keeping the
+  // position's layer and asset type). startTrade is rebuilt every render,
+  // so the row gets a stable wrapper that calls the latest one through a
+  // ref (updated in an effect, never during render), which keeps
+  // PortfolioStockRow's memo() effective. The ticker being priced is kept
+  // in state so its button can show a spinner; one top-up at a time.
+  const startTradeRef = useRef(startTrade);
+  useEffect(() => {
+    startTradeRef.current = startTrade;
+  });
+  const [topUpPendingTicker, setTopUpPendingTicker] = useState<string | null>(null);
+  const isTopUpPendingRef = useRef(false);
+
+  const handleBuyMoreTicker = useCallback(
+    async (stock: PortfolioStock) => {
+      if (isTopUpPendingRef.current) {
+        return;
+      }
+      isTopUpPendingRef.current = true;
+      setTopUpPendingTicker(stock.ticker);
+      try {
+        await startTradeRef.current({
+          ticker: stock.ticker,
+          category: stock.category,
+          assetType: stock.assetType,
+          calibrationTotalValue: null,
+          internalTargetPct: null,
+          fromAmbushRadar: false,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : t('fetchFailedForTicker', { ticker: stock.ticker });
+        Alert.alert(t('cannotPriceTradeTitle'), message);
+      } finally {
+        isTopUpPendingRef.current = false;
+        if (isMountedRef.current) {
+          setTopUpPendingTicker(null);
+        }
+      }
+    },
+    [t],
+  );
+
   const handleAddTicker = async () => {
     const normalizedTicker = normalizeTickerInput(ticker);
     if (!normalizedTicker || isAdding) {
@@ -1468,8 +1512,20 @@ export default function PortfolioScreen() {
           // seed it from the current price if this position never had one.
           // DATA-LOSS FIX: an 'unavailable' row's price is only a placeholder
           // 0, so it never seeds a missing watermark.
-          const highestWatermark =
-            stock.highestWatermark ?? (stock.priceStatus === 'live' ? stock.price : null);
+          //
+          // LATCH RESET: saving Edit Entry Data restarts the watermark
+          // (activeHWM) at the current price. The watermark is the breakout
+          // latch in @/utils/protectionState: a peak recorded BEFORE the
+          // user entered the real entry data (e.g. while a legacy position
+          // was trailing without it) would otherwise count as an earlier
+          // breakout and keep the position in Automated Tracking even with
+          // the price below the newly entered historicalHWM. Restarting it
+          // means the price must reclaim historicalHWM from now on. With
+          // the price unavailable the watermark is cleared, and the next
+          // successful refresh seeds it.
+          const isEntryDataEdited = entryEdit.purchasePriceUsd !== null || entryEdit.historicalHwmUsd !== null;
+          const livePrice = stock.priceStatus === 'live' ? stock.price : null;
+          const highestWatermark = isEntryDataEdited ? livePrice : (stock.highestWatermark ?? livePrice);
 
           // CORE LAYER INTERNAL ALLOCATION: a BLANK field PRESERVES the
           // existing value — same "blank means leave it alone" reasoning as
@@ -1580,6 +1636,8 @@ export default function PortfolioScreen() {
         layerTotalValue={section.layerTotalValue}
         usdIlsRate={usdIlsRate}
         onSell={handleSellTicker}
+        onBuyMore={handleBuyMoreTicker}
+        isBuyMorePending={topUpPendingTicker === item.ticker}
         onSaveEdit={handleSaveEdit}
         colors={colors}
         styles={styles}
@@ -1587,17 +1645,26 @@ export default function PortfolioScreen() {
         t={t}
       />
     ),
-    [handleSellTicker, handleSaveEdit, usdIlsRate, colors, styles, language, t],
+    [handleSellTicker, handleBuyMoreTicker, topUpPendingTicker, handleSaveEdit, usdIlsRate, colors, styles, language, t],
   );
+
+  // SNAPSHOT HEADER: the same real-time summary heads both exports.
+  const snapshotHeader = () =>
+    formatSnapshotHeader({
+      allocation,
+      cashBalance: isCashLoaded ? cashBalance : null,
+      usdIlsRate,
+      targetPct: CATEGORY_TARGET_PCT,
+    });
 
   const handleCopyPortfolioData = async () => {
     const timestamp = new Date().toLocaleString();
     const report = [
       `Pipeline Portfolio Report — ${timestamp}`,
       '',
-      ...formatPortfolioLines(stocks, usdIlsRate),
+      ...snapshotHeader(),
       '',
-      ...formatCashLines(cashBalance, allocation),
+      ...formatPortfolioLines(stocks, usdIlsRate),
     ].join('\n');
 
     try {
@@ -1629,10 +1696,10 @@ export default function PortfolioScreen() {
       const report = [
         `Pipeline Full Data Export — ${timestamp}`,
         '',
+        ...snapshotHeader(),
+        '',
         '=== PORTFOLIO ===',
         ...formatPortfolioLines(stocks, usdIlsRate),
-        '',
-        ...formatCashLines(cashBalance, allocation),
         '',
         '=== AMBUSH RADAR ===',
         ...formatAmbushLines(ambushStocks),
@@ -2304,6 +2371,9 @@ export default function PortfolioScreen() {
                     </TouchableOpacity>
                   </View>
 
+                  {/* Sets expectations for the two-step flow: no quantity
+                      field here, because the broker's fill is entered next. */}
+                  <Text style={styles.addAssetNextStepHint}>{t('addAssetNextStepHint')}</Text>
                   <View style={styles.addRow}>
                     <TouchableOpacity
                       style={[styles.addButton, isAdding && styles.addButtonDisabled]}
@@ -2552,6 +2622,10 @@ type PortfolioStockRowProps = {
   // TRADE RECONCILIATION: opens Execute Sell. Receives the whole position,
   // not just its ticker: the sale needs its units, currency and price.
   onSell: (stock: PortfolioStock) => void;
+  // PORTFOLIO "BUY MORE": opens Execute Trade (buy mode) to top up this
+  // position; isBuyMorePending while its live quote is being fetched.
+  onBuyMore: (stock: PortfolioStock) => void;
+  isBuyMorePending: boolean;
   onSaveEdit: (
     ticker: string,
     assetType: AssetType,
@@ -2587,6 +2661,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   layerTotalValue,
   usdIlsRate,
   onSell,
+  onBuyMore,
+  isBuyMorePending,
   onSaveEdit,
   colors,
   styles,
@@ -2819,6 +2895,22 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           {/* TRADE RECONCILIATION: Sell replaces the old ✕ delete. Every
               exit (partial or full) goes through Execute Sell, so the
               proceeds always reach the buying power. */}
+          {/* PORTFOLIO "BUY MORE": tops up this position through Execute
+              Trade, without the Add Asset search. */}
+          <TouchableOpacity
+            style={[styles.buyMoreButton, isBuyMorePending && styles.buyMoreButtonPending]}
+            onPress={() => onBuyMore(stock)}
+            disabled={isBuyMorePending}
+            hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+            accessibilityRole="button"
+            accessibilityState={{ busy: isBuyMorePending, disabled: isBuyMorePending }}
+            accessibilityLabel={`${t('buy')} ${stock.ticker}`}>
+            {isBuyMorePending ? (
+              <ActivityIndicator size="small" color={colors.bullish} />
+            ) : (
+              <Text style={styles.buyMoreButtonText}>{t('buy')}</Text>
+            )}
+          </TouchableOpacity>
           <TouchableOpacity
             style={styles.sellButton}
             onPress={() => onSell(stock)}
@@ -3455,6 +3547,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   addRow: {
     marginBottom: 4,
   },
+  // Add Asset: the helper line right above "Continue to Execution".
+  addAssetNextStepHint: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 8,
+    textAlign: 'center',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
   addButton: {
     backgroundColor: colors.bullish,
     borderRadius: 8,
@@ -3646,6 +3746,27 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   // TRADE RECONCILIATION: the row's Sell button (replaced the ✕ delete).
+  // PORTFOLIO "BUY MORE": same shape as Sell, in the bullish color. A
+  // fixed minimum width so the spinner doesn't shrink the button.
+  buyMoreButton: {
+    borderWidth: 1,
+    borderColor: colors.bullish,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    minWidth: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  buyMoreButtonPending: {
+    opacity: 0.7,
+  },
+  buyMoreButtonText: {
+    color: colors.bullish,
+    fontSize: 13,
+    fontWeight: '700',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
   sellButton: {
     borderWidth: 1,
     borderColor: colors.bearish,

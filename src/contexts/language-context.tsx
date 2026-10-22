@@ -207,6 +207,7 @@ export type TranslationKey =
   | 'structuralBreakdownBanner'
   | 'fxRateCaption'
   | 'editEntryData'
+  | 'addAssetNextStepHint'
   | 'entryDataHint'
   | 'purchasePriceInput'
   | 'historicalHwmInput'
@@ -329,7 +330,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     assetType: 'סוג נכס',
     addToPortfolio: 'הוסף לתיק',
     unitsPlaceholder: 'יחידות',
-    totalValueInBank: 'שווי כולל בבנק (₪/$) - אופציונלי',
+    totalValueInBank: 'אופציונלי: כיול שווי כולל',
     copyAmbushData: 'העתק נתוני מארב',
     add: 'הוסף',
     addTickerPlaceholder: 'הוסף טיקר (למשל MSFT)',
@@ -413,6 +414,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     structuralBreakdownBanner: 'שבירה מבנית - נדרש מימוש',
     fxRateCaption: 'שער דולר/שקל: {{rate}}',
     editEntryData: 'עריכת נתוני כניסה',
+    addAssetNextStepHint: 'כמות, מחיר ועמלות יוזנו במסך הבא.',
     entryDataHint: 'הזן כפי שמופיע אצל הברוקר ({{unit}}). שדה ריק נשאר ללא שינוי.',
     purchasePriceInput: 'מחיר כניסה ({{unit}}) - כעת: {{current}}',
     historicalHwmInput: 'שיא היסטורי ({{unit}}) - כעת: {{current}}',
@@ -527,7 +529,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     assetType: 'Asset Type',
     addToPortfolio: 'Add to Portfolio',
     unitsPlaceholder: 'Units',
-    totalValueInBank: 'Total Value in Bank (ILS/USD) - optional',
+    totalValueInBank: 'Optional: Total Value Calibration',
     copyAmbushData: 'Copy Ambush Data',
     add: 'Add',
     addTickerPlaceholder: 'Add ticker (e.g. MSFT)',
@@ -612,6 +614,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     structuralBreakdownBanner: 'STRUCTURAL BREAKDOWN - LIQUIDATION REQUIRED',
     fxRateCaption: 'USD/ILS: {{rate}}',
     editEntryData: 'Edit Entry Data',
+    addAssetNextStepHint: 'You will input Quantity, Price, and Fees on the next screen.',
     entryDataHint: 'Enter as your broker shows it ({{unit}}). A blank field stays unchanged.',
     purchasePriceInput: 'Entry price ({{unit}}) - now: {{current}}',
     historicalHwmInput: 'Historical HWM ({{unit}}) - now: {{current}}',

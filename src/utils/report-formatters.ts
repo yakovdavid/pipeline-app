@@ -110,15 +110,39 @@ export function formatPortfolioLines(stocks: PortfolioStock[], usdIlsRate: numbe
   return lines;
 }
 
-// LIQUIDITY CORE: the buying power and the cash-diluted weights, in the
-// same terms the Portfolio's summary card shows them (weights sum to
-// exactly 100.0%, see computeAllocation).
-export function formatCashLines(cashBalance: number, allocation: AllocationBreakdown): string[] {
+// SNAPSHOT HEADER: the real-time summary at the top of both Portfolio
+// exports ("Copy Portfolio Data" and "Copy ALL Data"), in the same terms
+// the Portfolio's summary card shows:
+//   1. Total Portfolio Value: invested + cash (the allocation denominator);
+//   2. Available Buying Power (cash balance);
+//   3. the USD/ILS rate every Israeli position in the snapshot was valued
+//      with (see @/utils/fx);
+//   4. each layer's actual, cash-diluted weight next to its target (Cash
+//      has no target). Weights sum to exactly 100.0%, see computeAllocation.
+// A cash balance that hasn't loaded, or a rate that hasn't been fetched, is
+// labelled as such rather than printed as a misleading number.
+export type SnapshotHeaderInput = {
+  allocation: AllocationBreakdown;
+  // Null until the saved balance has been read.
+  cashBalance: number | null;
+  usdIlsRate: number | null;
+  targetPct: Record<'Core' | 'Satellite' | 'Quality', number>;
+};
+
+export function formatSnapshotHeader({ allocation, cashBalance, usdIlsRate, targetPct }: SnapshotHeaderInput): string[] {
   const { weightsPct } = allocation;
+  const layerLine = (label: string, actual: number, target: number | null): string =>
+    `  ${label.padEnd(10)} ${`${actual.toFixed(1)}%`.padStart(6)}  /  ${target === null ? '—' : `${target}%`}`;
   return [
-    `CASH (buying power): ${formatUsd(cashBalance)}`,
-    `ALLOCATION incl. cash (total ${formatUsd(allocation.totalValue)}): ` +
-      `Core ${weightsPct.Core.toFixed(1)}% | Satellite ${weightsPct.Satellite.toFixed(1)}% | ` +
-      `Quality ${weightsPct.Quality.toFixed(1)}% | Cash ${weightsPct.Cash.toFixed(1)}%`,
+    `Total Portfolio Value (Invested + Cash): ${formatUsd(allocation.totalValue)}`,
+    `Available Buying Power (Cash): ${cashBalance === null ? 'not loaded' : formatUsd(cashBalance)}`,
+    `USD/ILS rate: ${
+      usdIlsRate === null ? 'unavailable (Israeli positions valued at the API USD price)' : usdIlsRate.toFixed(4)
+    }`,
+    'Layer Allocation (Actual / Target):',
+    layerLine('Core', weightsPct.Core, targetPct.Core),
+    layerLine('Satellite', weightsPct.Satellite, targetPct.Satellite),
+    layerLine('Quality', weightsPct.Quality, targetPct.Quality),
+    layerLine('Cash', weightsPct.Cash, null),
   ];
 }
