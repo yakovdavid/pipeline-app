@@ -208,6 +208,11 @@ export type TranslationKey =
   | 'fxRateCaption'
   | 'editEntryData'
   | 'addAssetNextStepHint'
+  | 'logExitFill'
+  | 'executionLogFailed'
+  | 'feesLoggedCaption'
+  | 'trackingTooltipLabel'
+  | 'trackingTooltip'
   | 'entryDataHint'
   | 'purchasePriceInput'
   | 'historicalHwmInput'
@@ -415,6 +420,11 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     fxRateCaption: 'שער דולר/שקל: {{rate}}',
     editEntryData: 'עריכת נתוני כניסה',
     addAssetNextStepHint: 'כמות, מחיר ועמלות יוזנו במסך הבא.',
+    logExitFill: 'רישום ביצוע יציאה (כל היחידות)',
+    executionLogFailed: '{{ticker}} עודכן, אך רישום הביצוע ביומן נכשל.',
+    feesLoggedCaption: 'עמלות ברוקר שנרשמו: {{amount}}',
+    trackingTooltipLabel: 'מידע על מעקב אוטומטי',
+    trackingTooltip: 'חישובי הסטופ הנגרר מבוססים על מרווחי הרענון של האפליקציה. מנוע המסחר הרציף של הברוקר במהלך היום הוא מקור האמת המוחלט.',
     entryDataHint: 'הזן כפי שמופיע אצל הברוקר ({{unit}}). שדה ריק נשאר ללא שינוי.',
     purchasePriceInput: 'מחיר כניסה ({{unit}}) - כעת: {{current}}',
     historicalHwmInput: 'שיא היסטורי ({{unit}}) - כעת: {{current}}',
@@ -615,6 +625,11 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     fxRateCaption: 'USD/ILS: {{rate}}',
     editEntryData: 'Edit Entry Data',
     addAssetNextStepHint: 'You will input Quantity, Price, and Fees on the next screen.',
+    logExitFill: 'Log Exit Fill (All Units)',
+    executionLogFailed: '{{ticker}} was updated, but the fill could not be logged.',
+    feesLoggedCaption: 'Broker fees logged: {{amount}}',
+    trackingTooltipLabel: 'About Automated Tracking',
+    trackingTooltip: 'Trailing stop calculations are based on app refresh intervals. The broker\'s continuous intra-day engine is the absolute source of truth.',
     entryDataHint: 'Enter as your broker shows it ({{unit}}). A blank field stays unchanged.',
     purchasePriceInput: 'Entry price ({{unit}}) - now: {{current}}',
     historicalHwmInput: 'Historical HWM ({{unit}}) - now: {{current}}',

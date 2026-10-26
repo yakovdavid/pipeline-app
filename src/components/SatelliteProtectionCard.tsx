@@ -112,6 +112,9 @@ export function SatelliteProtectionCard({ ticker, currentPrice, protection }: Sa
   const styles = useMemo(() => createStyles(colors, language), [colors, language]);
 
   const [isExpanded, setIsExpanded] = useState(false);
+  // AUTOMATED TRACKING TOOLTIP: tapping the info icon next to the badge
+  // shows (and hides) a short note on what the in-app trailing stop is.
+  const [isTooltipVisible, setIsTooltipVisible] = useState(false);
   const [copiedField, setCopiedField] = useState<CopiedField>(null);
 
   // Tracks the pending "revert to plain copy icon" timeout so a second
@@ -182,6 +185,22 @@ export function SatelliteProtectionCard({ ticker, currentPrice, protection }: Sa
           <View style={[styles.statusBadge, { backgroundColor: statusBadgeColor }]}>
             <Text style={styles.statusBadgeText}>{statusLabel}</Text>
           </View>
+          {/* Only in Automated Tracking: the stop shown then is the app's
+              own trailing calculation, which runs on refreshes, not ticks. */}
+          {isAutomatedTracking && (
+            <TouchableOpacity
+              onPress={() => setIsTooltipVisible((previous) => !previous)}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: isTooltipVisible }}
+              accessibilityLabel={t('trackingTooltipLabel')}>
+              <Ionicons
+                name={isTooltipVisible ? 'information-circle' : 'information-circle-outline'}
+                size={18}
+                color={colors.textSecondary}
+              />
+            </TouchableOpacity>
+          )}
           <Ionicons
             name={isExpanded ? 'chevron-up' : 'chevron-down'}
             size={18}
@@ -189,6 +208,12 @@ export function SatelliteProtectionCard({ ticker, currentPrice, protection }: Sa
           />
         </View>
       </TouchableOpacity>
+
+      {isAutomatedTracking && isTooltipVisible && (
+        <View style={styles.tooltip} accessibilityRole="text">
+          <Text style={styles.tooltipText}>{t('trackingTooltip')}</Text>
+        </View>
+      )}
 
       {/* EXPANDED STATE: the actionable order-ticket detail — Order Type,
           the Stop Price/% value (with its own Copy button), and, only
@@ -308,6 +333,21 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
     },
     expandedSection: {
       marginTop: 12,
+    },
+    // AUTOMATED TRACKING TOOLTIP: a small tinted note under the badge row.
+    tooltip: {
+      marginTop: 8,
+      borderRadius: 8,
+      paddingHorizontal: 10,
+      paddingVertical: 8,
+      backgroundColor: colors.background,
+    },
+    tooltipText: {
+      color: colors.textSecondary,
+      fontSize: 12,
+      lineHeight: 17,
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     divider: {
       height: 1,

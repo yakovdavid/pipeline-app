@@ -3,37 +3,35 @@
 // with their broker, which doesn't universally support a true server-side
 // trailing stop.
 //
-// Three different "high water marks" are involved, and keeping them apart
-// is the point of this module:
-//   historicalHWM: the 52-week high when the position was opened. The
-//     level the price must reclaim before the stop may start trailing.
-//   activeHWM: the highest price observed since the position was opened
-//     (the position's `highestWatermark`). Every price observed before a
-//     breakout is below historicalHWM, so once the price has broken out
-//     this is exactly "the highest price observed since breaking out".
-//   purchasePrice: the average executed price, the anchor of the locked
-//     stop.
+// The two stop rules (locked; do not change one without the other):
 //
-// Recovery State: the position has never reclaimed historicalHWM
-//   (activeHWM < historicalHWM, which before any breakout is the same test
-//   as currentPrice < historicalHWM). The stop is rigidly locked at
-//   purchasePrice × 0.88 and does not trail; a broker-side trailing stop
-//   would ratchet with the price, so a static Stop Market order is
-//   required. A price alert at historicalHWM tells the user when the
-//   breakout happens.
-// Automated Tracking: the price has reclaimed historicalHWM at least once.
-//   The stop trails at activeHWM × 0.88, and a broker-side 12% Trailing
-//   Stop can track it.
+// RULE 1, Recovery State (Stop Market)
+//   Condition: currentPrice < historicalHWM, and the position has not
+//     broken out since historicalHWM was set (see the latch below).
+//   Stop price: purchasePrice × 0.88, exactly. historicalHWM is ONLY the
+//     threshold that ends this state; it is never part of the stop
+//     calculation, and neither is any tracked peak. A broker-side trailing
+//     stop would ratchet with the price, so a static Stop Market order is
+//     required; a price alert at historicalHWM tells the user when the
+//     breakout happens.
 //
-// The breakout is deliberately one-way. Read literally,
-// "currentPrice < historicalHWM" would send a position back to Recovery on
-// any dip after a breakout, swapping the higher trailing stop for the
-// lower purchase-price stop: the stop would move DOWN. Since activeHWM
-// never decreases, testing it instead keeps the stop monotonic.
+// RULE 2, Automated Tracking (Trailing Stop)
+//   Condition: permanently, once currentPrice >= historicalHWM; or from the
+//     start when the position has no historicalHWM or no purchasePrice
+//     (nothing to recover against, e.g. a legacy position).
+//   Stop price: activeHWM × 0.88, where activeHWM is the highest price the
+//     app has tracked (the position's `highestWatermark`, never below the
+//     current price). Every price before the breakout is below
+//     historicalHWM, so after it this is exactly the highest price tracked
+//     during Automated Tracking.
 //
-// Positions without a recorded entry (opened before trade logging) have no
-// purchasePrice/historicalHWM and are in Automated Tracking off activeHWM,
-// which is exactly how their stop worked before.
+// "Permanently" is implemented as a one-way latch on activeHWM, which
+// never decreases: once it reaches historicalHWM the position stays in
+// Rule 2 even if the price dips back below historicalHWM. Re-entering Rule
+// 1 on such a dip would swap the trailing stop for the lower
+// purchasePrice × 0.88, moving the stop DOWN. Saving Edit Entry Data
+// restarts activeHWM (see handleSaveEdit in app/(tabs)/index.tsx), so a
+// peak recorded before the entry data existed can't trip the latch.
 
 // The single 12% stop distance (matches SATELLITE_TS_PCT in
 // @/constants/thresholds); both modes use it.
@@ -46,7 +44,9 @@ export type ProtectionStatusColor = 'orange' | 'green';
 
 export type ProtectionInputs = {
   currentPrice: number;
+  // Rule 1's only anchor (average executed price, USD).
   purchasePrice: number | null;
+  // Rule 1's threshold only; never used to compute a stop.
   historicalHWM: number | null;
   // The position's highestWatermark; null if no price was ever observed.
   activeHWM: number | null;
@@ -78,11 +78,14 @@ export function computeProtectionState({
   activeHWM,
 }: ProtectionInputs): ProtectionState {
   // The watermark is updated on every refresh, but taking the max here too
-  // means a stop is never computed off a peak below the price on screen.
+  // means the breakout is recognized the moment the price on screen
+  // reaches historicalHWM, even before the watermark itself is updated.
   const effectiveActiveHWM = Math.max(activeHWM ?? currentPrice, currentPrice);
+  // Rule 1 needs both values; without either, Rule 2 applies.
   const isRecoveryState = purchasePrice !== null && historicalHWM !== null && effectiveActiveHWM < historicalHWM;
 
   if (isRecoveryState) {
+    // RULE 1: purchasePrice × 0.88, exactly. historicalHWM is not used.
     const stopPrice = purchasePrice * STOP_MULTIPLIER;
     return {
       mode: 'recovery',
@@ -96,6 +99,7 @@ export function computeProtectionState({
     };
   }
 
+  // RULE 2: activeHWM × 0.88.
   return {
     mode: 'tracking',
     isRecoveryState: false,

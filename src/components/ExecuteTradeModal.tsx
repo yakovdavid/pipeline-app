@@ -57,6 +57,10 @@ export type ExecuteTradeRequest =
       side: 'sell';
       // The units currently held: the most that can be sold.
       unitsHeld: number;
+      // EXECUTION RECONCILIATION fast path ("Log Exit Fill"): the quantity
+      // to start with, or null for an empty field. Price and fee are never
+      // prefilled; they must come from the broker's fill.
+      prefillQuantity: number | null;
     });
 
 export type ExecuteTradeModalProps = {
@@ -81,7 +85,11 @@ export function ExecuteTradeModal({ request, cashBalance, onConfirm, onCancel }:
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, language), [colors, language]);
 
-  const [quantityText, setQuantityText] = useState('');
+  // Initial value only: the parent remounts this modal (a fresh `key`) for
+  // each request, so a prefilled quantity applies exactly once.
+  const [quantityText, setQuantityText] = useState(() =>
+    request?.side === 'sell' && request.prefillQuantity !== null ? String(request.prefillQuantity) : '',
+  );
   const [priceText, setPriceText] = useState('');
   const [feeText, setFeeText] = useState('');
 

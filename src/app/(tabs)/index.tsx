@@ -81,10 +81,23 @@ import {
   takePendingPortfolioBuy,
   type PortfolioBuyRequest,
 } from '@/utils/portfolio-buy-handoff';
-import { formatAmbushLines, formatPortfolioLines, formatSnapshotHeader } from '@/utils/report-formatters';
+import {
+  formatAmbushLines,
+  formatExecutionLines,
+  formatPortfolioLines,
+  formatSnapshotHeader,
+} from '@/utils/report-formatters';
 import { buildPortfolioStock, toPortfolioTickerEntry } from '@/utils/portfolio-hydration';
 import { getLayerWeights, publishLayerWeights } from '@/utils/layer-weights-store';
 import { brokerQuoteToUsd, positionUsdValue, usdPerLocalForTrade, usdToLocalPrice } from '@/utils/fx';
+import {
+  appendExecution,
+  createExecutionId,
+  EXECUTION_LEDGER_MAX_ENTRIES,
+  loadExecutionLedger,
+  totalFeesUsd,
+  type ExecutionRecord,
+} from '@/utils/execution-ledger';
 import { applySale } from '@/utils/position-ledger';
 import { computeProtectionState, resolveHistoricalHWM, type ProtectionState } from '@/utils/protectionState';
 import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
@@ -94,6 +107,7 @@ import {
   averagePurchasePrice,
   computeTradeCost,
   executedUnitPriceUsd,
+  isPriceEnteredInAgorot,
   exceedsHolding,
   formatSignedUsd,
   formatUsd,
@@ -250,9 +264,9 @@ function toAmbushStock(stock: PortfolioStock): Stock {
 // _with_request_scoped_fields.
 //
 // PROTECTION STATE (HWM decoupling): the stop itself comes from
-// computeProtectionState — locked at purchasePrice × 0.88 in Recovery
-// State, trailing at activeHWM × 0.88 once the price has reclaimed the
-// position's historicalHWM. Null with no observed price yet (no watermark)
+// computeProtectionState — Rule 1: locked at purchasePrice × 0.88 in
+// Recovery State; Rule 2: trailing at activeHWM × 0.88 once the price has
+// reached the position's historicalHWM (or with no entry data at all). Null with no observed price yet (no watermark)
 // or while the price is unavailable (its placeholder 0 would read as a
 // triggered stop).
 function computeSatelliteProtection(stock: PortfolioStock): ProtectionState | null {
@@ -582,6 +596,26 @@ export default function PortfolioScreen() {
   useEffect(() => {
     Promise.resolve().then(loadCash);
   }, [loadCash]);
+
+  // EXECUTION RECONCILIATION: the logged fills (see
+  // @/utils/execution-ledger), loaded once; kept in memory for the fee
+  // total on the summary card and for the exports. Null until loaded.
+  const [executionLog, setExecutionLog] = useState<ExecutionRecord[] | null>(null);
+
+  const loadExecutions = useCallback(async () => {
+    try {
+      const records = await loadExecutionLedger();
+      if (isMountedRef.current) {
+        setExecutionLog(records);
+      }
+    } catch (error) {
+      console.warn('[ledger] Failed to read the execution ledger.', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    Promise.resolve().then(loadExecutions);
+  }, [loadExecutions]);
 
   // GAP 3 (explicit FX): the live USD/ILS rate (GET /api/fx/usd-ils), used
   // to value every Israeli position and to price Israeli trades. Fetched on
@@ -1159,6 +1193,22 @@ export default function PortfolioScreen() {
     [toastOpacity],
   );
 
+  // Logs one confirmed fill. The trade itself (position + cash) is already
+  // applied by the caller; a logging failure is reported but never undoes
+  // it.
+  const logExecution = (record: ExecutionRecord) => {
+    appendExecution(record)
+      .then((updated) => {
+        if (isMountedRef.current) {
+          setExecutionLog(updated);
+        }
+      })
+      .catch((error) => {
+        console.error('[ledger] Failed to log execution:', error);
+        showToast(t('executionLogFailed', { ticker: record.ticker }));
+      });
+  };
+
   // TRADE RECONCILIATION, step 2: the trade is confirmed. In one pass:
   //   1. save the position with the executed quantity (a new position, or
   //      added onto a held one) and record the cost as its cost basis;
@@ -1221,6 +1271,23 @@ export default function PortfolioScreen() {
 
     const balanceAfter = roundToCents(cashBalanceRef.current - costUsd);
     applyCashBalance(balanceAfter);
+
+
+    // EXECUTION RECONCILIATION: the fill, exactly as entered, in the ledger.
+    logExecution({
+      id: createExecutionId(),
+      executedAt: new Date().toISOString(),
+      ticker: trade.ticker,
+      side: 'buy',
+      quantity: inputs.quantity,
+      price: inputs.price,
+      priceUnit: isPriceEnteredInAgorot(trade.ticker) ? 'Ag' : trade.basis.currencySymbol,
+      feeLocal: inputs.fee,
+      feeUsd: roundToCents(inputs.fee * trade.basis.usdPerLocal),
+      currencySymbol: trade.basis.currencySymbol,
+      amountUsd: costUsd,
+      cashAfterUsd: balanceAfter,
+    });
 
     setPendingTrade(null);
     setTicker('');
@@ -1368,7 +1435,7 @@ export default function PortfolioScreen() {
   // rate). An 'unavailable' row fetches a fresh quote first. Stable
   // identity (useCallback) keeps PortfolioStockRow's memo() effective.
   const handleSellTicker = useCallback(
-    async (stock: PortfolioStock) => {
+    async (stock: PortfolioStock, options?: { prefillAllUnits?: boolean }) => {
       if (!isCashLoadedRef.current) {
         Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
         return;
@@ -1418,9 +1485,20 @@ export default function PortfolioScreen() {
         basis: { ticker: stock.ticker, assetType: stock.assetType, usdPerLocal, currencySymbol },
         livePriceDisplay: formatUnitPrice(stock.ticker, displayLocalPrice, currencySymbol, t('ag')),
         unitsHeld: stock.units,
+        prefillQuantity: options?.prefillAllUnits === true ? stock.units : null,
       });
     },
     [t],
+  );
+
+  // EXECUTION RECONCILIATION, fast path: when a Satellite stop has
+  // triggered (or a Structural Breakdown calls for liquidation), the row
+  // offers "Log Exit Fill", which opens Execute Sell with the full
+  // quantity already filled in. The price and fee still come from the
+  // broker's confirmation, so the app records the actual fill.
+  const handleLogExitFill = useCallback(
+    (stock: PortfolioStock) => handleSellTicker(stock, { prefillAllUnits: true }),
+    [handleSellTicker],
   );
 
   // The sale is confirmed. In one pass:
@@ -1437,6 +1515,22 @@ export default function PortfolioScreen() {
     const balanceAfter = roundToCents(cashBalanceRef.current + proceedsUsd);
     applyCashBalance(balanceAfter);
     setPendingSale(null);
+    // EXECUTION RECONCILIATION: the fill, exactly as entered, in the ledger.
+    logExecution({
+      id: createExecutionId(),
+      executedAt: new Date().toISOString(),
+      ticker: sale.ticker,
+      side: 'sell',
+      quantity: inputs.quantity,
+      price: inputs.price,
+      priceUnit: isPriceEnteredInAgorot(sale.ticker) ? 'Ag' : sale.basis.currencySymbol,
+      feeLocal: inputs.fee,
+      feeUsd: roundToCents(inputs.fee * sale.basis.usdPerLocal),
+      currencySymbol: sale.basis.currencySymbol,
+      amountUsd: proceedsUsd,
+      cashAfterUsd: balanceAfter,
+    });
+
 
     const saleMessage = closesPosition
       ? t('positionClosedToast', {
@@ -1636,6 +1730,7 @@ export default function PortfolioScreen() {
         layerTotalValue={section.layerTotalValue}
         usdIlsRate={usdIlsRate}
         onSell={handleSellTicker}
+        onLogExitFill={handleLogExitFill}
         onBuyMore={handleBuyMoreTicker}
         isBuyMorePending={topUpPendingTicker === item.ticker}
         onSaveEdit={handleSaveEdit}
@@ -1645,7 +1740,7 @@ export default function PortfolioScreen() {
         t={t}
       />
     ),
-    [handleSellTicker, handleBuyMoreTicker, topUpPendingTicker, handleSaveEdit, usdIlsRate, colors, styles, language, t],
+    [handleSellTicker, handleLogExitFill, handleBuyMoreTicker, topUpPendingTicker, handleSaveEdit, usdIlsRate, colors, styles, language, t],
   );
 
   // SNAPSHOT HEADER: the same real-time summary heads both exports.
@@ -1655,6 +1750,7 @@ export default function PortfolioScreen() {
       cashBalance: isCashLoaded ? cashBalance : null,
       usdIlsRate,
       targetPct: CATEGORY_TARGET_PCT,
+      executions: executionLog,
     });
 
   const handleCopyPortfolioData = async () => {
@@ -1700,6 +1796,9 @@ export default function PortfolioScreen() {
         '',
         '=== PORTFOLIO ===',
         ...formatPortfolioLines(stocks, usdIlsRate),
+        '',
+        '=== RECENT EXECUTIONS ===',
+        ...formatExecutionLines(executionLog),
         '',
         '=== AMBUSH RADAR ===',
         ...formatAmbushLines(ambushStocks),
@@ -1777,6 +1876,12 @@ export default function PortfolioScreen() {
       // the current balance as it is.
       if (payload.cashBalance !== null) {
         applyCashBalance(payload.cashBalance);
+      }
+      // EXECUTION RECONCILIATION: restoreBackupPayload already saved the
+      // backup's ledger; mirror it into state (capped like storage). An
+      // older backup without one leaves the current ledger as it is.
+      if (payload.executions !== null) {
+        setExecutionLog(payload.executions.slice(-EXECUTION_LEDGER_MAX_ENTRIES));
       }
       setSyncWarning(allFetchesFailed);
 
@@ -2042,6 +2147,7 @@ export default function PortfolioScreen() {
         allocation={allocation}
         isCashLoaded={isCashLoaded}
         usdIlsRate={usdIlsRate}
+        feesLoggedUsd={executionLog === null ? null : totalFeesUsd(executionLog)}
         onAdjustCash={handleOpenAdjustCash}
       />
 
@@ -2622,6 +2728,9 @@ type PortfolioStockRowProps = {
   // TRADE RECONCILIATION: opens Execute Sell. Receives the whole position,
   // not just its ticker: the sale needs its units, currency and price.
   onSell: (stock: PortfolioStock) => void;
+  // EXECUTION RECONCILIATION: Execute Sell with all units prefilled, offered
+  // once the stop has triggered or a Structural Breakdown applies.
+  onLogExitFill: (stock: PortfolioStock) => void;
   // PORTFOLIO "BUY MORE": opens Execute Trade (buy mode) to top up this
   // position; isBuyMorePending while its live quote is being fetched.
   onBuyMore: (stock: PortfolioStock) => void;
@@ -2661,6 +2770,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   layerTotalValue,
   usdIlsRate,
   onSell,
+  onLogExitFill,
   onBuyMore,
   isBuyMorePending,
   onSaveEdit,
@@ -3147,8 +3257,9 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
           {/* PROTECTION STATE: the two entry anchors captured by Execute
               Trade (absent for positions opened before trade logging). */}
-          {/* LEGACY ENTRY DATA: without both anchors the position can only
-              be in Automated Tracking; point the user at the fix. */}
+          {/* LEGACY ENTRY DATA: without both a purchasePrice and a
+              historicalHWM the position can only be in Automated Tracking
+              (Rule 2); point the user at the fix. */}
           {(stock.purchasePrice === null || stock.historicalHWM === null) && (
             <Text style={styles.entryMissingText}>{t('entryDataMissingHint')}</Text>
           )}
@@ -3180,6 +3291,21 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               {t(protection.isRecoveryState ? 'stopLockedAt' : 'trailingStopActivatedAt')}: $
               {trailingStopPrice.toFixed(2)}
             </Text>
+          )}
+
+          {/* EXECUTION RECONCILIATION, fast path: once the stop has
+              triggered (or a breakdown calls for liquidation), recording the
+              broker's exit is one tap away, with the full quantity
+              prefilled. */}
+          {(isTrailingStopTriggered || isBreakdown) && (
+            <TouchableOpacity
+              style={styles.logExitFillButton}
+              onPress={() => onLogExitFill(stock)}
+              accessibilityRole="button"
+              accessibilityLabel={`${t('logExitFill')} ${stock.ticker}`}>
+              <Ionicons name="receipt-outline" size={16} color="#FFFFFF" />
+              <Text style={styles.logExitFillButtonText}>{t('logExitFill')}</Text>
+            </TouchableOpacity>
           )}
 
           {/* SATELLITE CARD FIX: replaces the old stock.drawdownPct-based
@@ -3746,6 +3872,24 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   // TRADE RECONCILIATION: the row's Sell button (replaced the ✕ delete).
+  // EXECUTION RECONCILIATION: the fast "Log Exit Fill" action under a
+  // triggered stop: solid bearish, full width, impossible to miss.
+  logExitFillButton: {
+    flexDirection: isHebrew ? 'row-reverse' : 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: colors.bearish,
+    borderRadius: 8,
+    paddingVertical: 8,
+    marginTop: 8,
+  },
+  logExitFillButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
   // PORTFOLIO "BUY MORE": same shape as Sell, in the bullish color. A
   // fixed minimum width so the spinner doesn't shrink the button.
   buyMoreButton: {

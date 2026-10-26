@@ -9,6 +9,12 @@ import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioTickerEntry } from '@/types/portfolio';
 import { parseCashBalance, saveCashBalance } from '@/utils/cash-storage';
+import {
+  loadExecutionLedger,
+  parseExecutionRecords,
+  replaceExecutionLedger,
+  type ExecutionRecord,
+} from '@/utils/execution-ledger';
 
 const BACKUP_SCHEMA_VERSION = 1;
 const PORTFOLIO_CATEGORIES: PortfolioCategory[] = ['Core', 'Satellite', 'Quality'];
@@ -23,16 +29,24 @@ export type BackupPayload = {
   // cash tracking; restoring such a backup leaves the current balance
   // untouched rather than zeroing it.
   cashBalance: number | null;
+  // EXECUTION RECONCILIATION: the logged fills (see
+  // @/utils/execution-ledger). Null when the backup predates the ledger;
+  // restoring such a backup leaves the device's ledger untouched rather
+  // than erasing it. An empty array is a real, empty ledger.
+  executions: ExecutionRecord[] | null;
 };
 
-// Reads both screens' persisted ticker lists directly from AsyncStorage
-// (not live component state, which this module has no access to) into one
-// exportable JSON object.
+// Reads both screens' persisted ticker lists, the cash balance and the
+// execution ledger directly from AsyncStorage (not live component state,
+// which this module has no access to) into one exportable JSON object. An
+// unreadable ledger fails the export, like an unreadable portfolio would,
+// rather than producing a backup that silently lacks it.
 export async function createBackupPayload(): Promise<BackupPayload> {
-  const [storedPortfolio, storedAmbush, storedCash] = await Promise.all([
+  const [storedPortfolio, storedAmbush, storedCash, executions] = await Promise.all([
     AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(AMBUSH_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(CASH_BALANCE_STORAGE_KEY),
+    loadExecutionLedger(),
   ]);
 
   return {
@@ -42,6 +56,7 @@ export async function createBackupPayload(): Promise<BackupPayload> {
     ambush: storedAmbush ? (JSON.parse(storedAmbush) as AmbushTickerEntry[]) : [],
     // Never-saved cash is a real balance of 0, not "unknown".
     cashBalance: storedCash ? parseCashBalance(JSON.parse(storedCash)) : 0,
+    executions,
   };
 }
 
@@ -192,6 +207,9 @@ export function parseBackupPayload(rawText: string): BackupPayload {
     portfolio,
     ambush,
     cashBalance: parseCashBalance(payload.cashBalance),
+    // Malformed entries are dropped one by one; a missing or non-array
+    // value means "no ledger in this backup" (null).
+    executions: parseExecutionRecords(payload.executions),
   };
 }
 
@@ -205,5 +223,6 @@ export async function restoreBackupPayload(payload: BackupPayload): Promise<void
     AsyncStorage.setItem(PORTFOLIO_TICKERS_STORAGE_KEY, JSON.stringify(payload.portfolio)),
     AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(payload.ambush)),
     ...(payload.cashBalance !== null ? [saveCashBalance(payload.cashBalance)] : []),
+    ...(payload.executions !== null ? [replaceExecutionLedger(payload.executions)] : []),
   ]);
 }

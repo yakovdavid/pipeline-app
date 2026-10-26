@@ -8,6 +8,10 @@ export const PORTFOLIO_TICKERS_STORAGE_KEY = '@pipeline/portfolio_tickers';
 // is only the cash that can actually be invested.
 export const CASH_BALANCE_STORAGE_KEY = '@pipeline/cash_balance';
 
+// EXECUTION RECONCILIATION: the append-only log of confirmed buys and
+// sells (see @/utils/execution-ledger).
+export const EXECUTION_LEDGER_STORAGE_KEY = '@pipeline/execution_ledger';
+
 // User's Light/Dark mode preference for the Pipeline screens (see
 // ThemeContext). Stored as the literal string 'light' | 'dark' rather than
 // a boolean so the raw AsyncStorage value is self-describing if inspected.

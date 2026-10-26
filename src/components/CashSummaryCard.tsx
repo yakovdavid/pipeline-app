@@ -17,6 +17,9 @@ export type CashSummaryCardProps = {
   isCashLoaded: boolean;
   // GAP 3: the live USD/ILS rate (null until fetched).
   usdIlsRate: number | null;
+  // EXECUTION RECONCILIATION: total broker fees in the execution ledger
+  // (null until the ledger has loaded).
+  feesLoggedUsd: number | null;
   onAdjustCash: () => void;
 };
 
@@ -47,6 +50,7 @@ export const CashSummaryCard = memo(function CashSummaryCard({
   allocation,
   isCashLoaded,
   usdIlsRate,
+  feesLoggedUsd,
   onAdjustCash,
 }: CashSummaryCardProps) {
   const { colors } = usePipelineTheme();
@@ -100,6 +104,9 @@ export const CashSummaryCard = memo(function CashSummaryCard({
           {/* GAP 3: the live rate every Israeli position is valued with. */}
           {usdIlsRate !== null && (
             <Text style={styles.caption}>{t('fxRateCaption', { rate: usdIlsRate.toFixed(4) })}</Text>
+          )}
+          {feesLoggedUsd !== null && (
+            <Text style={styles.caption}>{t('feesLoggedCaption', { amount: formatUsd(feesLoggedUsd) })}</Text>
           )}
 
           <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>

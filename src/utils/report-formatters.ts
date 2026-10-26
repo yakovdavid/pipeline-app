@@ -2,6 +2,7 @@ import type { AmbushAsset } from '@/types/ambush';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import type { PortfolioStock } from '@/types/portfolio';
 import type { AllocationBreakdown } from '@/utils/allocation';
+import { totalFeesUsd, type ExecutionRecord } from '@/utils/execution-ledger';
 import { positionUsdValue, usdUnitPrice } from '@/utils/fx';
 import { formatUsd } from '@/utils/trade-execution';
 
@@ -127,9 +128,18 @@ export type SnapshotHeaderInput = {
   cashBalance: number | null;
   usdIlsRate: number | null;
   targetPct: Record<'Core' | 'Satellite' | 'Quality', number>;
+  // EXECUTION RECONCILIATION: the logged fills, for the fee total (null
+  // until the ledger has loaded).
+  executions: readonly ExecutionRecord[] | null;
 };
 
-export function formatSnapshotHeader({ allocation, cashBalance, usdIlsRate, targetPct }: SnapshotHeaderInput): string[] {
+export function formatSnapshotHeader({
+  allocation,
+  cashBalance,
+  usdIlsRate,
+  targetPct,
+  executions,
+}: SnapshotHeaderInput): string[] {
   const { weightsPct } = allocation;
   const layerLine = (label: string, actual: number, target: number | null): string =>
     `  ${label.padEnd(10)} ${`${actual.toFixed(1)}%`.padStart(6)}  /  ${target === null ? '—' : `${target}%`}`;
@@ -139,10 +149,41 @@ export function formatSnapshotHeader({ allocation, cashBalance, usdIlsRate, targ
     `USD/ILS rate: ${
       usdIlsRate === null ? 'unavailable (Israeli positions valued at the API USD price)' : usdIlsRate.toFixed(4)
     }`,
+    `Broker fees logged: ${
+      executions === null
+        ? 'ledger not loaded'
+        : `${formatUsd(totalFeesUsd(executions))} across ${executions.length} execution(s)`
+    }`,
     'Layer Allocation (Actual / Target):',
     layerLine('Core', weightsPct.Core, targetPct.Core),
     layerLine('Satellite', weightsPct.Satellite, targetPct.Satellite),
     layerLine('Quality', weightsPct.Quality, targetPct.Quality),
     layerLine('Cash', weightsPct.Cash, null),
   ];
+}
+
+// EXECUTION RECONCILIATION: the most recent logged fills, newest first, one
+// line each, in the terms of the broker's confirmation (price and fee as
+// entered), for checking against the broker statement.
+export const RECENT_EXECUTIONS_IN_EXPORT = 20;
+
+export function formatExecutionLines(executions: readonly ExecutionRecord[] | null): string[] {
+  if (executions === null) {
+    return ['  (ledger not loaded)'];
+  }
+  if (executions.length === 0) {
+    return ['  (none logged)'];
+  }
+  return executions
+    .slice(-RECENT_EXECUTIONS_IN_EXPORT)
+    .reverse()
+    .map((record) => {
+      const amountLabel = record.side === 'buy' ? 'cost' : 'net proceeds';
+      return (
+        `  ${record.executedAt.slice(0, 16).replace('T', ' ')} ${record.side.toUpperCase()} ` +
+        `${record.ticker} ${record.quantity} @ ${record.price} ${record.priceUnit} | ` +
+        `fee ${record.feeLocal} ${record.currencySymbol} (${formatUsd(record.feeUsd)}) | ` +
+        `${amountLabel} ${formatUsd(record.amountUsd)} | cash after ${formatUsd(record.cashAfterUsd)}`
+      );
+    });
 }
