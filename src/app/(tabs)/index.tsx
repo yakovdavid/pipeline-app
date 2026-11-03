@@ -29,7 +29,7 @@ import { StatusBar } from 'expo-status-bar';
 
 import { AdjustCashModal } from '@/components/AdjustCashModal';
 import { CashSummaryCard } from '@/components/CashSummaryCard';
-import { ExecuteTradeModal, type ExecuteTradeRequest } from '@/components/ExecuteTradeModal';
+import { ExecuteTradeModal, type ExecuteTradeRequest, type HistoricalHwmSource } from '@/components/ExecuteTradeModal';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { SatelliteProtectionCard } from '@/components/SatelliteProtectionCard';
 import type { Stock } from '@/components/StockCard';
@@ -99,7 +99,7 @@ import {
   type ExecutionRecord,
 } from '@/utils/execution-ledger';
 import { applySale } from '@/utils/position-ledger';
-import { computeProtectionState, resolveHistoricalHWM, type ProtectionState } from '@/utils/protectionState';
+import { computeProtectionState, type ProtectionState } from '@/utils/protectionState';
 import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
 import { normalizeTickerInput } from '@/utils/ticker';
 import {
@@ -107,6 +107,8 @@ import {
   averagePurchasePrice,
   computeTradeCost,
   executedUnitPriceUsd,
+  quoteInputToUsd,
+  usdToQuoteInput,
   isPriceEnteredInAgorot,
   exceedsHolding,
   formatSignedUsd,
@@ -192,6 +194,16 @@ type EntryDataEdit = {
   historicalHwmUsd: number | null;
 };
 
+// Whether a historicalHWM was left as it was (a top-up that kept the
+// pre-filled value): a tiny tolerance absorbs the round trip through the
+// two-decimal input field and the currency conversion.
+function isSameHwm(previous: number | null, next: number): boolean {
+  if (previous === null) {
+    return false;
+  }
+  return Math.abs(previous - next) <= Math.max(1e-6, Math.abs(previous) * 1e-4);
+}
+
 type TradeStart = {
   ticker: string;
   category: PortfolioCategory;
@@ -264,9 +276,9 @@ function toAmbushStock(stock: PortfolioStock): Stock {
 // _with_request_scoped_fields.
 //
 // PROTECTION STATE (HWM decoupling): the stop itself comes from
-// computeProtectionState — Rule 1: locked at purchasePrice × 0.88 in
+// computeProtectionState — Rule 1: locked at historicalHWM × 0.88 in
 // Recovery State; Rule 2: trailing at activeHWM × 0.88 once the price has
-// reached the position's historicalHWM (or with no entry data at all). Null with no observed price yet (no watermark)
+// reached the position's historicalHWM (or with no historicalHWM at all). Null with no observed price yet (no watermark)
 // or while the price is unavailable (its placeholder 0 would read as a
 // triggered stop).
 function computeSatelliteProtection(stock: PortfolioStock): ProtectionState | null {
@@ -278,7 +290,6 @@ function computeSatelliteProtection(stock: PortfolioStock): ProtectionState | nu
   }
   return computeProtectionState({
     currentPrice: stock.price,
-    purchasePrice: stock.purchasePrice,
     historicalHWM: stock.historicalHWM,
     activeHWM: stock.highestWatermark,
   });
@@ -1003,6 +1014,21 @@ export default function PortfolioScreen() {
     // The reference price as this position will display it: a held
     // position's own calibration applies (AUTO-CALIBRATION).
     const displayFactor = held?.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR;
+    const basis = { ticker: start.ticker, assetType, usdPerLocal, currencySymbol: quote.currencySymbol };
+
+    // HISTORICAL HWM SMART DEFAULT for the Execute Trade field (USD first,
+    // then converted to the price field's units):
+    //   top-up with a stored value -> that value, so a correction the user
+    //     made earlier isn't silently replaced by the API figure;
+    //   otherwise the quote's 52-week high;
+    //   with no 52-week high, the live price (the position then tracks at
+    //     once).
+    const quoteHigh52 = quote.high52 !== null && quote.high52 > 0 ? applyCalibration(quote.high52, displayFactor) : null;
+    const historicalHwmDefaultUsd =
+      held?.historicalHWM ?? quoteHigh52 ?? applyCalibration(quote.price, displayFactor);
+    const historicalHwmSource: HistoricalHwmSource =
+      held !== undefined && held.historicalHWM !== null ? 'position' : quoteHigh52 !== null ? 'api' : 'livePrice';
+
     tradeIdRef.current += 1;
     setPendingTrade({
       side: 'buy',
@@ -1010,7 +1036,7 @@ export default function PortfolioScreen() {
       ticker: start.ticker,
       category,
       assetType,
-      basis: { ticker: start.ticker, assetType, usdPerLocal, currencySymbol: quote.currencySymbol },
+      basis,
       livePriceDisplay: formatUnitPrice(
         start.ticker,
         applyCalibration(quote.localPrice, displayFactor),
@@ -1018,6 +1044,8 @@ export default function PortfolioScreen() {
         t('ag'),
       ),
       isTopUp: held !== undefined,
+      historicalHwmDefault: usdToQuoteInput(historicalHwmDefaultUsd, basis),
+      historicalHwmSource,
       quote,
       calibrationTotalValue: held === undefined ? start.calibrationTotalValue : null,
       internalTargetPct: start.internalTargetPct,
@@ -1216,7 +1244,7 @@ export default function PortfolioScreen() {
   //   3. for a radar Buy, take the ticker off the Ambush Radar.
   // The duplicate check runs again inside the state update, so a ticker
   // that became held in the meantime is topped up rather than duplicated.
-  const commitTrade = (trade: PendingTrade, inputs: TradeInputs, costUsd: number) => {
+  const commitTrade = (trade: PendingTrade, inputs: TradeInputs, costUsd: number, historicalHwmUsd: number) => {
     // PROTECTION STATE: the executed price per unit (fees excluded), on the
     // same USD basis as the live price.
     const fillPriceUsd = executedUnitPriceUsd(inputs, trade.basis);
@@ -1232,11 +1260,20 @@ export default function PortfolioScreen() {
                 // An unknown earlier cost stays unknown: a partial sum
                 // would understate the position's real cost.
                 costBasisUsd: stock.costBasisUsd === null ? null : roundToCents(stock.costBasisUsd + costUsd),
-                // A top-up re-averages the entry price (which moves the
-                // Recovery stop with it) but keeps the position's original
-                // historicalHWM: the peak to reclaim is still the one from
-                // when the position was opened.
+                // A top-up re-averages the entry price (cost information;
+                // it doesn't affect the stop).
                 purchasePrice: averagePurchasePrice(stock.purchasePrice, stock.units, fillPriceUsd, inputs.quantity),
+                // HISTORICAL HWM: the value confirmed in Execute Trade
+                // (pre-filled with the stored one). If the user changed it,
+                // the breakout tracking restarts from the current price,
+                // like Edit Entry Data, so a peak recorded against the old
+                // value can't latch the position into Automated Tracking.
+                historicalHWM: historicalHwmUsd,
+                highestWatermark: isSameHwm(stock.historicalHWM, historicalHwmUsd)
+                  ? stock.highestWatermark
+                  : stock.priceStatus === 'live'
+                    ? stock.price
+                    : null,
               },
         );
       }
@@ -1245,13 +1282,9 @@ export default function PortfolioScreen() {
         inputs.quantity,
         trade.quote.localPrice,
       );
-      // PROTECTION STATE: the quote's 52-week high, on the position's
-      // calibrated basis, or the execution-time price when the quote has
-      // none (the position then tracks immediately).
-      const historicalHWM = resolveHistoricalHWM(
-        trade.quote.high52 === null ? null : applyCalibration(trade.quote.high52, calibrationFactor),
-        applyCalibration(trade.quote.price, calibrationFactor),
-      );
+      // PROTECTION STATE: historicalHWM is the value confirmed in Execute
+      // Trade (the smart default or the user's correction). It's a real
+      // price in broker terms, so no calibration is applied to it.
       const entry: PortfolioTickerEntry = {
         ticker: trade.ticker,
         category: trade.category,
@@ -1262,7 +1295,7 @@ export default function PortfolioScreen() {
         internalTargetPct: trade.internalTargetPct,
         costBasisUsd: costUsd,
         purchasePrice: fillPriceUsd,
-        historicalHWM,
+        historicalHWM: historicalHwmUsd,
       };
       // buildPortfolioStock calibrates the quote and seeds the watermark
       // from the live price, exactly like a freshly loaded position.
@@ -1323,11 +1356,13 @@ export default function PortfolioScreen() {
   // QA RULE: a trade costing more than the buying power is never applied
   // silently. The user sees the cost, the balance and the resulting
   // (negative) balance, and must explicitly choose Execute Anyway.
-  const handleConfirmTrade = (inputs: TradeInputs) => {
+  const handleConfirmTrade = (inputs: TradeInputs, historicalHwmInput: number | null) => {
     const trade = pendingTrade;
-    if (trade === null) {
+    if (trade === null || historicalHwmInput === null) {
       return;
     }
+    // The historicalHWM field's final value, in USD on the live-price basis.
+    const historicalHwmUsd = quoteInputToUsd(historicalHwmInput, trade.basis);
     if (!isCashLoadedRef.current) {
       Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
       return;
@@ -1344,12 +1379,16 @@ export default function PortfolioScreen() {
         }),
         [
           { text: t('cancel'), style: 'cancel' },
-          { text: t('executeAnyway'), style: 'destructive', onPress: () => commitTrade(trade, inputs, totalUsd) },
+          {
+            text: t('executeAnyway'),
+            style: 'destructive',
+            onPress: () => commitTrade(trade, inputs, totalUsd, historicalHwmUsd),
+          },
         ],
       );
       return;
     }
-    commitTrade(trade, inputs, totalUsd);
+    commitTrade(trade, inputs, totalUsd, historicalHwmUsd);
   };
 
   // YIELD LEDGER / CASH CORRECTION ("Adjust Cash"): a deposit or dividend
@@ -3257,10 +3296,10 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
           {/* PROTECTION STATE: the two entry anchors captured by Execute
               Trade (absent for positions opened before trade logging). */}
-          {/* LEGACY ENTRY DATA: without both a purchasePrice and a
-              historicalHWM the position can only be in Automated Tracking
-              (Rule 2); point the user at the fix. */}
-          {(stock.purchasePrice === null || stock.historicalHWM === null) && (
+          {/* LEGACY ENTRY DATA: without a historicalHWM the position can
+              only be in Automated Tracking (Rule 2); point the user at the
+              fix. */}
+          {stock.historicalHWM === null && (
             <Text style={styles.entryMissingText}>{t('entryDataMissingHint')}</Text>
           )}
           {stock.purchasePrice !== null && (

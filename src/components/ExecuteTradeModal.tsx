@@ -26,13 +26,22 @@ import {
   computeTradeCost,
   exceedsHolding,
   formatMoney,
+  formatQuoteInput,
   formatUsd,
   isPriceEnteredInAgorot,
+  parsePositiveNumber,
   parseTradeInputs,
   roundToCents,
   type TradeInputs,
   type TradePricingBasis,
 } from '@/utils/trade-execution';
+
+// Where the historicalHWM field's pre-filled value came from:
+//   'api'       the quote's 52-week high (new position);
+//   'position'  the position's own stored value (top-up);
+//   'livePrice' no 52-week high was available: the live price, so the
+//               position starts in Automated Tracking.
+export type HistoricalHwmSource = 'api' | 'position' | 'livePrice';
 
 type TradeRequestBase = {
   ticker: string;
@@ -52,6 +61,13 @@ export type ExecuteTradeRequest =
       // True when the ticker is already held: the quantity is added to
       // the existing position.
       isTopUp: boolean;
+      // HISTORICAL HWM SMART DEFAULT: the value pre-filled in the
+      // historicalHWM field, in the same units as the price field (Agorot
+      // for ".TA", otherwise the instrument's currency), and where it came
+      // from. Whatever the field holds on confirm is saved as the
+      // position's historicalHWM, the anchor of the Recovery stop.
+      historicalHwmDefault: number | null;
+      historicalHwmSource: HistoricalHwmSource;
     })
   | (TradeRequestBase & {
       side: 'sell';
@@ -66,7 +82,9 @@ export type ExecuteTradeRequest =
 export type ExecuteTradeModalProps = {
   request: ExecuteTradeRequest | null;
   cashBalance: number;
-  onConfirm: (inputs: TradeInputs) => void;
+  // historicalHwmInput: the historicalHWM field's final value (price-field
+  // units) for a buy; always null for a sale.
+  onConfirm: (inputs: TradeInputs, historicalHwmInput: number | null) => void;
   onCancel: () => void;
 };
 
@@ -92,6 +110,14 @@ export function ExecuteTradeModal({ request, cashBalance, onConfirm, onCancel }:
   );
   const [priceText, setPriceText] = useState('');
   const [feeText, setFeeText] = useState('');
+  // HISTORICAL HWM SMART DEFAULT: starts pre-filled (see the request) and
+  // is fully editable; the remount-per-request keeps the default fresh.
+  const initialHwmText =
+    request?.side === 'buy' && request.historicalHwmDefault !== null
+      ? formatQuoteInput(request.historicalHwmDefault)
+      : '';
+  const [hwmText, setHwmText] = useState(initialHwmText);
+  const isHwmOverridden = hwmText.trim() !== initialHwmText;
 
   const inputs = parseTradeInputs(quantityText, priceText, feeText);
   const isSell = request?.side === 'sell';
@@ -118,8 +144,19 @@ export function ExecuteTradeModal({ request, cashBalance, onConfirm, onCancel }:
       );
       return;
     }
+    let historicalHwmInput: number | null = null;
+    if (request.side === 'buy') {
+      historicalHwmInput = parsePositiveNumber(hwmText);
+      if (historicalHwmInput === null) {
+        Alert.alert(
+          t('invalidHwmTitle'),
+          t('invalidHwmMessage', { unit: isPriceEnteredInAgorot(request.ticker) ? t('ag') : request.basis.currencySymbol }),
+        );
+        return;
+      }
+    }
     Keyboard.dismiss();
-    onConfirm(inputs);
+    onConfirm(inputs, historicalHwmInput);
   };
 
   if (request === null) {
@@ -204,6 +241,35 @@ export function ExecuteTradeModal({ request, cashBalance, onConfirm, onCancel }:
                   placeholderTextColor={colors.textSecondary}
                   accessibilityLabel={t('brokerFee', { unit: feeUnit })}
                 />
+
+                {/* HISTORICAL HWM SMART DEFAULT (buys only): pre-filled,
+                    editable, and saved exactly as confirmed. It is the
+                    anchor of the Recovery stop (historicalHWM × 0.88). */}
+                {request.side === 'buy' && (
+                  <>
+                    <Text style={styles.label}>{t('historicalHwmField', { unit: priceUnit })}</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={hwmText}
+                      onChangeText={setHwmText}
+                      keyboardType="decimal-pad"
+                      maxLength={15}
+                      selectTextOnFocus
+                      accessibilityLabel={t('historicalHwmField', { unit: priceUnit })}
+                    />
+                    <Text style={[styles.hint, isHwmOverridden && styles.overrideHint]}>
+                      {isHwmOverridden
+                        ? t('hwmManualOverride')
+                        : t(
+                            request.historicalHwmSource === 'api'
+                              ? 'hwmSourceApi'
+                              : request.historicalHwmSource === 'position'
+                                ? 'hwmSourcePosition'
+                                : 'hwmSourceLivePrice',
+                          )}
+                    </Text>
+                  </>
+                )}
 
                 <View style={styles.summary}>
                   <View style={styles.summaryRow}>
@@ -316,6 +382,11 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
       marginBottom: 8,
       textAlign,
       writingDirection,
+    },
+    // The historicalHWM field's note once the user has changed the default.
+    overrideHint: {
+      color: colors.warning,
+      fontWeight: '600',
     },
     topUpNote: {
       color: colors.warning,

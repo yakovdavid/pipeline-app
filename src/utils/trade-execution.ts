@@ -96,8 +96,36 @@ function grossLocal(inputs: TradeInputs, basis: TradePricingBasis): number {
 // basis as a position's live `price` (Agorot converted to Shekels, then
 // to USD). This is a position's `purchasePrice`.
 export function executedUnitPriceUsd(inputs: TradeInputs, basis: TradePricingBasis): number {
-  const unitPriceLocal = isPriceEnteredInAgorot(basis.ticker) ? inputs.price / AGOROT_PER_SHEKEL : inputs.price;
+  return quoteInputToUsd(inputs.price, basis);
+}
+
+// A price typed in the Execute Trade units (Agorot for ".TA", otherwise
+// the instrument's currency) as USD on the live-price basis, and back.
+// Used for the fill price and for the historicalHWM field, so both are
+// entered and stored the same way.
+export function quoteInputToUsd(value: number, basis: TradePricingBasis): number {
+  const unitPriceLocal = isPriceEnteredInAgorot(basis.ticker) ? value / AGOROT_PER_SHEKEL : value;
   return unitPriceLocal * basis.usdPerLocal;
+}
+
+export function usdToQuoteInput(usdValue: number, basis: TradePricingBasis): number | null {
+  if (!Number.isFinite(basis.usdPerLocal) || basis.usdPerLocal <= 0) {
+    return null;
+  }
+  const localValue = usdValue / basis.usdPerLocal;
+  return isPriceEnteredInAgorot(basis.ticker) ? localValue * AGOROT_PER_SHEKEL : localValue;
+}
+
+// A pre-filled input value: two decimals at most, no trailing zeros
+// ("3985", "187.2").
+export function formatQuoteInput(value: number): string {
+  return String(Number(value.toFixed(2)));
+}
+
+// A positive number from a text field (commas allowed), or null.
+export function parsePositiveNumber(text: string): number | null {
+  const value = parseNumber(text);
+  return value !== null && value > 0 ? value : null;
 }
 
 // A top-up's new average purchase price, weighted by quantity. An unknown

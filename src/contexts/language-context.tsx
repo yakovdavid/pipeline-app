@@ -209,6 +209,13 @@ export type TranslationKey =
   | 'editEntryData'
   | 'addAssetNextStepHint'
   | 'logExitFill'
+  | 'historicalHwmField'
+  | 'hwmSourceApi'
+  | 'hwmSourcePosition'
+  | 'hwmSourceLivePrice'
+  | 'hwmManualOverride'
+  | 'invalidHwmTitle'
+  | 'invalidHwmMessage'
   | 'executionLogFailed'
   | 'feesLoggedCaption'
   | 'trackingTooltipLabel'
@@ -421,6 +428,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     editEntryData: 'עריכת נתוני כניסה',
     addAssetNextStepHint: 'כמות, מחיר ועמלות יוזנו במסך הבא.',
     logExitFill: 'רישום ביצוע יציאה (כל היחידות)',
+    historicalHwmField: 'שיא היסטורי ({{unit}})',
+    hwmSourceApi: 'מולא אוטומטית משיא 52 השבועות. תקן אם הנתון שגוי.',
+    hwmSourcePosition: 'מולא מהערך השמור של הפוזיציה. שינוי שלו מאפס את מעקב הפריצה.',
+    hwmSourceLivePrice: 'אין שיא 52 שבועות: מולא המחיר החי (הסטופ ייגרר מיד).',
+    hwmManualOverride: 'ערך ידני: זהו השיא שיישמר ועליו יחושב הסטופ.',
+    invalidHwmTitle: 'שיא היסטורי לא תקין',
+    invalidHwmMessage: 'הזן שיא היסטורי חיובי ב-{{unit}}.',
     executionLogFailed: '{{ticker}} עודכן, אך רישום הביצוע ביומן נכשל.',
     feesLoggedCaption: 'עמלות ברוקר שנרשמו: {{amount}}',
     trackingTooltipLabel: 'מידע על מעקב אוטומטי',
@@ -431,7 +445,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     invalidEntryDataTitle: 'נתוני כניסה לא תקינים',
     invalidEntryDataMessage: 'הזן מספר חיובי ב-{{unit}}, או השאר את השדה ריק.',
     entryDataMissingHint: 'חסרים נתוני כניסה: מוצג כמעקב אוטומטי. עריכה > עריכת נתוני כניסה.',
-    stopLockedAt: 'סטופ נעול (מחיר כניסה -12%)',
+    stopLockedAt: 'סטופ נעול (-12% מהשיא ההיסטורי)',
     purchasePriceLabel: 'מחיר כניסה',
     historicalHwmLabel: 'שיא היסטורי (שיא 52 שבועות בכניסה)',
     overweightLockBadge: 'מושבת - שכבה בחריגת משקל',
@@ -626,6 +640,13 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     editEntryData: 'Edit Entry Data',
     addAssetNextStepHint: 'You will input Quantity, Price, and Fees on the next screen.',
     logExitFill: 'Log Exit Fill (All Units)',
+    historicalHwmField: 'Historical HWM ({{unit}})',
+    hwmSourceApi: 'Pre-filled from the 52-week high. Correct it if the data looks wrong.',
+    hwmSourcePosition: 'Pre-filled from this position. Changing it restarts the breakout tracking.',
+    hwmSourceLivePrice: 'No 52-week high available: pre-filled with the live price (the stop trails at once).',
+    hwmManualOverride: 'Manual override: this is the HWM that will be saved and used for the stop.',
+    invalidHwmTitle: 'Invalid Historical HWM',
+    invalidHwmMessage: 'Enter a positive historical HWM in {{unit}}.',
     executionLogFailed: '{{ticker}} was updated, but the fill could not be logged.',
     feesLoggedCaption: 'Broker fees logged: {{amount}}',
     trackingTooltipLabel: 'About Automated Tracking',
@@ -636,7 +657,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     invalidEntryDataTitle: 'Invalid Entry Data',
     invalidEntryDataMessage: 'Enter a positive number in {{unit}}, or leave the field blank.',
     entryDataMissingHint: 'Entry data missing: shown as Automated Tracking. Edit > Edit Entry Data.',
-    stopLockedAt: 'Locked stop (entry -12%)',
+    stopLockedAt: 'Locked Stop (-12% from HWM)',
     purchasePriceLabel: 'Entry price',
     historicalHwmLabel: 'Historical HWM (52-week high at entry)',
     overweightLockBadge: 'Disabled - Layer Overweight',
