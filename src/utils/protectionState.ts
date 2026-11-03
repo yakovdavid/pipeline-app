@@ -59,10 +59,11 @@
 // never decreases: once it reaches historicalHWM the position stays in
 // Rule 2 even if the price dips back below historicalHWM. Re-entering Rule
 // 1 on such a dip would swap the trailing stop (activeHWM × 0.88) for the
-// lower historicalHWM × 0.88, moving the stop DOWN. Changing a position's
-// historicalHWM (Edit Entry Data, or a top-up that corrects it) restarts
-// activeHWM, so a peak recorded against the old value can't trip the
-// latch.
+// lower historicalHWM × 0.88, moving the stop DOWN. Editing entry data
+// (purchasePrice, historicalHWM, in Edit Entry Data or a top-up) NEVER
+// resets activeHWM: the tracked peak persists. The user can set it by hand
+// (Edit Entry Data > High Water Mark) to recover a lost peak; a value at or
+// above historicalHWM moves the position to Rule 2 at once.
 
 // The single 12% stop distance (matches SATELLITE_TS_PCT in
 // @/constants/thresholds); both modes use it.

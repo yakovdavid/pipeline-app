@@ -223,6 +223,8 @@ export type TranslationKey =
   | 'entryDataHint'
   | 'purchasePriceInput'
   | 'historicalHwmInput'
+  | 'activeHwmInput'
+  | 'editHighWaterMark'
   | 'invalidEntryDataTitle'
   | 'invalidEntryDataMessage'
   | 'entryDataMissingHint'
@@ -442,6 +444,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     entryDataHint: 'הזן כפי שמופיע אצל הברוקר ({{unit}}). שדה ריק נשאר ללא שינוי.',
     purchasePriceInput: 'מחיר כניסה ({{unit}}) - כעת: {{current}}',
     historicalHwmInput: 'שיא היסטורי ({{unit}}) - כעת: {{current}}',
+    activeHwmInput: 'שיא מעקב (HWM) בזמן ההחזקה ({{unit}}) - כעת: {{current}}',
+    editHighWaterMark: 'עריכת שיא המעקב',
     invalidEntryDataTitle: 'נתוני כניסה לא תקינים',
     invalidEntryDataMessage: 'הזן מספר חיובי ב-{{unit}}, או השאר את השדה ריק.',
     entryDataMissingHint: 'חסרים נתוני כניסה: מוצג כמעקב אוטומטי. עריכה > עריכת נתוני כניסה.',
@@ -654,6 +658,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     entryDataHint: 'Enter as your broker shows it ({{unit}}). A blank field stays unchanged.',
     purchasePriceInput: 'Entry price ({{unit}}) - now: {{current}}',
     historicalHwmInput: 'Historical HWM ({{unit}}) - now: {{current}}',
+    activeHwmInput: 'High Water Mark while held ({{unit}}) - now: {{current}}',
+    editHighWaterMark: 'Edit High Water Mark',
     invalidEntryDataTitle: 'Invalid Entry Data',
     invalidEntryDataMessage: 'Enter a positive number in {{unit}}, or leave the field blank.',
     entryDataMissingHint: 'Entry data missing: shown as Automated Tracking. Edit > Edit Entry Data.',

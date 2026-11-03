@@ -192,17 +192,10 @@ type PendingSale = Extract<ExecuteTradeRequest, { side: 'sell' }> & {
 type EntryDataEdit = {
   purchasePriceUsd: number | null;
   historicalHwmUsd: number | null;
+  // MANUAL HWM OVERRIDE: the true peak reached while holding, replacing
+  // the tracked highestWatermark (activeHWM).
+  activeHwmUsd: number | null;
 };
-
-// Whether a historicalHWM was left as it was (a top-up that kept the
-// pre-filled value): a tiny tolerance absorbs the round trip through the
-// two-decimal input field and the currency conversion.
-function isSameHwm(previous: number | null, next: number): boolean {
-  if (previous === null) {
-    return false;
-  }
-  return Math.abs(previous - next) <= Math.max(1e-6, Math.abs(previous) * 1e-4);
-}
 
 type TradeStart = {
   ticker: string;
@@ -1264,16 +1257,10 @@ export default function PortfolioScreen() {
                 // it doesn't affect the stop).
                 purchasePrice: averagePurchasePrice(stock.purchasePrice, stock.units, fillPriceUsd, inputs.quantity),
                 // HISTORICAL HWM: the value confirmed in Execute Trade
-                // (pre-filled with the stored one). If the user changed it,
-                // the breakout tracking restarts from the current price,
-                // like Edit Entry Data, so a peak recorded against the old
-                // value can't latch the position into Automated Tracking.
+                // (pre-filled with the stored one). The tracked peak
+                // (highestWatermark) is kept as it is: changing an entry
+                // value never resets it (see handleSaveEdit).
                 historicalHWM: historicalHwmUsd,
-                highestWatermark: isSameHwm(stock.historicalHWM, historicalHwmUsd)
-                  ? stock.highestWatermark
-                  : stock.priceStatus === 'live'
-                    ? stock.price
-                    : null,
               },
         );
       }
@@ -1646,19 +1633,15 @@ export default function PortfolioScreen() {
           // DATA-LOSS FIX: an 'unavailable' row's price is only a placeholder
           // 0, so it never seeds a missing watermark.
           //
-          // LATCH RESET: saving Edit Entry Data restarts the watermark
-          // (activeHWM) at the current price. The watermark is the breakout
-          // latch in @/utils/protectionState: a peak recorded BEFORE the
-          // user entered the real entry data (e.g. while a legacy position
-          // was trailing without it) would otherwise count as an earlier
-          // breakout and keep the position in Automated Tracking even with
-          // the price below the newly entered historicalHWM. Restarting it
-          // means the price must reclaim historicalHWM from now on. With
-          // the price unavailable the watermark is cleared, and the next
-          // successful refresh seeds it.
-          const isEntryDataEdited = entryEdit.purchasePriceUsd !== null || entryEdit.historicalHwmUsd !== null;
+          // NO LATCH RESET: editing purchasePrice or historicalHWM never
+          // touches the watermark (activeHWM); the tracked peak persists.
+          // The only way to change it is the MANUAL HWM OVERRIDE field,
+          // whose value replaces it as entered. If that value is at or above
+          // historicalHWM, computeProtectionState puts the position in
+          // Automated Tracking (stop = activeHWM × 0.88) on this same
+          // render; the next refresh only raises it if the price is higher.
           const livePrice = stock.priceStatus === 'live' ? stock.price : null;
-          const highestWatermark = isEntryDataEdited ? livePrice : (stock.highestWatermark ?? livePrice);
+          const highestWatermark = entryEdit.activeHwmUsd ?? stock.highestWatermark ?? livePrice;
 
           // CORE LAYER INTERNAL ALLOCATION: a BLANK field PRESERVES the
           // existing value — same "blank means leave it alone" reasoning as
@@ -1714,9 +1697,9 @@ export default function PortfolioScreen() {
           // same raw figures. macroTrend/tacticalMomentum are untouched —
           // they're a price-vs-SMA ratio comparison, unaffected by scaling
           // both sides by the same factor (see calibrateQuote's own
-          // comment). The old highestWatermark's basis is no longer valid
-          // once the scale changes, so it's reseeded from the newly
-          // corrected price instead of carried forward stale.
+          // comment). The tracked highestWatermark is moved to the new
+          // scale the same way, so the peak survives recalibration (a
+          // manual override typed in this same save is used as entered).
           const existingFactor = stock.calibrationFactor ?? DEFAULT_CALIBRATION_FACTOR;
           const rawLocalPrice = stripCalibration(stock.localPrice, existingFactor);
           const rawUsdPrice = stripCalibration(stock.price, existingFactor);
@@ -1740,7 +1723,11 @@ export default function PortfolioScreen() {
             sma50: newSma50,
             sma200: newSma200,
             calibrationFactor,
-            highestWatermark: newUsdPrice,
+            highestWatermark:
+              entryEdit.activeHwmUsd ??
+              (stock.highestWatermark === null
+                ? newUsdPrice
+                : applyCalibration(stripCalibration(stock.highestWatermark, existingFactor), calibrationFactor)),
             internalTargetPct,
             // PROTECTION STATE: a stored historicalHWM came from Yahoo (the
             // quote's 52-week high), so it moves to the new scale like the
@@ -2838,6 +2825,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const [isEntryEditorOpen, setIsEntryEditorOpen] = useState(false);
   const [purchasePriceText, setPurchasePriceText] = useState('');
   const [historicalHwmText, setHistoricalHwmText] = useState('');
+  const [activeHwmText, setActiveHwmText] = useState('');
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
   // `units` is a Nominal Value quantity — 100 nominal units = 1 real
@@ -2973,8 +2961,16 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     setInternalTargetText('');
     setPurchasePriceText('');
     setHistoricalHwmText('');
+    setActiveHwmText('');
     setIsEntryEditorOpen(stock.purchasePrice === null || stock.historicalHWM === null);
     setIsEditing(true);
+  };
+
+  // MANUAL HWM OVERRIDE: the pencil next to "High Water Mark" opens the
+  // editor straight onto the entry fields.
+  const handleStartEditingHwm = () => {
+    handleStartEditing();
+    setIsEntryEditorOpen(true);
   };
 
   // LEGACY ENTRY DATA: the unit the two fields are typed in, and their
@@ -3008,7 +3004,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const handleSaveEdit = () => {
     const purchasePriceUsd = parseEntryField(purchasePriceText);
     const historicalHwmUsd = parseEntryField(historicalHwmText);
-    if (purchasePriceUsd === 'invalid' || historicalHwmUsd === 'invalid') {
+    const activeHwmUsd = parseEntryField(activeHwmText);
+    if (purchasePriceUsd === 'invalid' || historicalHwmUsd === 'invalid' || activeHwmUsd === 'invalid') {
       // Stays in edit mode so nothing typed is lost.
       Alert.alert(t('invalidEntryDataTitle'), t('invalidEntryDataMessage', { unit: entryUnit }));
       return;
@@ -3016,6 +3013,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     onSaveEdit(stock.ticker, editedAssetType, totalValueText, internalTargetText, {
       purchasePriceUsd,
       historicalHwmUsd,
+      activeHwmUsd,
     });
     setIsEditing(false);
   };
@@ -3185,6 +3183,21 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                 maxLength={15}
                 onSubmitEditing={handleSaveEdit}
               />
+              {/* MANUAL HWM OVERRIDE: the true peak reached while holding,
+                  to recover a lost or wrong tracked peak (see onSaveEdit). */}
+              <TextInput
+                style={[styles.unitsEditInput, styles.totalValueEditInput]}
+                value={activeHwmText}
+                onChangeText={setActiveHwmText}
+                placeholder={t('activeHwmInput', {
+                  unit: entryUnit,
+                  current: formatEntryValue(stock.highestWatermark),
+                })}
+                placeholderTextColor={colors.textSecondary}
+                keyboardType="decimal-pad"
+                maxLength={15}
+                onSubmitEditing={handleSaveEdit}
+              />
             </View>
           )}
         </View>
@@ -3289,9 +3302,18 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               trailingStopPrice just below (highestWatermark is tracked in
               USD regardless of the instrument's own trading currency). */}
           {stock.highestWatermark !== null && (
-            <Text style={styles.macroContextText}>
-              {t('highWaterMark')}: ${stock.highestWatermark.toFixed(2)}
-            </Text>
+            <View style={styles.hwmDisplayRow}>
+              <Text style={styles.macroContextText}>
+                {t('highWaterMark')}: ${stock.highestWatermark.toFixed(2)}
+              </Text>
+              <TouchableOpacity
+                onPress={handleStartEditingHwm}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityRole="button"
+                accessibilityLabel={`${t('editHighWaterMark')} ${stock.ticker}`}>
+                <Ionicons name="pencil" size={12} color={colors.textSecondary} />
+              </TouchableOpacity>
+            </View>
           )}
 
           {/* PROTECTION STATE: the two entry anchors captured by Execute
@@ -4119,6 +4141,12 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     marginTop: 6,
     textAlign: isHebrew ? 'right' : 'left',
     writingDirection: isHebrew ? 'rtl' : 'ltr',
+  },
+  // MANUAL HWM OVERRIDE: "High Water Mark: $X" plus its edit pencil.
+  hwmDisplayRow: {
+    flexDirection: isHebrew ? 'row-reverse' : 'row',
+    alignItems: 'flex-end',
+    gap: 8,
   },
   trailingStopText: {
     // Translated-word-first label + LTR '$' threshold value — an aligned
