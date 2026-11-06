@@ -1,4 +1,5 @@
 import type { AmbushAsset, QualityAmbushAsset, SatelliteAmbushAsset } from '@/types/ambush';
+import { isFailedAmbush } from '@/utils/ambush-safety';
 import { classifyPullbackZone } from '@/utils/ambush-zone';
 import { isQualityBuySignal, passesQualityFundamentals } from '@/utils/quality-signal';
 
@@ -21,7 +22,12 @@ export type AmbushReadinessGroups = Record<AmbushReadinessZone, AmbushAsset[]>;
 //     Invalidated.
 //   Invalidated (CRASH RULE): pullback depth <= -7.00%. That is a crash,
 //     not a pullback, even in an uptrend. Exactly -7.00% counts as a crash.
-//   Value Zone: pullback depth from -3.00% down to -6.99%.
+//   Invalidated (FAILED AMBUSH): in the Kill Zone, but the price is less
+//     than 2% above the structural stop it would get on entry
+//     (historicalHWM × 0.88). See @/utils/ambush-safety; the card shows
+//     why with its own "Failed Ambush" banner.
+//   Value Zone: pullback depth from -3.00% down to -6.99%, and the safety
+//     cross-check passes.
 //   Watch:      pullback depth  > -3.00%.
 // All boundaries come from classifyPullbackZone (ambush-zone.ts), the same
 // function behind the card's Pullback Depth badge, so a row's section and
@@ -35,7 +41,7 @@ function classifySatellite(asset: SatelliteAmbushAsset): AmbushReadinessZone {
   }
   switch (classifyPullbackZone(asset.pullbackDepth)) {
     case 'killZone':
-      return 'valueZone';
+      return isFailedAmbush(asset) ? 'invalidated' : 'valueZone';
     case 'overshot':
       return 'invalidated';
     case 'premium':

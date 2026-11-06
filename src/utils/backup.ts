@@ -15,6 +15,13 @@ import {
   replaceExecutionLedger,
   type ExecutionRecord,
 } from '@/utils/execution-ledger';
+import {
+  ensureTargetAllocationsLoaded,
+  getTargetAllocationState,
+  parseTargetAllocations,
+  saveTargetAllocations,
+  type TargetAllocations,
+} from '@/utils/target-allocation-store';
 
 const BACKUP_SCHEMA_VERSION = 1;
 const PORTFOLIO_CATEGORIES: PortfolioCategory[] = ['Core', 'Satellite', 'Quality'];
@@ -34,6 +41,11 @@ export type BackupPayload = {
   // restoring such a backup leaves the device's ledger untouched rather
   // than erasing it. An empty array is a real, empty ledger.
   executions: ExecutionRecord[] | null;
+  // DYNAMIC LAYER TARGETS: the Core/Satellite/Quality targets (see
+  // @/utils/target-allocation-store). Null when the backup predates them;
+  // restoring such a backup leaves the device's targets untouched. An
+  // invalid set fails parseBackupPayload (see parseBackupTargets).
+  targetAllocations: TargetAllocations | null;
 };
 
 // Reads both screens' persisted ticker lists, the cash balance and the
@@ -41,12 +53,18 @@ export type BackupPayload = {
 // which this module has no access to) into one exportable JSON object. An
 // unreadable ledger fails the export, like an unreadable portfolio would,
 // rather than producing a backup that silently lacks it.
+//
+// The target allocations are the ones in effect (the store's state, once
+// the saved value has been read): never-set targets export as the 70/20/10
+// default, so a migrated device ends up with exactly the targets the old
+// one was using.
 export async function createBackupPayload(): Promise<BackupPayload> {
   const [storedPortfolio, storedAmbush, storedCash, executions] = await Promise.all([
     AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(AMBUSH_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(CASH_BALANCE_STORAGE_KEY),
     loadExecutionLedger(),
+    ensureTargetAllocationsLoaded(),
   ]);
 
   return {
@@ -57,6 +75,7 @@ export async function createBackupPayload(): Promise<BackupPayload> {
     // Never-saved cash is a real balance of 0, not "unknown".
     cashBalance: storedCash ? parseCashBalance(JSON.parse(storedCash)) : 0,
     executions,
+    targetAllocations: { ...getTargetAllocationState().targets },
   };
 }
 
@@ -210,19 +229,42 @@ export function parseBackupPayload(rawText: string): BackupPayload {
     // Malformed entries are dropped one by one; a missing or non-array
     // value means "no ledger in this backup" (null).
     executions: parseExecutionRecords(payload.executions),
+    targetAllocations: parseBackupTargets(payload),
   };
+}
+
+// STRICT BACKUP VALIDATION: an absent block (a backup from before targets
+// existed) restores nothing, keeping the device's targets. A block that is
+// present but invalid (not 0-100% each, not summing to 100%, a missing
+// layer, or null) rejects the WHOLE import: skipping it would leave the
+// device on targets the user never chose, possibly reopening a 0% layer.
+function parseBackupTargets(payload: Record<string, unknown>): TargetAllocations | null {
+  if (!('targetAllocations' in payload)) {
+    return null;
+  }
+  const targets = parseTargetAllocations(payload.targetAllocations);
+  if (targets === null) {
+    throw new Error(
+      'Backup has a corrupted "targetAllocations" block: Core, Satellite and Quality must each be 0-100% ' +
+        'and sum to 100%. Nothing was restored.',
+    );
+  }
+  return targets;
 }
 
 // Overwrites both screens' persisted storage. Portfolio's own live state is
 // updated by the caller right after this (it's already mounted where the
 // Import UI lives); Ambush Radar picks up the change next time its tab
 // gains focus (see the useFocusEffect in ambush.tsx) since it's a separate
-// mounted screen this module has no direct handle to.
+// mounted screen this module has no direct handle to. The target
+// allocations are the exception: saveTargetAllocations publishes them to
+// both screens at once, so the radar's locks update without a refocus.
 export async function restoreBackupPayload(payload: BackupPayload): Promise<void> {
   await Promise.all([
     AsyncStorage.setItem(PORTFOLIO_TICKERS_STORAGE_KEY, JSON.stringify(payload.portfolio)),
     AsyncStorage.setItem(AMBUSH_TICKERS_STORAGE_KEY, JSON.stringify(payload.ambush)),
     ...(payload.cashBalance !== null ? [saveCashBalance(payload.cashBalance)] : []),
     ...(payload.executions !== null ? [replaceExecutionLedger(payload.executions)] : []),
+    ...(payload.targetAllocations !== null ? [saveTargetAllocations(payload.targetAllocations)] : []),
   ]);
 }

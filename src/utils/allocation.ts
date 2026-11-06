@@ -71,10 +71,17 @@ export function computeAllocation(values: AllocationValues): AllocationBreakdown
 
 // CIRCUIT BREAKER (Layer Overweight Lock): a layer whose cash-diluted
 // weight is STRICTLY above its target + 1 percentage point is locked, and
-// the Ambush Radar disables buying into it (Satellite > 21%, Quality > 11%,
-// Core > 71%). Evaluated on the same one-decimal weights the Portfolio
-// displays, so the lock never disagrees with what the user sees: 21.0% is
-// not locked, 21.1% is.
+// the Ambush Radar disables buying into it. The targets are the user's own
+// (DYNAMIC LAYER TARGETS, @/utils/target-allocation-store), never a
+// hardcoded cap: with 70/20/10 that's Satellite > 21%, Quality > 11%; with
+// 80/0/20, Quality > 21%. Any layer below its target is always buyable.
+// Evaluated on the same one-decimal weights the Portfolio displays, so the
+// lock never disagrees with what the user sees: 21.0% is not locked, 21.1%
+// is.
+//
+// A layer with a 0% target is CLOSED: locked whatever its weight, since
+// the plan holds nothing there (the 1-point tolerance would otherwise let
+// a fresh buy into it through).
 export const OVERWEIGHT_TOLERANCE_PCT = 1;
 
 export type AllocationLayer = Exclude<AllocationBucket, 'Cash'>;
@@ -88,5 +95,9 @@ export function isLayerOverweight(
   weightsPct: AllocationValues,
   targetPct: Record<AllocationLayer, number>,
 ): boolean {
-  return weightsPct[layer] > overweightLimitPct(layer, targetPct);
+  return isLayerClosed(layer, targetPct) || weightsPct[layer] > overweightLimitPct(layer, targetPct);
+}
+
+export function isLayerClosed(layer: AllocationLayer, targetPct: Record<AllocationLayer, number>): boolean {
+  return targetPct[layer] <= 0;
 }

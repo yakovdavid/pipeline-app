@@ -44,6 +44,8 @@ export type TranslationKey =
   | 'notAvailable'
   | 'insufficientMomentumData'
   | 'structuralStopWarning'
+  | 'failedAmbushBanner'
+  | 'failedAmbushDetail'
   // Pullback Depth Indicator (replaces the binary Tactical Momentum
   // badge — see TrendBadges.tsx) and Quality Z-Score Module
   | 'pullbackDepth'
@@ -235,6 +237,15 @@ export type TranslationKey =
   | 'overweightBanner'
   | 'overweightBuyBlockedTitle'
   | 'overweightBuyBlockedMessage'
+  | 'layerClosedBanner'
+  | 'layerClosedBuyBlockedMessage'
+  | 'targetAllocation'
+  | 'targetAllocationHint'
+  | 'targetAllocationSum'
+  | 'saveTargets'
+  | 'invalidTargetsTitle'
+  | 'invalidTargetsMessage'
+  | 'targetsSaveFailedMessage'
   | 'netProceeds'
   | 'confirmSell'
   | 'sellQuantityTooHighTitle'
@@ -281,6 +292,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     notAvailable: 'לא זמין',
     insufficientMomentumData: 'אין מספיק נתוני ממוצע נע',
     structuralStopWarning: '⚠ אזהרת עצירה מבנית: במרחק 2% מתמיכת ממוצע 200 יום',
+    failedAmbushBanner: 'מארב כושל (קרוב מדי לסטופ המבני)',
+    failedAmbushDetail: 'הסטופ {{stop}} נמצא רק {{margin}}% מתחת למחיר (מינימום {{min}}%).',
     pullbackDepth: 'עומק נסיגה',
     premium: 'פרימיום',
     watch: 'מעקב',
@@ -456,6 +469,15 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     overweightBanner: '{{layer}} במשקל {{weight}}% (תקרה {{limit}}%): הקנייה נעולה',
     overweightBuyBlockedTitle: 'שכבה בחריגת משקל',
     overweightBuyBlockedMessage: '{{layer}} מעל התקרה של {{limit}}%. הקנייה מהמכ״ם נעולה עד לאיזון.',
+    layerClosedBanner: 'יעד {{layer}} הוא 0%: הקנייה סגורה',
+    layerClosedBuyBlockedMessage: 'יעד {{layer}} הוא 0%. הקנייה מהמכ״ם סגורה לשכבה זו.',
+    targetAllocation: 'יעדי הקצאה',
+    targetAllocationHint: 'היעד של כל שכבה, באחוזים. הסכום חייב להיות 100%. שכבה מתחת ליעד נשארת פתוחה לקנייה; שכבה ביעד 0% סגורה.',
+    targetAllocationSum: 'סה״כ: {{sum}}%',
+    saveTargets: 'שמור יעדים',
+    invalidTargetsTitle: 'יעדים לא תקינים',
+    invalidTargetsMessage: 'כל יעד חייב להיות בין 0 ל-100, והסכום חייב להיות 100%.',
+    targetsSaveFailedMessage: 'לא ניתן היה לשמור את היעדים. הם פעילים עד לסגירת האפליקציה.',
     netProceeds: 'תמורה נטו',
     confirmSell: 'אשר מכירה',
     sellQuantityTooHighTitle: 'הכמות גבוהה מהמוחזק',
@@ -494,6 +516,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     notAvailable: 'N/A',
     insufficientMomentumData: 'Not enough moving-average data',
     structuralStopWarning: '⚠ Structural Stop Warning: within 2% of 200-day support',
+    failedAmbushBanner: 'Failed Ambush (Too close to structural stop)',
+    failedAmbushDetail: 'Stop {{stop}} is only {{margin}}% below the price (minimum {{min}}%).',
     pullbackDepth: 'Pullback Depth',
     premium: 'Premium',
     watch: 'Watch',
@@ -670,6 +694,15 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     overweightBanner: '{{layer}} is at {{weight}}% (limit {{limit}}%): buying is locked',
     overweightBuyBlockedTitle: 'Layer Overweight',
     overweightBuyBlockedMessage: '{{layer}} is above its {{limit}}% limit. Buying from the radar is locked until it rebalances.',
+    layerClosedBanner: '{{layer}} target is 0%: buying is closed',
+    layerClosedBuyBlockedMessage: '{{layer}} has a 0% target. Buying from the radar is closed for this layer.',
+    targetAllocation: 'Target Allocation',
+    targetAllocationHint: 'The target of each layer, in percent. They must sum to 100%. A layer below its target stays open for buying; a 0% layer is closed.',
+    targetAllocationSum: 'Total: {{sum}}%',
+    saveTargets: 'Save Targets',
+    invalidTargetsTitle: 'Invalid Targets',
+    invalidTargetsMessage: 'Each target must be 0-100, and they must sum to 100%.',
+    targetsSaveFailedMessage: 'The targets could not be saved. They apply until the app is closed.',
     netProceeds: 'Net Proceeds',
     confirmSell: 'Confirm Sale',
     sellQuantityTooHighTitle: 'Quantity Exceeds Holding',

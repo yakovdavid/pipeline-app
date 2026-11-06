@@ -28,13 +28,14 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar';
 
 import { AdjustCashModal } from '@/components/AdjustCashModal';
+import { TargetAllocationModal } from '@/components/TargetAllocationModal';
 import { CashSummaryCard } from '@/components/CashSummaryCard';
 import { ExecuteTradeModal, type ExecuteTradeRequest, type HistoricalHwmSource } from '@/components/ExecuteTradeModal';
 import { PullToRefreshLogo } from '@/components/PullToRefreshLogo';
 import { SatelliteProtectionCard } from '@/components/SatelliteProtectionCard';
 import type { Stock } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
-import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT, formatUnitsLabel } from '@/constants/labels';
+import { assetTypeLabel, categoryLabel, formatUnitsLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { PORTFOLIO_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
@@ -52,7 +53,7 @@ import {
 import type { AmbushAsset, AmbushLayer } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
-import { computeAllocation, isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
+import { computeAllocation, isLayerClosed, isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
 import { buildUnavailableAmbushAsset, fetchAmbushAsset } from '@/utils/ambush-assets';
 import {
   addTickerToAmbushRadar,
@@ -100,6 +101,13 @@ import {
 } from '@/utils/execution-ledger';
 import { applySale } from '@/utils/position-ledger';
 import { computeProtectionState, type ProtectionState } from '@/utils/protectionState';
+import {
+  ensureTargetAllocationsLoaded,
+  getTargetAllocationState,
+  saveTargetAllocations,
+  useTargetAllocations,
+  type TargetAllocations,
+} from '@/utils/target-allocation-store';
 import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
 import { normalizeTickerInput } from '@/utils/ticker';
 import {
@@ -362,7 +370,8 @@ function computeInternalWeightPct(stock: PortfolioStock, layerTotalValue: number
 }
 
 // Builds the "<layer> (Target: X% | Actual: Y%) - N Assets" section-header
-// string — target from the fixed Fortress 2.0 Model (CATEGORY_TARGET_PCT),
+// string — target from the user's saved targets (DYNAMIC LAYER TARGETS,
+// @/utils/target-allocation-store; 70/20/10 by default),
 // actual is the SAME currentWeightPct computed once in allSections below
 // (not re-derived here), and N the number of tickers in it.
 //
@@ -375,9 +384,10 @@ function buildSectionTitle(
   category: PortfolioCategory,
   categoryStocks: PortfolioStock[],
   currentWeightPct: number,
+  targets: TargetAllocations,
 ): string {
   return (
-    `${categoryLabel(t, category)} (${t('target')}: ${CATEGORY_TARGET_PCT[category]}% | ` +
+    `${categoryLabel(t, category)} (${t('target')}: ${targets[category]}% | ` +
     `${t('actual')}: ${currentWeightPct.toFixed(1)}%) - ${categoryStocks.length} ${t('assets')}`
   );
 }
@@ -579,6 +589,14 @@ export default function PortfolioScreen() {
   const isCashLoadedRef = useRef(false);
   const [isAdjustCashModalVisible, setIsAdjustCashModalVisible] = useState(false);
   const [adjustCashModalKey, setAdjustCashModalKey] = useState(0);
+  // DYNAMIC LAYER TARGETS: the user's Core/Satellite/Quality targets,
+  // shared with the Ambush Radar, and their editor.
+  const { targets } = useTargetAllocations();
+  const [isTargetModalVisible, setIsTargetModalVisible] = useState(false);
+  const [targetModalKey, setTargetModalKey] = useState(0);
+  useEffect(() => {
+    void ensureTargetAllocationsLoaded();
+  }, []);
 
   const loadCash = useCallback(async () => {
     try {
@@ -1140,14 +1158,19 @@ export default function PortfolioScreen() {
     // CIRCUIT BREAKER, defense in depth: the radar already disables Buy on
     // a locked layer, but the lock is re-checked here against the latest
     // weights in case they changed between the tap and this point.
+    // DYNAMIC LAYER TARGETS: checked against the saved targets, read first.
+    await ensureTargetAllocationsLoaded();
+    const currentTargets = getTargetAllocationState().targets;
     const weights = getLayerWeights();
-    if (weights !== null && isLayerOverweight(request.layer, weights, CATEGORY_TARGET_PCT)) {
+    if (weights !== null && isLayerOverweight(request.layer, weights, currentTargets)) {
       Alert.alert(
         t('overweightBuyBlockedTitle'),
-        t('overweightBuyBlockedMessage', {
-          layer: categoryLabel(t, request.layer),
-          limit: overweightLimitPct(request.layer, CATEGORY_TARGET_PCT),
-        }),
+        isLayerClosed(request.layer, currentTargets)
+          ? t('layerClosedBuyBlockedMessage', { layer: categoryLabel(t, request.layer) })
+          : t('overweightBuyBlockedMessage', {
+              layer: categoryLabel(t, request.layer),
+              limit: overweightLimitPct(request.layer, currentTargets),
+            }),
       );
       return;
     }
@@ -1389,6 +1412,20 @@ export default function PortfolioScreen() {
     setAdjustCashModalKey((key) => key + 1);
     setIsAdjustCashModalVisible(true);
   }, [t]);
+
+  const handleOpenTargets = useCallback(() => {
+    setTargetModalKey((key) => key + 1);
+    setIsTargetModalVisible(true);
+  }, []);
+
+  const handleSaveTargets = (next: TargetAllocations) => {
+    setIsTargetModalVisible(false);
+    // Applied at once (both screens re-render on the new targets); a
+    // failed save only means they won't survive a restart.
+    saveTargetAllocations(next).catch(() => {
+      Alert.alert(t('invalidTargetsTitle'), t('targetsSaveFailedMessage'));
+    });
+  };
 
   const handleAdjustCash = (deltaUsd: number) => {
     if (!isCashLoadedRef.current) {
@@ -1775,7 +1812,7 @@ export default function PortfolioScreen() {
       allocation,
       cashBalance: isCashLoaded ? cashBalance : null,
       usdIlsRate,
-      targetPct: CATEGORY_TARGET_PCT,
+      targetPct: targets,
       executions: executionLog,
     });
 
@@ -1909,6 +1946,9 @@ export default function PortfolioScreen() {
       if (payload.executions !== null) {
         setExecutionLog(payload.executions.slice(-EXECUTION_LEDGER_MAX_ENTRIES));
       }
+      // DYNAMIC LAYER TARGETS: nothing to mirror. restoreBackupPayload
+      // saved them through the shared store, which already re-rendered
+      // this screen and the radar; an older backup leaves them as they are.
       setSyncWarning(allFetchesFailed);
 
       if (allFetchesFailed) {
@@ -2060,7 +2100,7 @@ export default function PortfolioScreen() {
 
   const allSections: PortfolioListSection[] = [
     {
-      title: buildSectionTitle(t, 'Core', coreStocks, coreWeightPct),
+      title: buildSectionTitle(t, 'Core', coreStocks, coreWeightPct, targets),
       category: 'Core',
       accentColor: colors.core,
       data: coreStocks,
@@ -2068,7 +2108,7 @@ export default function PortfolioScreen() {
       layerTotalValue: coreLayerTotalValue,
     },
     {
-      title: buildSectionTitle(t, 'Satellite', satelliteStocks, satelliteWeightPct),
+      title: buildSectionTitle(t, 'Satellite', satelliteStocks, satelliteWeightPct, targets),
       category: 'Satellite',
       accentColor: colors.satellite,
       data: satelliteStocks,
@@ -2076,7 +2116,7 @@ export default function PortfolioScreen() {
       layerTotalValue: satelliteLayerTotalValue,
     },
     {
-      title: buildSectionTitle(t, 'Quality', qualityStocks, qualityWeightPct),
+      title: buildSectionTitle(t, 'Quality', qualityStocks, qualityWeightPct, targets),
       category: 'Quality',
       accentColor: colors.quality,
       data: qualityStocks,
@@ -2175,6 +2215,7 @@ export default function PortfolioScreen() {
         usdIlsRate={usdIlsRate}
         feesLoggedUsd={executionLog === null ? null : totalFeesUsd(executionLog)}
         onAdjustCash={handleOpenAdjustCash}
+        onEditTargets={handleOpenTargets}
       />
 
       {isInitializing ? (
@@ -2552,6 +2593,16 @@ export default function PortfolioScreen() {
         cashBalance={cashBalance}
         onSubmit={handleAdjustCash}
         onCancel={() => setIsAdjustCashModalVisible(false)}
+      />
+
+      {/* DYNAMIC LAYER TARGETS. Keyed per opening so it always starts from
+          the saved targets. */}
+      <TargetAllocationModal
+        key={`targets-${targetModalKey}`}
+        visible={isTargetModalVisible}
+        targets={targets}
+        onSubmit={handleSaveTargets}
+        onCancel={() => setIsTargetModalVisible(false)}
       />
 
       <Modal

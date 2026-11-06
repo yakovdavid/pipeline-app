@@ -23,3 +23,9 @@ export const THEME_PREFERENCE_STORAGE_KEY = '@pipeline/theme_preference';
 // own RTL layout direction setting): that requires a full app reload to
 // take effect, whereas this toggle is meant to apply live.
 export const LANGUAGE_PREFERENCE_STORAGE_KEY = '@pipeline/language_preference';
+
+// DYNAMIC LAYER TARGETS: the user's Core/Satellite/Quality target
+// allocation, a JSON object of percents summing to 100 (see
+// @/utils/target-allocation-store). Never saved means the Fortress 2.0
+// default, 70/20/10.
+export const TARGET_ALLOCATION_STORAGE_KEY = '@pipeline/target_allocation';

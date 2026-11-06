@@ -23,7 +23,7 @@ import { QualityAmbushCard } from '@/components/QualityAmbushCard';
 import { StockCard } from '@/components/StockCard';
 import { TickerAutocomplete } from '@/components/TickerAutocomplete';
 import { AMBUSH_ZONE_TITLE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
-import { assetTypeLabel, categoryLabel, CATEGORY_TARGET_PCT } from '@/constants/labels';
+import { assetTypeLabel, categoryLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { AMBUSH_TICKERS_STORAGE_KEY } from '@/constants/storage-keys';
 import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
@@ -48,8 +48,9 @@ import {
   toAmbushTickerEntry,
 } from '@/utils/ambush-assets';
 import { loadAmbushTickerEntries, subscribeToAmbushAdditions, subscribeToAmbushRemovals } from '@/utils/ambush-storage';
-import { isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
+import { isLayerClosed, isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
 import { useLayerWeights } from '@/utils/layer-weights-store';
+import { ensureTargetAllocationsLoaded, useTargetAllocations } from '@/utils/target-allocation-store';
 import { requestPortfolioBuy } from '@/utils/portfolio-buy-handoff';
 import { sendStructuralStopNotification } from '@/utils/notifications';
 import { formatAmbushLines } from '@/utils/report-formatters';
@@ -503,13 +504,22 @@ export default function AmbushRadarScreen() {
   // as soon as the Portfolio publishes new weights, including right after
   // cash is added or withdrawn. Unknown weights (the Portfolio hasn't
   // finished loading) lock nothing.
+  //
+  // DYNAMIC LAYER TARGETS: the targets are the user's saved ones (see
+  // @/utils/target-allocation-store), never hardcoded caps, so a layer
+  // below its own target stays buyable. Nothing locks until they've been
+  // read, for the same reason as unknown weights.
   const layerWeights = useLayerWeights();
+  const { targets, isLoaded: areTargetsLoaded } = useTargetAllocations();
+  useEffect(() => {
+    void ensureTargetAllocationsLoaded();
+  }, []);
   const lockedLayers = useMemo<Record<AmbushLayer, boolean>>(
     () => ({
-      Satellite: layerWeights !== null && isLayerOverweight('Satellite', layerWeights, CATEGORY_TARGET_PCT),
-      Quality: layerWeights !== null && isLayerOverweight('Quality', layerWeights, CATEGORY_TARGET_PCT),
+      Satellite: layerWeights !== null && areTargetsLoaded && isLayerOverweight('Satellite', layerWeights, targets),
+      Quality: layerWeights !== null && areTargetsLoaded && isLayerOverweight('Quality', layerWeights, targets),
     }),
-    [layerWeights],
+    [layerWeights, targets, areTargetsLoaded],
   );
   const lockedLayersRef = useRef(lockedLayers);
   useEffect(() => {
@@ -729,11 +739,13 @@ export default function AmbushRadarScreen() {
           .map((layer) => (
             <View key={layer} style={styles.overweightBanner}>
               <Text style={styles.overweightBannerText}>
-                {t('overweightBanner', {
-                  layer: categoryLabel(t, layer),
-                  weight: layerWeights[layer].toFixed(1),
-                  limit: overweightLimitPct(layer, CATEGORY_TARGET_PCT),
-                })}
+                {isLayerClosed(layer, targets)
+                  ? t('layerClosedBanner', { layer: categoryLabel(t, layer) })
+                  : t('overweightBanner', {
+                      layer: categoryLabel(t, layer),
+                      weight: layerWeights[layer].toFixed(1),
+                      limit: overweightLimitPct(layer, targets),
+                    })}
               </Text>
             </View>
           ))}

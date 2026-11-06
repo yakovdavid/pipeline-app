@@ -21,6 +21,8 @@ export type CashSummaryCardProps = {
   // (null until the ledger has loaded).
   feesLoggedUsd: number | null;
   onAdjustCash: () => void;
+  // DYNAMIC LAYER TARGETS: opens the target-allocation editor.
+  onEditTargets: () => void;
 };
 
 function bucketLabel(t: TFunction, bucket: AllocationBucket): string {
@@ -52,6 +54,7 @@ export const CashSummaryCard = memo(function CashSummaryCard({
   usdIlsRate,
   feesLoggedUsd,
   onAdjustCash,
+  onEditTargets,
 }: CashSummaryCardProps) {
   const { colors } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
@@ -109,7 +112,18 @@ export const CashSummaryCard = memo(function CashSummaryCard({
             <Text style={styles.caption}>{t('feesLoggedCaption', { amount: formatUsd(feesLoggedUsd) })}</Text>
           )}
 
-          <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>
+          <View style={styles.allocationHeaderRow}>
+            <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>
+            <TouchableOpacity
+              style={styles.editTargetsButton}
+              onPress={onEditTargets}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityRole="button"
+              accessibilityLabel={t('targetAllocation')}>
+              <Ionicons name="options-outline" size={14} color={colors.textSecondary} />
+              <Text style={styles.editTargetsText}>{t('targetAllocation')}</Text>
+            </TouchableOpacity>
+          </View>
           <View style={styles.weightsRow}>
             {ALLOCATION_BUCKETS.map((bucket) => (
               <View key={bucket} style={styles.weightChip}>
@@ -164,6 +178,23 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
     },
     allocationCaption: {
       marginTop: 4,
+    },
+    allocationHeaderRow: {
+      flexDirection: isHebrew ? 'row-reverse' : 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    editTargetsButton: {
+      flexDirection: isHebrew ? 'row-reverse' : 'row',
+      alignItems: 'center',
+      gap: 4,
+      marginTop: 4,
+    },
+    editTargetsText: {
+      color: colors.textSecondary,
+      fontSize: 12,
+      fontWeight: '700',
+      writingDirection,
     },
     balance: {
       color: colors.textPrimary,

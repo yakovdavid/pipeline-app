@@ -26,10 +26,10 @@ export function categoryLabel(t: TFunction, category: PortfolioCategory): string
   }
 }
 
-// The Fortress 2.0 Model's fixed allocation targets (Core/Satellite/
-// Quality = 70/20/10) — used both for the "Add Asset" category picker and
-// the Portfolio SectionList headers' "Target: X%" figure. A numeric
-// constant, not translatable text, so it stays outside the t() dictionary.
+// The Fortress 2.0 Model's DEFAULT allocation targets (Core/Satellite/
+// Quality = 70/20/10): only the starting value of the user's own targets
+// (DYNAMIC LAYER TARGETS, @/utils/target-allocation-store). Never compare
+// a layer against this directly; read the store instead.
 export const CATEGORY_TARGET_PCT: Record<PortfolioCategory, number> = {
   Core: 70,
   Satellite: 20,

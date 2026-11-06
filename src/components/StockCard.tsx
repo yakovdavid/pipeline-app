@@ -6,11 +6,12 @@ import { MomentumBar } from '@/components/MomentumBar';
 import { TrendBadges } from '@/components/TrendBadges';
 import { assetTypeLabel } from '@/constants/labels';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
-import { STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
+import { AMBUSH_MIN_STOP_MARGIN_PCT, STRUCTURAL_STOP_THRESHOLD } from '@/constants/thresholds';
 import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { AssetType, TrendLabel } from '@/types/asset';
 import type { PriceStatus } from '@/services/api';
+import { computeStructuralMargin, isFailedAmbush } from '@/utils/ambush-safety';
 import { formatUnitPrice } from '@/utils/currency';
 
 export type Stock = {
@@ -38,11 +39,9 @@ export type Stock = {
   // backend found explanatory headlines. Not rendered on the card itself
   // (see report-formatters.ts) — just carried through so exports can use it.
   anomalyReport: string | null;
-  // 52-week high / drawdown from the backend. Not rendered here: the
-  // Quality-layer drawdown review styling is a Portfolio-only concept (see
-  // PortfolioStockRow in index.tsx) — Ambush Radar has no "layer"/category
-  // at all, so this pair is carried through for type-compatibility with
-  // StockQuote only, unused by this component's own UI.
+  // 52-week high / drawdown from the backend. high52 is the historicalHWM
+  // a buy would start with, so it drives the AMBUSH SAFETY CROSS-CHECK
+  // (see @/utils/ambush-safety); drawdownPct isn't rendered here.
   high52: number | null;
   drawdownPct: number | null;
   // PULLBACK DEPTH INDICATOR: replaces the old binary Tactical Momentum
@@ -118,12 +117,35 @@ export const StockCard = memo(function StockCard({
   const agorotSuffix = t('ag');
   const priceDisplay = formatUnitPrice(ticker, localPrice, currencySymbol, agorotSuffix);
 
+  // AMBUSH SAFETY CROSS-CHECK: a Kill Zone setup too close to its entry
+  // stop. The radar already lists it under Invalidated with no Buy button
+  // (see classifySatellite in @/utils/ambush-grouping); this banner says
+  // why, since its Pullback Depth badge still reads Kill Zone. The stop is
+  // shown in the listing's own units, scaled by the localPrice/price ratio.
+  const failedMargin = isFailedAmbush(stock) ? computeStructuralMargin(price, stock.high52) : null;
+  const failedStopDisplay =
+    failedMargin !== null && price > 0
+      ? formatUnitPrice(ticker, failedMargin.stopPrice * (localPrice / price), currencySymbol, agorotSuffix)
+      : null;
+
   return (
     <View style={styles.card}>
       <View style={isOverweightLocked ? styles.lockedContent : undefined}>
         {isNearStructuralStop && (
           <View style={styles.warningBanner}>
             <Text style={styles.warningBannerText}>{t('structuralStopWarning')}</Text>
+          </View>
+        )}
+        {failedMargin !== null && failedStopDisplay !== null && (
+          <View style={styles.failedAmbushBanner} accessibilityRole="alert">
+            <Text style={styles.failedAmbushTitle}>{t('failedAmbushBanner')}</Text>
+            <Text style={styles.failedAmbushDetail}>
+              {t('failedAmbushDetail', {
+                stop: failedStopDisplay,
+                margin: failedMargin.marginPct.toFixed(2),
+                min: AMBUSH_MIN_STOP_MARGIN_PCT,
+              })}
+            </Text>
           </View>
         )}
 
@@ -250,6 +272,29 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       marginBottom: 6,
       paddingHorizontal: 12,
       paddingVertical: 4,
+    },
+    // AMBUSH SAFETY CROSS-CHECK: same full-width strip as warningBanner,
+    // in the bearish color (a rejected entry, not a caution).
+    failedAmbushBanner: {
+      backgroundColor: colors.bearish,
+      marginHorizontal: -12,
+      marginTop: -8,
+      marginBottom: 6,
+      paddingHorizontal: 12,
+      paddingVertical: 4,
+    },
+    failedAmbushTitle: {
+      color: '#FFFFFF',
+      fontSize: 12,
+      fontWeight: '800',
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
+    },
+    failedAmbushDetail: {
+      color: '#FFFFFF',
+      fontSize: 11,
+      textAlign: isHebrew ? 'right' : 'left',
+      writingDirection: isHebrew ? 'rtl' : 'ltr',
     },
     warningBannerText: {
       color: colors.warningText,

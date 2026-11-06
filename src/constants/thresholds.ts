@@ -31,6 +31,12 @@ export const PULLBACK_PREMIUM_THRESHOLD_PCT = 0;
 export const PULLBACK_KILL_ZONE_THRESHOLD_PCT = -3.0;
 export const PULLBACK_OVERSHOT_THRESHOLD_PCT = -7.0;
 
+// AMBUSH SAFETY CROSS-CHECK: a Kill Zone entry is rejected ("Failed
+// Ambush") when the price is less than this many percent above the
+// structural stop it would get on entry (historicalHWM × 0.88, see
+// @/utils/ambush-safety). Exactly 2.00% passes.
+export const AMBUSH_MIN_STOP_MARGIN_PCT = 2;
+
 // QUALITY MARGIN OF SAFETY: the single Z-Score line for every Quality asset,
 // app-wide. At or below it, a fundamentally sound Quality asset is a Buy
 // Signal: the Ambush Radar's Value Zone and the Portfolio's Quality alert.
