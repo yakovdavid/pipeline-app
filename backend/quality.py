@@ -1,6 +1,13 @@
-"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets, sourced
-entirely from Yahoo Finance through the `yfinance` library (the same library
-main.py uses for quotes). No API key, no paid plan.
+"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets.
+
+Sources (2026-11-22 ROIC fix):
+  - Z-Score and the Moat inputs: Yahoo Finance via `yfinance`.
+  - ROIC: Financial Modeling Prep (FMP), key-metrics-ttm ->
+    returnOnInvestedCapitalTTM (NOPAT-based, trailing twelve months).
+    Requires the FMP_API_KEY environment variable (Starter plan or higher
+    for all US symbols). Yahoo's ROE is NOT used as a ROIC fallback: a
+    missing ROIC (null) is safer than a wrong one, because the app gates
+    Quality signals on it.
 
 GET /api/quality/{ticker} returns, for one ticker:
   - Statistics, from the last 2 years of daily closes:
@@ -13,9 +20,10 @@ GET /api/quality/{ticker} returns, for one ticker:
       A year is viable only when both ratios can be computed (no missing
       figure, equity > 0, revenue > 0); other years are skipped, never
       counted as zero.
-      roic: the AVERAGE ROE across viable years, as a percent (28 = 28%).
-            A ROIC proxy: Yahoo doesn't publish ROIC. The response key stays
-            `roic` so the app and the cache table keep working unchanged.
+      roic: FMP returnOnInvestedCapitalTTM as a percent (8.9 = 8.9%).
+            null when FMP has no figure (ETF, non-US listing, missing key).
+            (Before 2026-11-22 this was the average Yahoo ROE - a proxy that
+            inflated asset-heavy companies, e.g. CNI: ROE 22% vs ROIC 9%.)
       moat: Wide   if average ROE >= 15% AND average operating margin >= 15%
             Narrow if both averages >= 10% (and not Wide)
             None   otherwise, or with fewer than 2 viable years
@@ -34,6 +42,7 @@ response, rather than failing the request.
 """
 
 import math
+import os
 import re
 import statistics
 import threading
@@ -43,6 +52,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Literal
 
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import APIRouter, HTTPException
 from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
@@ -80,6 +90,11 @@ TOTAL_ASSETS_LABELS = ("Total Assets",)
 TOTAL_LIABILITIES_LABELS = ("Total Liabilities", "Total Liabilities Net Minority Interest")
 
 QUALITY_METRICS_TABLE = "quality_metrics"
+
+# FMP (Financial Modeling Prep) - the ROIC source. Stable API.
+FMP_KEY_METRICS_TTM_URL = "https://financialmodelingprep.com/stable/key-metrics-ttm"
+FMP_TIMEOUT_SECONDS = 15
+FMP_ROIC_FIELD = "returnOnInvestedCapitalTTM"
 
 # Accepted ticker shape: US-style symbols plus dot or dash classes and
 # exchange suffixes (BRK-B, RY.TO). Validated before the symbol is sent to
@@ -339,6 +354,44 @@ class PriceStatistics:
     z_score: float | None
 
 
+def fetch_fmp_roic_ttm(symbol: str) -> float | None:
+    """ROIC (TTM, NOPAT-based) from FMP as a percent, or None when FMP has
+    no figure for the symbol (ETF, non-US listing) or no API key is set.
+
+    Raises QualityRateLimitError on HTTP 429 and FundamentalsError on any
+    other transport/HTTP failure, so the caller serves the cached value
+    (flagged stale) instead of caching a wrong "no ROIC" for 30 days.
+    Plan restrictions (401/402/403) are reported as None + a log line: the
+    symbol is simply outside the plan's coverage."""
+    api_key = os.environ.get("FMP_API_KEY", "").strip()
+    if not api_key:
+        print("[quality] FMP_API_KEY is not set; ROIC unavailable.")
+        return None
+    try:
+        response = requests.get(
+            FMP_KEY_METRICS_TTM_URL,
+            params={"symbol": symbol, "apikey": api_key},
+            timeout=FMP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as error:
+        raise FundamentalsError(f"FMP request failed for '{symbol}': {type(error).__name__}") from None
+    if response.status_code == 429:
+        raise QualityRateLimitError(f"FMP rate-limited the ROIC request for '{symbol}'.")
+    if response.status_code in (401, 402, 403):
+        print(f"[quality] FMP denied ROIC for '{symbol}' (HTTP {response.status_code}); outside plan coverage.")
+        return None
+    if response.status_code != 200:
+        raise FundamentalsError(f"FMP returned HTTP {response.status_code} for '{symbol}'.")
+    try:
+        payload = response.json()
+    except ValueError:
+        raise FundamentalsError(f"FMP returned a non-JSON body for '{symbol}'.") from None
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        return None  # FMP has no key metrics for this symbol (e.g. an ETF).
+    value = _finite_float(payload[0].get(FMP_ROIC_FIELD))
+    return value * 100 if value is not None else None
+
+
 def compute_price_statistics(closes: list[float]) -> PriceStatistics:
     """Z-Score of the latest close against the whole window, using the
     population standard deviation (statistics.pstdev, the same convention as
@@ -516,11 +569,26 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
                 # any (an ETF) is simply re-confirmed as having none.
                 if statements.is_empty and row.get("roic") is not None:
                     raise FundamentalsError(f"Yahoo Finance returned no financial statements for '{symbol}'.")
-                roic, moat = compute_moat(compute_yearly_ratios(statements))
+                _roe_proxy, moat = compute_moat(compute_yearly_ratios(statements))
+                fmp_failed = False
+                try:
+                    roic = fetch_fmp_roic_ttm(symbol)
+                except QualityDataError as fmp_error:
+                    # An FMP outage must not fail the whole endpoint (the
+                    # Z-Score is still valid): keep the cached ROIC, if any,
+                    # and flag the fundamentals as stale.
+                    print(f"[quality] FMP ROIC refresh failed for '{symbol}' ({fmp_error}); keeping cached ROIC.")
+                    roic = _to_float(row.get("roic"))
+                    fundamentals_stale = True
+                    fmp_failed = True
                 row.update(
                     roic=round(roic, 2) if roic is not None else None,
                     moat=moat,
-                    last_updated_fundamentals=now.isoformat(),
+                    # After an FMP failure the timestamp is NOT advanced, so
+                    # the next request retries instead of waiting 30 days.
+                    last_updated_fundamentals=(
+                        row.get("last_updated_fundamentals") if fmp_failed else now.isoformat()
+                    ),
                 )
                 refreshed = True
             except QualityDataError as error:

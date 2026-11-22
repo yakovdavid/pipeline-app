@@ -7,7 +7,8 @@ import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import type { QualityAmbushAsset, QualityMoat } from '@/types/ambush';
-import { QUALITY_MIN_ROIC_PCT } from '@/constants/thresholds';
+import { qualityMinRoicPct } from '@/utils/quality-signal';
+import { useTargetAllocations } from '@/utils/target-allocation-store';
 import type { AmbushReadinessZone } from '@/utils/ambush-grouping';
 import { formatUnitPrice } from '@/utils/currency';
 
@@ -66,11 +67,13 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
   const { colors, isDarkMode } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, isDarkMode, language), [colors, isDarkMode, language]);
+  // Template-dependent ROIC floor (8% Tactical / 15% Hyper-Quality).
+  const { targets } = useTargetAllocations();
 
   const zoneColors = ambushZoneColors(colors, zone);
   const isUnavailable = asset.priceStatus === 'unavailable';
   const roicColor =
-    asset.roic === null ? colors.textSecondary : asset.roic >= QUALITY_MIN_ROIC_PCT ? colors.bullish : colors.bearish;
+    asset.roic === null ? colors.textSecondary : asset.roic >= qualityMinRoicPct(targets) ? colors.bullish : colors.bearish;
   // SAFE BUTTONS: Buy is rendered only for a Value Zone asset. In Watch or
   // Invalidated it doesn't exist at all, so it can't be hit by accident.
   const canBuy = zone === 'valueZone';

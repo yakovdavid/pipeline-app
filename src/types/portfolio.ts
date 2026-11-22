@@ -106,11 +106,14 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // every non-Quality asset, or when that endpoint has no Z-Score or
   // failed. Live/ephemeral, never persisted, same as drawdownPct.
   qualityZScore: number | null;
-  // The Quality Buy Signal: Z-Score <= -1.0 AND ROIC >= 15% AND a moat,
+  // The Quality Buy Signal: Z-Score <= -1.0 AND ROIC >= the template floor (8%/15%) AND a moat,
   // the Ambush Radar's Value Zone rule (isQualityBuySignal in
   // @/utils/quality-signal). PortfolioStockRow additionally checks
   // `stock.category === 'Quality'` before showing it.
   qualityZScoreAlert: boolean;
+  // ROIC (percent, FMP TTM) from GET /api/quality, Quality positions only.
+  // Live/ephemeral, never persisted. See StockQuote.qualityRoic.
+  qualityRoic: number | null;
   // DATA-LOSS FIX: see StockQuote.priceStatus in @/services/api. An
   // 'unavailable' position keeps every persisted field (units, watermark,
   // calibration, roic, ...) exactly as loaded, so saving it writes the same

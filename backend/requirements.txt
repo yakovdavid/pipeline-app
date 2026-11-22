@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 # Yahoo Finance: live quotes (main.py) and all Quality data (quality.py):
-# the 2-year daily closes behind the Z-Score, and ROE/ROA/operating margin
-# for the ROIC proxy and the Moat.
+# the 2-year daily closes behind the Z-Score, and ROE/operating margin for
+# the Moat. ROIC comes from FMP (quality.py, FMP_API_KEY) over `requests`.
 yfinance
 pandas
 curl_cffi

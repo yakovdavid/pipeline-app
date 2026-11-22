@@ -118,6 +118,8 @@ export type TranslationKey =
   // Fortress 2.0 layer-specific UI (PortfolioStockRow)
   | 'allocation'
   | 'fundamentalAuditRequired'
+  | 'fundamentalDegradation'
+  | 'roicBelowFloor'
   | 'hold'
   // Add/Edit Asset modal
   | 'category'
@@ -352,6 +354,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     trailingStopActivatedAt: 'עצירה נגררת מופעלת ב',
     allocation: 'הקצאה',
     fundamentalAuditRequired: 'נדרשת בדיקה יסודית',
+    fundamentalDegradation: 'שחיקה פונדמנטלית',
+    roicBelowFloor: 'ROIC {{roic}}% מתחת לרף {{floor}}%',
     hold: 'החזק',
     category: 'קטגוריה',
     assetType: 'סוג נכס',
@@ -576,6 +580,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     trailingStopActivatedAt: 'Trailing stop activated at',
     allocation: 'Allocation',
     fundamentalAuditRequired: 'Fundamental Audit Required',
+    fundamentalDegradation: 'Fundamental Degradation',
+    roicBelowFloor: 'ROIC {{roic}}% below the {{floor}}% floor',
     hold: 'Hold',
     category: 'Category',
     assetType: 'Asset Type',

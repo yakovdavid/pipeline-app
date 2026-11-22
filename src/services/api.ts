@@ -57,6 +57,10 @@ export type StockQuote = {
   // Z-Score <= -1.0 AND ROIC >= 15% AND a moat, all from /api/quality —
   // exactly the Ambush Radar's Value Zone. A value trap never alerts.
   qualityZScoreAlert: boolean;
+  // ROIC (percent, FMP TTM) from GET /api/quality, filled in by
+  // fetchPortfolioQuote for Quality positions only; null otherwise or when
+  // FMP has no figure. Drives [FUNDAMENTAL DEGRADATION] in the Portfolio.
+  qualityRoic: number | null;
   // DATA-LOSS FIX: 'live' for every quote fetchStockData returns;
   // 'unavailable' only for the placeholder createUnavailableQuote builds
   // when a fetch failed. A ticker whose fetch failed stays in the list as
@@ -90,6 +94,7 @@ export function createUnavailableQuote(): StockQuote {
     pullbackDepth: null,
     qualityZScore: null,
     qualityZScoreAlert: false,
+    qualityRoic: null,
     priceStatus: 'unavailable',
   };
 }
@@ -253,6 +258,7 @@ export async function fetchStockData(
     // Filled in by fetchPortfolioQuote for Quality positions.
     qualityZScore: null,
     qualityZScoreAlert: false,
+    qualityRoic: null,
     priceStatus: 'live',
   };
 }
@@ -263,7 +269,7 @@ export type QualityMetrics = {
   currentPrice: number | null;
   // 2-year Z-Score; null with too little price history.
   zScore: number | null;
-  // Most recent year's ROIC as a percent; null with no financial statements.
+  // ROIC as a percent (FMP, TTM, NOPAT-based); null when FMP has no figure.
   roic: number | null;
   moat: QualityMoat | null;
   // True when a backend refresh failed and expired cached values are shown.
@@ -341,7 +347,12 @@ export async function fetchPortfolioQuote(
   if (metrics === null) {
     return quote;
   }
-  return { ...quote, qualityZScore: metrics.zScore, qualityZScoreAlert: isQualityBuySignal(metrics) };
+  return {
+    ...quote,
+    qualityZScore: metrics.zScore,
+    qualityZScoreAlert: isQualityBuySignal(metrics),
+    qualityRoic: metrics.roic,
+  };
 }
 
 // TREND CLASSIFICATION: validates the backend's macro_trend/

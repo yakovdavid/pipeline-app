@@ -108,6 +108,7 @@ import {
   useTargetAllocations,
   type TargetAllocations,
 } from '@/utils/target-allocation-store';
+import { isFundamentalDegradation, qualityMinRoicPct } from '@/utils/quality-signal';
 import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
 import { normalizeTickerInput } from '@/utils/ticker';
 import {
@@ -3006,6 +3007,16 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // never surface an alert on the wrong layer.
   const isQualityZScoreAlertActive = stock.category === 'Quality' && stock.qualityZScoreAlert === true;
 
+  // LAYER 2: QUALITY — FUNDAMENTAL DEGRADATION (2026-11-22): the held
+  // position's real ROIC (FMP TTM, via fetchPortfolioQuote) is below the
+  // active template's floor (8% Tactical / 15% Hyper-Quality, from the live
+  // target allocation). Independent of the price-based Kill Switch above:
+  // a business can degrade while its price holds. Unknown ROIC never alerts.
+  const { targets: rowTargets } = useTargetAllocations();
+  const roicFloorPct = qualityMinRoicPct(rowTargets);
+  const isFundamentalDegradationActive =
+    stock.category === 'Quality' && isFundamentalDegradation(stock.qualityRoic ?? null, rowTargets);
+
   const handleStartEditing = () => {
     setEditedAssetType(stock.assetType);
     setTotalValueText('');
@@ -3474,6 +3485,19 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               isFundamentalAuditRequired ? styles.killSwitchTagAlert : styles.killSwitchTagHold,
             ]}>
             {isFundamentalAuditRequired ? `[${t('fundamentalAuditRequired')}]` : `[${t('hold')}]`}
+          </Text>
+        </View>
+      )}
+
+      {/* LAYER 2: QUALITY — FUNDAMENTAL DEGRADATION: same loud red block as
+          the Kill Switch alert, shown only when the ROIC fails the floor. */}
+      {!isEditing && !isPriceUnavailable && isFundamentalDegradationActive && stock.qualityRoic !== null && (
+        <View style={[styles.killSwitchBlock, styles.killSwitchBlockAlert]}>
+          <Text style={[styles.killSwitchTag, styles.killSwitchTagAlert]}>
+            {`[${t('fundamentalDegradation')}]`}
+          </Text>
+          <Text style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
+            {t('roicBelowFloor', { roic: stock.qualityRoic.toFixed(1), floor: roicFloorPct })}
           </Text>
         </View>
       )}

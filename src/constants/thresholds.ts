@@ -44,6 +44,14 @@ export const AMBUSH_MIN_STOP_MARGIN_PCT = 2;
 // same backend values (GET /api/quality/{ticker}), so they can't disagree.
 export const QUALITY_MARGIN_OF_SAFETY_ZSCORE = -1.0;
 
-// QUALITY FUNDAMENTAL GATE: the minimum ROIC (percent) for a Quality asset
-// to count at all. Below it, a cheap Z-Score is a value trap, not a signal.
-export const QUALITY_MIN_ROIC_PCT = 15;
+// QUALITY FUNDAMENTAL GATE (Fortress templates, 2026-11-22): the minimum
+// ROIC (percent, FMP TTM) depends on who generates the Alpha:
+//   - Satellite target > 0% (Tactical, e.g. 70/20/10): Satellites carry the
+//     Alpha, Quality is a cushion -> ROIC > 8% (infrastructure allowed).
+//   - Satellite target = 0% (Hyper-Quality, e.g. 80/0/20): Quality must
+//     carry the Alpha -> ROIC > 15%.
+// Resolved from the live target allocation by qualityMinRoicPct in
+// @/utils/quality-signal. Below it: no Buy Signal, and a held Quality
+// position shows [FUNDAMENTAL DEGRADATION].
+export const QUALITY_MIN_ROIC_PCT_TACTICAL = 8;
+export const QUALITY_MIN_ROIC_PCT_HYPER_QUALITY = 15;
