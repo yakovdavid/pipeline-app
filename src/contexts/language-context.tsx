@@ -254,7 +254,50 @@ export type TranslationKey =
   | 'sellQuantityTooHighMessage'
   | 'positionClosedToast'
   | 'positionReducedToast'
-  | 'positionNotFoundMessage';
+  | 'positionNotFoundMessage'
+  | 'moatUnrated'
+  | 'moatSaveFailedTitle'
+  | 'moatSaveFailedMessage'
+  | 'ruleRoic'
+  | 'ruleMoatRated'
+  | 'ruleCapexToRevenue'
+  | 'ruleCapexToOcf'
+  | 'rulePeBelowAverage'
+  | 'ruleZScore'
+  | 'dailyCloseDrop'
+  | 'auditTriggeredOn'
+  | 'markAudited'
+  | 'markAuditedTitle'
+  | 'markAuditedMessage'
+  | 'degradationAction'
+  | 'avgCostInput'
+  | 'avgCostPnl'
+  | 'reconcileToIbi'
+  | 'reconcileToIbiHint'
+  | 'ibiCashBalanceLabel'
+  | 'ibiCashBalancePlaceholder'
+  | 'applyReconciliation'
+  | 'neverReconciledCaption'
+  | 'lastReconciledCaption'
+  | 'cashReconciledToast'
+  | 'capLockBadge'
+  | 'capLockTitle'
+  | 'capLockMessage'
+  | 'capExceededAfterBuyMessage'
+  | 'capLockRowText'
+  | 'rulePositionCap'
+  | 'legacyNoAddsTitle'
+  | 'legacyNoAddsMessage'
+  | 'legacyHoldBadge'
+  | 'legacyExitBadge'
+  | 'legacyExitRoic'
+  | 'legacyExitMoat'
+  | 'legacyExitThesis'
+  | 'legacyNoAddsHint'
+  | 'auditThesisIntact'
+  | 'auditThesisBroken'
+  | 'lastAuditIntact'
+  | 'lastAuditBroken';
 
 // t(key, params?) — params are substituted into `{{paramName}}` tokens in
 // the resolved string (e.g. 'fetchFailedForTicker': "Failed to fetch data
@@ -486,6 +529,49 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     confirmSell: 'אשר מכירה',
     sellQuantityTooHighTitle: 'הכמות גבוהה מהמוחזק',
     sellQuantityTooHighMessage: 'אפשר למכור עד {{units}} יחידות של {{ticker}}.',
+    moatUnrated: 'לא דורג',
+    moatSaveFailedTitle: 'שמירת החפיר נכשלה',
+    moatSaveFailedMessage: 'הדירוג הוחל במסך אך לא נשמר במכשיר. נסו שוב.',
+    ruleRoic: 'ROIC TTM > {{floor}}%',
+    ruleMoatRated: 'חפיר מדורג (רחב/צר)',
+    ruleCapexToRevenue: 'CapEx/הכנסות (ממוצע 3 שנים) ≤ {{max}}%',
+    ruleCapexToOcf: 'CapEx/תזרים תפעולי (ממוצע 3 שנים) ≤ {{max}}%',
+    rulePeBelowAverage: 'P/E TTM < ממוצע 5 שנים',
+    ruleZScore: 'Z-Score (504 ימי מסחר) ≤ {{max}}',
+    dailyCloseDrop: 'ירידה מהשיא השנתי (סגירה יומית {{date}}): {{pct}}%',
+    auditTriggeredOn: 'הופעל בסגירה של {{date}} ({{pct}}%). נשאר פעיל עד סימון "נבדק".',
+    markAudited: 'סמן כנבדק',
+    markAuditedTitle: 'סימון בדיקה יסודית',
+    markAuditedMessage: 'לאשר שבדקת את ה-ROIC ואת עמידות החפיר של {{ticker}}? בחרו את המסקנה: ההתראה תיסגר ותחזור רק אחרי התאוששות מעל קו ה-15% ושבירה חדשה.',
+    degradationAction: 'יציאה ופריסה מחדש רק לניירות שעומדים בתבנית',
+    avgCostInput: 'עלות ממוצעת מ-IBI ({{unit}}), כעת: {{current}}',
+    avgCostPnl: 'עלות ממוצעת (IBI): {{cost}} | רווח/הפסד: {{pnl}} ({{pct}})',
+    reconcileToIbi: 'התאמה ליתרת IBI',
+    reconcileToIbiHint: 'IBI הוא מקור האמת: היתרה תוגדר בדיוק לסכום שמופיע ב-IBI וההפרש יירשם.',
+    ibiCashBalanceLabel: 'יתרת מזומן ב-IBI (USD)',
+    ibiCashBalancePlaceholder: 'לדוגמה 93.56',
+    applyReconciliation: 'עדכן ליתרת IBI',
+    neverReconciledCaption: 'טרם בוצעה התאמה ל-IBI',
+    lastReconciledCaption: 'התאמה אחרונה ל-IBI: {{date}} (הפרש {{delta}})',
+    cashReconciledToast: 'המזומן הותאם ל-IBI: {{balance}} (הפרש {{delta}})',
+    capLockBadge: 'CAP LOCK',
+    capLockTitle: 'נעילת תקרה (CAP LOCK)',
+    capLockMessage: '{{ticker}} כבר מהווה {{weight}}% מהתיק (מושקע + מזומן). התקרה למניה בודדת היא {{cap}}%, ולכן קניות נוספות חסומות. אין מכירה כפויה.',
+    capExceededAfterBuyMessage: 'אחרי הקנייה הזו {{ticker}} יהווה {{weight}}% מהתיק, מעל תקרת {{cap}}% למניה בודדת. הקטינו את הכמות.',
+    capLockRowText: 'משקל בתיק {{weight}}% / תקרה {{cap}}%: קניות חסומות, אין מכירה.',
+    rulePositionCap: 'משקל הפוזיציה מתחת ל-{{max}}% מהתיק',
+    legacyNoAddsTitle: 'אחזקת Legacy',
+    legacyNoAddsMessage: '{{ticker}} ברשימת ה-Legacy: אין הוספות. מחזיקים כל עוד ROIC ≥ 8% והחפיר אינו None.',
+    legacyHoldBadge: 'LEGACY HOLD',
+    legacyExitBadge: 'LEGACY EXIT',
+    legacyExitRoic: 'ROIC TTM {{roic}}% מתחת לרצפת ה-Legacy ({{floor}}%)',
+    legacyExitMoat: 'החפיר דורג None',
+    legacyExitThesis: 'הבדיקה היסודית האחרונה: התזה נשברה',
+    legacyNoAddsHint: 'Legacy: אין הוספות. תג בלבד, אין מכירה אוטומטית.',
+    auditThesisIntact: 'התזה תקינה',
+    auditThesisBroken: 'התזה נשברה',
+    lastAuditIntact: 'בדיקה יסודית אחרונה: התזה תקינה',
+    lastAuditBroken: 'בדיקה יסודית אחרונה: התזה נשברה',
     positionClosedToast: '{{ticker}} נמכר במלואו: {{proceeds}}. כוח קנייה: {{balance}}',
     positionReducedToast: 'נמכרו {{units}} {{ticker}}: {{proceeds}}. כוח קנייה: {{balance}}',
     positionNotFoundMessage: 'הפוזיציה כבר לא נמצאת בתיק.',
@@ -713,6 +799,49 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     confirmSell: 'Confirm Sale',
     sellQuantityTooHighTitle: 'Quantity Exceeds Holding',
     sellQuantityTooHighMessage: 'You can sell at most {{units}} units of {{ticker}}.',
+    moatUnrated: 'Unrated',
+    moatSaveFailedTitle: 'Moat not saved',
+    moatSaveFailedMessage: 'The rating is applied on screen but could not be saved on this device. Try again.',
+    ruleRoic: 'ROIC TTM > {{floor}}%',
+    ruleMoatRated: 'Moat rated (Wide/Narrow)',
+    ruleCapexToRevenue: '3y CapEx/Revenue ≤ {{max}}%',
+    ruleCapexToOcf: '3y CapEx/OCF ≤ {{max}}%',
+    rulePeBelowAverage: 'P/E TTM < 5y avg P/E',
+    ruleZScore: 'Z-Score (504 trading days) ≤ {{max}}',
+    dailyCloseDrop: 'Drop from 52w high (daily close {{date}}): {{pct}}%',
+    auditTriggeredOn: 'Triggered on the {{date}} close ({{pct}}%). Stays active until marked Audited.',
+    markAudited: 'Mark Audited',
+    markAuditedTitle: 'Mark fundamental audit done',
+    markAuditedMessage: 'Confirm you reviewed ROIC and moat durability for {{ticker}}? Choose the conclusion: the alert clears and re-arms only after a close back above the -15% line and a new breach.',
+    degradationAction: 'Exit & redeploy only into template-qualifying names',
+    avgCostInput: 'IBI average cost ({{unit}}), now: {{current}}',
+    avgCostPnl: 'Avg cost (IBI): {{cost}} | P&L: {{pnl}} ({{pct}})',
+    reconcileToIbi: 'Reconcile to IBI',
+    reconcileToIbiHint: 'IBI is the source of truth: the balance is set to exactly what IBI shows and the difference is logged.',
+    ibiCashBalanceLabel: 'IBI cash balance (USD)',
+    ibiCashBalancePlaceholder: 'e.g. 93.56',
+    applyReconciliation: 'Set to IBI balance',
+    neverReconciledCaption: 'Not yet reconciled with IBI',
+    lastReconciledCaption: 'Last reconciled with IBI: {{date}} (difference {{delta}})',
+    cashReconciledToast: 'Cash reconciled to IBI: {{balance}} (difference {{delta}})',
+    capLockBadge: 'CAP LOCK',
+    capLockTitle: 'CAP LOCK',
+    capLockMessage: '{{ticker}} is already {{weight}}% of the portfolio (invested + cash). The single-stock cap is {{cap}}%, so adds are blocked. Nothing is sold.',
+    capExceededAfterBuyMessage: 'After this buy {{ticker}} would be {{weight}}% of the portfolio, above the {{cap}}% single-stock cap. Reduce the quantity.',
+    capLockRowText: 'Portfolio weight {{weight}}% / cap {{cap}}%: adds blocked, no sell.',
+    rulePositionCap: 'Position below {{max}}% of portfolio',
+    legacyNoAddsTitle: 'Legacy holding',
+    legacyNoAddsMessage: '{{ticker}} is on the Legacy list: no adds. Held while ROIC ≥ 8% and the moat is not None.',
+    legacyHoldBadge: 'LEGACY HOLD',
+    legacyExitBadge: 'LEGACY EXIT',
+    legacyExitRoic: 'ROIC TTM {{roic}}% below the Legacy floor ({{floor}}%)',
+    legacyExitMoat: 'Moat rated None',
+    legacyExitThesis: 'Last fundamental audit: thesis broken',
+    legacyNoAddsHint: 'Legacy: no adds. Badge only, never an automatic sell.',
+    auditThesisIntact: 'Thesis intact',
+    auditThesisBroken: 'Thesis broken',
+    lastAuditIntact: 'Last fundamental audit: thesis intact',
+    lastAuditBroken: 'Last fundamental audit: thesis broken',
     positionClosedToast: 'Sold all {{ticker}}: {{proceeds}}. Buying power: {{balance}}',
     positionReducedToast: 'Sold {{units}} {{ticker}}: {{proceeds}}. Buying power: {{balance}}',
     positionNotFoundMessage: 'This position is no longer in the portfolio.',

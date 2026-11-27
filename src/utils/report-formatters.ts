@@ -4,6 +4,7 @@ import type { PortfolioStock } from '@/types/portfolio';
 import type { AllocationBreakdown } from '@/utils/allocation';
 import { totalFeesUsd, type ExecutionRecord } from '@/utils/execution-ledger';
 import { positionUsdValue, usdUnitPrice } from '@/utils/fx';
+import { evaluateQualityReading } from '@/utils/quality-signal';
 import { formatUsd } from '@/utils/trade-execution';
 
 // Shared by the Ambush Radar screen's own export and the Portfolio screen's
@@ -21,11 +22,17 @@ export function formatAmbushLines(stocks: AmbushAsset[]): string[] {
       return [`  ${stock.ticker} (${stock.assetType}, ${stock.layer}): PRICE UNAVAILABLE (fetch failed)`];
     }
     if (stock.layer === 'Quality') {
-      const roicText = stock.roic === null ? 'N/A' : `${stock.roic.toFixed(1)}%`;
+      const pct = (value: number | null) => (value === null ? 'N/A' : `${value.toFixed(1)}%`);
+      const num = (value: number | null) => (value === null ? 'N/A' : value.toFixed(1));
       const zScoreText = stock.zScore === null ? 'N/A' : stock.zScore.toFixed(2);
+      // VALUE ZONE: the failed entry rules of the active template, by id.
+      const { failedRules } = evaluateQualityReading(stock);
       return [
         `  ${stock.ticker} (${stock.assetType}, Quality): Price $${stock.price.toFixed(2)} | ` +
-          `ROIC ${roicText} | Moat: ${stock.moat ?? 'N/A'} | Z-Score: ${zScoreText}`,
+          `ROIC ${pct(stock.roic)} | Moat: ${stock.moat} | Z-Score: ${zScoreText} | ` +
+          `P/E ${num(stock.peTtm)} vs 5y ${num(stock.pe5yAvg)} | ` +
+          `CapEx/Rev 3y ${pct(stock.capexToRevenue3y)} | CapEx/OCF 3y ${pct(stock.capexToOcf3y)} | ` +
+          `Failed: ${failedRules.length === 0 ? 'none' : failedRules.join(', ')}`,
       ];
     }
     // TREND CLASSIFICATION: both backend-computed signals (see
@@ -54,18 +61,29 @@ export function formatAmbushLines(stocks: AmbushAsset[]): string[] {
   });
 }
 
-const PORTFOLIO_SECTIONS: { category: PortfolioStock['category']; title: string }[] = [
-  { category: 'Core', title: 'CORE (70%)' },
-  { category: 'Satellite', title: 'SATELLITE (20%)' },
-  { category: 'Quality', title: 'QUALITY (10%)' },
-];
+const PORTFOLIO_SECTION_ORDER: readonly PortfolioStock['category'][] = ['Core', 'Satellite', 'Quality'];
+
+// Section headers read the user's saved targets (targetAllocations), never
+// a hardcoded preset: an 80/0/20 template prints CORE (80%) / SATELLITE (0%)
+// / QUALITY (20%).
+export function formatPortfolioSectionTitle(
+  category: PortfolioStock['category'],
+  targetPct: Record<PortfolioStock['category'], number>,
+): string {
+  return `${category.toUpperCase()} (${targetPct[category]}%)`;
+}
 
 // GAP 3: `usdIlsRate` is the live USD/ILS rate; Israeli positions are
 // valued with it (see positionUsdValue), exactly as on screen.
-export function formatPortfolioLines(stocks: PortfolioStock[], usdIlsRate: number | null): string[] {
+export function formatPortfolioLines(
+  stocks: PortfolioStock[],
+  usdIlsRate: number | null,
+  targetPct: Record<PortfolioStock['category'], number>,
+): string[] {
   const lines: string[] = [];
 
-  PORTFOLIO_SECTIONS.forEach(({ category, title }, index) => {
+  PORTFOLIO_SECTION_ORDER.forEach((category, index) => {
+    const title = formatPortfolioSectionTitle(category, targetPct);
     const sectionStocks = stocks.filter((stock) => stock.category === category);
 
     lines.push(title);
@@ -103,7 +121,7 @@ export function formatPortfolioLines(stocks: PortfolioStock[], usdIlsRate: numbe
       });
     }
 
-    if (index < PORTFOLIO_SECTIONS.length - 1) {
+    if (index < PORTFOLIO_SECTION_ORDER.length - 1) {
       lines.push('');
     }
   });

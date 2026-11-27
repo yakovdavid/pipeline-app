@@ -4,10 +4,12 @@ import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { AMBUSH_ZONE_BADGE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
-import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
+import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
-import type { QualityAmbushAsset, QualityMoat } from '@/types/ambush';
-import { qualityMinRoicPct } from '@/utils/quality-signal';
+import { MoatSelector } from '@/components/MoatSelector';
+import { QualityRuleList } from '@/components/QualityRuleList';
+import type { QualityAmbushAsset } from '@/types/ambush';
+import { evaluateQualityReading, qualityEntryThresholds, qualityMinRoicPct } from '@/utils/quality-signal';
 import { useTargetAllocations } from '@/utils/target-allocation-store';
 import type { AmbushReadinessZone } from '@/utils/ambush-grouping';
 import { formatUnitPrice } from '@/utils/currency';
@@ -26,27 +28,18 @@ export type QualityAmbushCardProps = {
   // CIRCUIT BREAKER: the Quality layer is above target + 1%, so the card
   // is dimmed, badged and its Buy button disabled.
   isOverweightLocked: boolean;
+  // P9: the lock badge's text when the lock is a single-stock CAP LOCK
+  // rather than a layer lock. Defaults to the overweight badge.
+  lockBadgeText?: string;
 };
 
-function moatLabel(t: TFunction, moat: QualityMoat | null): string {
-  switch (moat) {
-    case 'Wide':
-      return t('moatWide');
-    case 'Narrow':
-      return t('moatNarrow');
-    case 'None':
-      return t('moatNone');
-    default:
-      return t('notAvailable');
-  }
-}
-
 // UNIFIED RADAR: the Quality (fundamental) counterpart of StockCard,
-// populated from GET /api/quality/{ticker}. COMPACT LAYOUT, two rows: ticker
-// and price; then ROIC (green at or above the 15% gate, red below), Moat,
-// and the Z-Score (the statistical trigger, slightly larger and bolder) side
-// by side. A thin status strip along the bottom shows the readiness zone in
-// that zone's color.
+// populated from GET /api/quality/{ticker}. Rows: ticker and price; ROIC
+// (green above the template floor, red otherwise) and the Z-Score side by
+// side; the editable manual moat (MoatSelector); then every entry rule of
+// the active template with ✓/✗ (QualityRuleList), so a card outside the
+// Value Zone shows which rule failed. A thin status strip along the bottom
+// shows the readiness zone in that zone's color.
 //
 // Missing values show as "N/A": ROIC when the company has no financial
 // statements (e.g. an ETF), the Z-Score when there isn't enough price
@@ -63,6 +56,7 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
   onDelete,
   onBuy,
   isOverweightLocked,
+  lockBadgeText,
 }: QualityAmbushCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
@@ -73,7 +67,9 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
   const zoneColors = ambushZoneColors(colors, zone);
   const isUnavailable = asset.priceStatus === 'unavailable';
   const roicColor =
-    asset.roic === null ? colors.textSecondary : asset.roic >= qualityMinRoicPct(targets) ? colors.bullish : colors.bearish;
+    asset.roic === null ? colors.textSecondary : asset.roic > qualityMinRoicPct(targets) ? colors.bullish : colors.bearish;
+  const thresholds = qualityEntryThresholds(targets);
+  const evaluation = evaluateQualityReading(asset, targets);
   // SAFE BUTTONS: Buy is rendered only for a Value Zone asset. In Watch or
   // Invalidated it doesn't exist at all, so it can't be hit by accident.
   const canBuy = zone === 'valueZone';
@@ -123,10 +119,6 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
                 {asset.roic === null ? t('notAvailable') : `${asset.roic.toFixed(1)}%`}
               </Text>
             </View>
-            <View style={styles.metric}>
-              <Text style={styles.metricLabel}>{t('moatLabel')}</Text>
-              <Text style={styles.metricValue}>{moatLabel(t, asset.moat)}</Text>
-            </View>
             {/* The statistical trigger, slightly larger than the
                 fundamentals beside it. */}
             <View style={styles.metric}>
@@ -135,6 +127,16 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
                 {asset.zScore === null ? t('notAvailable') : asset.zScore.toFixed(2)}
               </Text>
             </View>
+          </View>
+        )}
+
+        {/* MANUAL MOAT: editable even while the price is unavailable. */}
+        <View style={styles.moatRow}>
+          <MoatSelector ticker={asset.ticker} />
+        </View>
+        {!isUnavailable && (
+          <View style={styles.rulesRow}>
+            <QualityRuleList reading={asset} evaluation={evaluation} thresholds={thresholds} />
           </View>
         )}
 
@@ -148,7 +150,7 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
         <View style={styles.lockOverlay}>
           <View style={styles.lockBadge} accessibilityRole="text">
             <Ionicons name="lock-closed" size={14} color="#FFFFFF" />
-            <Text style={styles.lockBadgeText}>{t('overweightLockBadge')}</Text>
+            <Text style={styles.lockBadgeText}>{lockBadgeText ?? t('overweightLockBadge')}</Text>
           </View>
         </View>
       )}
@@ -312,6 +314,14 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       fontWeight: '800',
       marginTop: 1,
       writingDirection: 'ltr',
+    },
+    moatRow: {
+      paddingHorizontal: 12,
+      marginBottom: 6,
+    },
+    rulesRow: {
+      paddingHorizontal: 12,
+      marginBottom: 6,
     },
     statusStrip: {
       paddingHorizontal: 12,

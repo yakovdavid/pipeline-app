@@ -7,6 +7,7 @@ import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { usePipelineLanguage, type Language, type TFunction } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
 import { ALLOCATION_BUCKETS, type AllocationBreakdown, type AllocationBucket } from '@/utils/allocation';
+import type { CashReconciliation } from '@/utils/cash-storage';
 import { formatUsd } from '@/utils/trade-execution';
 
 export type CashSummaryCardProps = {
@@ -21,6 +22,8 @@ export type CashSummaryCardProps = {
   // (null until the ledger has loaded).
   feesLoggedUsd: number | null;
   onAdjustCash: () => void;
+  // IBI CASH RECONCILIATION (P7): the most recent one, null if never.
+  lastReconciliation: CashReconciliation | null;
   // DYNAMIC LAYER TARGETS: opens the target-allocation editor.
   onEditTargets: () => void;
 };
@@ -54,6 +57,7 @@ export const CashSummaryCard = memo(function CashSummaryCard({
   usdIlsRate,
   feesLoggedUsd,
   onAdjustCash,
+  lastReconciliation,
   onEditTargets,
 }: CashSummaryCardProps) {
   const { colors } = usePipelineTheme();
@@ -111,6 +115,15 @@ export const CashSummaryCard = memo(function CashSummaryCard({
           {feesLoggedUsd !== null && (
             <Text style={styles.caption}>{t('feesLoggedCaption', { amount: formatUsd(feesLoggedUsd) })}</Text>
           )}
+          {/* P7: when the balance was last matched to IBI, and by how much. */}
+          <Text style={styles.caption}>
+            {lastReconciliation === null
+              ? t('neverReconciledCaption')
+              : t('lastReconciledCaption', {
+                  date: new Date(lastReconciliation.reconciledAt).toLocaleDateString(language === 'he' ? 'he-IL' : 'en-GB'),
+                  delta: `${lastReconciliation.deltaUsd >= 0 ? '+' : '−'}${formatUsd(Math.abs(lastReconciliation.deltaUsd))}`,
+                })}
+          </Text>
 
           <View style={styles.allocationHeaderRow}>
             <Text style={[styles.caption, styles.allocationCaption]}>{t('allocationWithCash')}</Text>

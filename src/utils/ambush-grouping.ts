@@ -1,7 +1,8 @@
 import type { AmbushAsset, QualityAmbushAsset, SatelliteAmbushAsset } from '@/types/ambush';
 import { isFailedAmbush } from '@/utils/ambush-safety';
 import { classifyPullbackZone } from '@/utils/ambush-zone';
-import { isQualityBuySignal, passesQualityFundamentals } from '@/utils/quality-signal';
+import { evaluateQualityReading } from '@/utils/quality-signal';
+import type { TargetAllocations } from '@/utils/target-allocation-store';
 
 // UNIFIED RADAR: assets are grouped by operational readiness, not by layer,
 // so Satellite and Quality assets in the same state share a section.
@@ -51,23 +52,31 @@ function classifySatellite(asset: SatelliteAmbushAsset): AmbushReadinessZone {
   }
 }
 
-// Quality (fundamental + statistical), on live GET /api/quality data. The
-// rules live in @/utils/quality-signal, shared with the Portfolio alert:
-//   Invalidated: fails a fundamental gate (ROIC < 15%, no moat, or either
-//     unknown), or the fetch failed.
-//   Value Zone:  a Buy Signal: passes both gates and Z-Score <= -1.0. The
-//     Portfolio raises its Quality alert on exactly the same condition.
-//   Watch:       passes both gates, but Z-Score > -1.0 or no Z-Score yet
-//                (too little price history).
-function classifyQuality(asset: QualityAmbushAsset): AmbushReadinessZone {
-  if (asset.priceStatus === 'unavailable' || !passesQualityFundamentals(asset)) {
+// Quality, on live GET /api/quality data plus the manual moat. The rules
+// live in @/utils/quality-entry-rules (every entry rule of the active
+// template), shared with the Portfolio alert:
+//   Invalidated: fails a QUALITY gate (ROIC, moat rated, and under
+//     Hyper-Quality the two Capital Light ratios; unknown fails), or the
+//     fetch failed.
+//   Value Zone:  passes EVERY rule, including the price gates P/E TTM <
+//     5y avg P/E and Z-Score <= -1.0. The Portfolio raises its Quality
+//     alert on exactly the same condition.
+//   Watch:       a qualifying business that fails only a price gate.
+// The card lists which rule failed (QualityAmbushCard).
+function classifyQuality(asset: QualityAmbushAsset, targets?: TargetAllocations): AmbushReadinessZone {
+  if (asset.priceStatus === 'unavailable') {
     return 'invalidated';
   }
-  return isQualityBuySignal(asset) ? 'valueZone' : 'watch';
+  const evaluation = evaluateQualityReading(asset, targets);
+  if (!evaluation.passesQualityGates) {
+    return 'invalidated';
+  }
+  return evaluation.isBuySignal ? 'valueZone' : 'watch';
 }
 
-export function classifyAmbushReadiness(asset: AmbushAsset): AmbushReadinessZone {
-  return asset.layer === 'Quality' ? classifyQuality(asset) : classifySatellite(asset);
+// `targets` defaults to the live target allocation.
+export function classifyAmbushReadiness(asset: AmbushAsset, targets?: TargetAllocations): AmbushReadinessZone {
+  return asset.layer === 'Quality' ? classifyQuality(asset, targets) : classifySatellite(asset);
 }
 
 // Within Value Zone and Watch, the most stretched assets come first:
@@ -106,10 +115,13 @@ function compareReadiness(a: AmbushAsset, b: AmbushAsset): number {
 // Splits the combined list into the three readiness zones. Returns new
 // arrays and never mutates the input. Array.prototype.sort is stable, so
 // ties keep watchlist order.
-export function groupAmbushByReadiness(assets: readonly AmbushAsset[]): AmbushReadinessGroups {
+export function groupAmbushByReadiness(
+  assets: readonly AmbushAsset[],
+  targets?: TargetAllocations,
+): AmbushReadinessGroups {
   const groups: AmbushReadinessGroups = { valueZone: [], watch: [], invalidated: [] };
   for (const asset of assets) {
-    groups[classifyAmbushReadiness(asset)].push(asset);
+    groups[classifyAmbushReadiness(asset, targets)].push(asset);
   }
   groups.valueZone.sort(compareReadiness);
   groups.watch.sort(compareReadiness);

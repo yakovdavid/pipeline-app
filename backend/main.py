@@ -340,7 +340,7 @@ BEARISH_ANOMALY_RULES: dict[str, dict[str, float]] = {
 SATELLITE_TRAILING_STOP_PCT = 0.12
 
 # Quality assets' Z-Score/ROIC/Moat are NOT computed in this file: see
-# GET /api/quality/{ticker} in quality.py (2-year Z-Score from FMP).
+# GET /api/quality/{ticker} in quality.py (504-day Z-Score, FMP ROIC/P/E/CapEx).
 
 # On-Demand Intel: a user-triggered (not automatic/high-frequency) request
 # for a ticker's latest headlines regardless of price movement. Since it's
@@ -1368,7 +1368,7 @@ def _update_high_water_mark(existing_high_water_mark: float | None, current_pric
     high_water_mark ... if the new current_price is strictly greater than
     the existing high_water_mark." A missing existing watermark (a
     position's very first fetch — nothing to compare against yet) seeds it
-    from current_price, matching the frontend's own computeHighestWatermark
+    from current_price, matching the frontend's own nextLocalWatermark
     (src/app/(tabs)/index.tsx) so the two stay consistent whether or not a
     caller has an existing value to send.
     """

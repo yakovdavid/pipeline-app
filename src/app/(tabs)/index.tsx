@@ -76,7 +76,14 @@ import {
   getEffectiveUnits,
   isTaseTicker,
 } from '@/utils/currency';
-import { loadCashBalance, saveCashBalance } from '@/utils/cash-storage';
+import {
+  buildCashReconciliation,
+  loadCashBalance,
+  loadCashReconciliations,
+  saveCashBalance,
+  saveCashReconciliations,
+  type CashReconciliation,
+} from '@/utils/cash-storage';
 import {
   subscribeToPortfolioBuyRequests,
   takePendingPortfolioBuy,
@@ -108,7 +115,26 @@ import {
   useTargetAllocations,
   type TargetAllocations,
 } from '@/utils/target-allocation-store';
-import { isFundamentalDegradation, qualityMinRoicPct } from '@/utils/quality-signal';
+import {
+  evaluateQualityReading,
+  isFundamentalDegradation,
+  qualityEntryThresholds,
+  qualityMinRoicPct,
+} from '@/utils/quality-signal';
+import { ensureMoatRatingsLoaded, getMoatRating, useMoatRatings } from '@/utils/moat-store';
+import { ensureAuditLatchesLoaded, markTickerAudited, recordDailyCloseReading, useAuditLatch } from '@/utils/audit-latch-store';
+import { MoatSelector } from '@/components/MoatSelector';
+import {
+  exceedsCapAfterBuy,
+  isAtOrAboveCap,
+  isCapApplicable,
+  positionWeightPct,
+  SINGLE_STOCK_CAP_PCT,
+  weightAfterBuyPct,
+} from '@/utils/position-cap';
+import { publishPositionWeights } from '@/utils/position-weights-store';
+import { isLegacyTicker, LEGACY_MIN_ROIC_PCT, legacyExitReasons, type LegacyExitReason } from '@/utils/legacy-hold';
+import { QualityRuleList } from '@/components/QualityRuleList';
 import { isStructuralBreakdown, isStructuralBreakdownLayer } from '@/utils/structural-breakdown';
 import { normalizeTickerInput } from '@/utils/ticker';
 import {
@@ -166,6 +192,9 @@ type PortfolioListSection = {
   // this layer's share of the WHOLE portfolio. Computed once here, same
   // reasoning as currentWeightPct, rather than each row re-deriving it.
   layerTotalValue: number;
+  // P9: the portfolio denominator (invested + cash), for each row's own
+  // weight against the single-stock cap.
+  portfolioTotalValue: number;
 };
 
 // The return type of createStyles (defined at the bottom of this file) —
@@ -202,8 +231,12 @@ type EntryDataEdit = {
   purchasePriceUsd: number | null;
   historicalHwmUsd: number | null;
   // MANUAL HWM OVERRIDE: the true peak reached while holding, replacing
-  // the tracked highestWatermark (activeHWM).
+  // the tracked highestWatermark (activeHWM). Typed in broker units and
+  // also given here in local currency (the canonical stored unit, P2).
   activeHwmUsd: number | null;
+  activeHwmLocal: number | null;
+  // P8: manual IBI average cost per unit, local currency.
+  avgCostLocal: number | null;
 };
 
 type TradeStart = {
@@ -587,6 +620,9 @@ export default function PortfolioScreen() {
   const [cashBalance, setCashBalance] = useState(0);
   const [isCashLoaded, setIsCashLoaded] = useState(false);
   const cashBalanceRef = useRef(0);
+  // P9: the latest portfolio denominator (invested + cash) for the buy
+  // handlers; null until the portfolio and cash have both loaded.
+  const portfolioTotalValueRef = useRef<number | null>(null);
   const isCashLoadedRef = useRef(false);
   const [isAdjustCashModalVisible, setIsAdjustCashModalVisible] = useState(false);
   const [adjustCashModalKey, setAdjustCashModalKey] = useState(0);
@@ -597,6 +633,25 @@ export default function PortfolioScreen() {
   const [targetModalKey, setTargetModalKey] = useState(0);
   useEffect(() => {
     void ensureTargetAllocationsLoaded();
+    void ensureMoatRatingsLoaded();
+    void ensureAuditLatchesLoaded();
+  }, []);
+
+  // P7: the IBI reconciliation log (newest last). A failed read shows
+  // "never reconciled" but doesn't block cash changes.
+  const [cashReconciliations, setCashReconciliations] = useState<CashReconciliation[]>([]);
+  useEffect(() => {
+    let isActive = true;
+    loadCashReconciliations()
+      .then((entries) => {
+        if (isActive) {
+          setCashReconciliations(entries);
+        }
+      })
+      .catch((error) => console.warn('[cash] Failed to read the IBI reconciliation log.', error));
+    return () => {
+      isActive = false;
+    };
   }, []);
 
   const loadCash = useCallback(async () => {
@@ -745,6 +800,10 @@ export default function PortfolioScreen() {
         category: entry.category ?? 'Core',
         units: typeof entry.units === 'number' && entry.units > 0 ? entry.units : 1,
         assetType: entry.assetType === 'ETF' ? 'ETF' : 'Stock',
+        highestWatermarkLocal:
+          typeof entry.highestWatermarkLocal === 'number' && entry.highestWatermarkLocal > 0
+            ? entry.highestWatermarkLocal
+            : null,
         highestWatermark:
           typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
         calibrationFactor:
@@ -766,6 +825,8 @@ export default function PortfolioScreen() {
           typeof entry.purchasePrice === 'number' && entry.purchasePrice > 0 ? entry.purchasePrice : null,
         historicalHWM:
           typeof entry.historicalHWM === 'number' && entry.historicalHWM > 0 ? entry.historicalHWM : null,
+        avgCostLocal:
+          typeof entry.avgCostLocal === 'number' && entry.avgCostLocal > 0 ? entry.avgCostLocal : null,
       }));
     } catch (error) {
       console.error(
@@ -807,7 +868,7 @@ export default function PortfolioScreen() {
       // /api/quality (see fetchPortfolioQuote), the same source the Ambush
       // Radar uses. highWaterMark is intentionally omitted here: this is each
       // position's FIRST fetch of the session, so there's nothing yet to
-      // compare against beyond what computeHighestWatermark below already
+      // compare against beyond what buildPortfolioStock's watermark step already
       // does client-side.
       fetchPortfolioQuote(entry.ticker, entry.category),
     );
@@ -965,6 +1026,22 @@ export default function PortfolioScreen() {
     }
   });
 
+  // P5 FUNDAMENTAL AUDIT LATCH: every held Quality position's daily-close
+  // reading is fed to the latch here, at screen level, so a row that is
+  // scrolled out of view (the list is virtualized) is still evaluated.
+  // Readings are idempotent; the latch only ever moves on a new close.
+  useEffect(() => {
+    for (const stock of stocks) {
+      const closeDrawdownPct = stock.category === 'Quality' ? (stock.qualityMetrics?.closeDrawdownPct ?? null) : null;
+      if (closeDrawdownPct !== null) {
+        recordDailyCloseReading(stock.ticker, {
+          closeDrawdownPct,
+          closeDate: stock.qualityMetrics?.auditCloseDate ?? null,
+        });
+      }
+    }
+  }, [stocks]);
+
   // CACHE INTEGRITY: keep AsyncStorage in sync with the current portfolio
   // — but ONLY once there's trustworthy data to sync. Skipped while
   // initializing so we don't overwrite storage before the saved list
@@ -1005,6 +1082,26 @@ export default function PortfolioScreen() {
     const held = stocks.find((stock) => stock.ticker === start.ticker);
     const category = held?.category ?? start.category;
     const assetType = held?.assetType ?? start.assetType;
+
+    // P10 LEGACY HOLD: no adds, from any entry point (Add Asset, Buy on the
+    // row, a radar Buy).
+    if (isLegacyTicker(start.ticker)) {
+      Alert.alert(t('legacyNoAddsTitle'), t('legacyNoAddsMessage', { ticker: start.ticker }));
+      return false;
+    }
+    // P9 CAP LOCK: a single stock already at or above 5% gets no add at
+    // all. (The post-trade weight is checked again in handleConfirmTrade.)
+    const denominator = portfolioTotalValueRef.current;
+    if (held !== undefined && denominator !== null && isCapApplicable(assetType, start.ticker)) {
+      const weight = positionWeightPct(positionUsdValue(held, usdIlsRateRef.current), denominator);
+      if (isAtOrAboveCap(weight)) {
+        Alert.alert(
+          t('capLockTitle'),
+          t('capLockMessage', { ticker: start.ticker, weight: weight.toFixed(1), cap: SINGLE_STOCK_CAP_PCT }),
+        );
+        return false;
+      }
+    }
 
     // SSOT: a Quality position's Z-Score, ROIC and Moat come from
     // /api/quality (see fetchPortfolioQuote); nothing is entered by hand.
@@ -1301,12 +1398,14 @@ export default function PortfolioScreen() {
         category: trade.category,
         assetType: trade.assetType,
         units: inputs.quantity,
+        highestWatermarkLocal: null,
         highestWatermark: null,
         calibrationFactor,
         internalTargetPct: trade.internalTargetPct,
         costBasisUsd: costUsd,
         purchasePrice: fillPriceUsd,
         historicalHWM: historicalHwmUsd,
+        avgCostLocal: null,
       };
       // buildPortfolioStock calibrates the quote and seeds the watermark
       // from the live price, exactly like a freshly loaded position.
@@ -1379,6 +1478,26 @@ export default function PortfolioScreen() {
       return;
     }
     const { totalUsd } = computeTradeCost(inputs, trade.basis);
+    // P9: the weight this single stock would have right after the buy must
+    // not exceed 5%. A hard block: the cap is a purchase lock.
+    const denominator = portfolioTotalValueRef.current;
+    if (denominator !== null && isCapApplicable(trade.assetType, trade.ticker)) {
+      const held = stocks.find((stock) => stock.ticker === trade.ticker);
+      const heldValueUsd = held === undefined ? 0 : positionUsdValue(held, usdIlsRateRef.current);
+      const feeUsd = inputs.fee * trade.basis.usdPerLocal;
+      const weightAfter = weightAfterBuyPct(heldValueUsd, totalUsd - feeUsd, feeUsd, denominator);
+      if (exceedsCapAfterBuy(weightAfter)) {
+        Alert.alert(
+          t('capLockTitle'),
+          t('capExceededAfterBuyMessage', {
+            ticker: trade.ticker,
+            weight: weightAfter.toFixed(1),
+            cap: SINGLE_STOCK_CAP_PCT,
+          }),
+        );
+        return;
+      }
+    }
     const available = cashBalanceRef.current;
     if (totalUsd > available) {
       Alert.alert(
@@ -1444,6 +1563,33 @@ export default function PortfolioScreen() {
         t(deltaUsd >= 0 ? 'cashAddedToast' : 'cashWithdrawnToast', { amount, balance: formatUsd(balanceAfter) }),
       );
     });
+  };
+
+  // IBI CASH RECONCILIATION (P7): IBI is the source of truth. The balance
+  // is set to exactly what IBI shows (no negative-balance prompt: a debit
+  // at IBI is a fact to record, not a choice), and the correction is
+  // logged so the drift stays visible on the summary card and in backups.
+  const handleReconcileCash = (ibiBalanceUsd: number) => {
+    if (!isCashLoadedRef.current) {
+      Alert.alert(t('cashUnavailableTitle'), t('cashUnavailableMessage'));
+      return;
+    }
+    const record = buildCashReconciliation(cashBalanceRef.current, ibiBalanceUsd, new Date());
+    applyCashBalance(record.ibiUsd);
+    setIsAdjustCashModalVisible(false);
+    setCashReconciliations((previous) => {
+      const next = [...previous, record];
+      saveCashReconciliations(next).catch((error) => {
+        console.warn('[cash] Failed to save the IBI reconciliation log.', error);
+      });
+      return next;
+    });
+    showToast(
+      t('cashReconciledToast', {
+        balance: formatUsd(record.ibiUsd),
+        delta: `${record.deltaUsd >= 0 ? '+' : '−'}${formatUsd(Math.abs(record.deltaUsd))}`,
+      }),
+    );
   };
 
   // CLOSED-LOOP WATCHLIST: what follows a sale that closes a position
@@ -1679,7 +1825,12 @@ export default function PortfolioScreen() {
           // Automated Tracking (stop = activeHWM × 0.88) on this same
           // render; the next refresh only raises it if the price is higher.
           const livePrice = stock.priceStatus === 'live' ? stock.price : null;
+          const liveLocalPrice = stock.priceStatus === 'live' ? stock.localPrice : null;
           const highestWatermark = entryEdit.activeHwmUsd ?? stock.highestWatermark ?? livePrice;
+          // P2: the canonical local-currency peak moves together with it.
+          const highestWatermarkLocal = entryEdit.activeHwmLocal ?? stock.highestWatermarkLocal ?? liveLocalPrice;
+          // P8: a filled-in average cost replaces the stored one.
+          const avgCostLocal = entryEdit.avgCostLocal ?? stock.avgCostLocal;
 
           // CORE LAYER INTERNAL ALLOCATION: a BLANK field PRESERVES the
           // existing value — same "blank means leave it alone" reasoning as
@@ -1720,6 +1871,8 @@ export default function PortfolioScreen() {
               ...stock,
               assetType: newAssetType,
               highestWatermark,
+              highestWatermarkLocal,
+              avgCostLocal,
               internalTargetPct,
               // LEGACY ENTRY DATA: a filled-in field replaces the stored
               // value; a blank one keeps it.
@@ -1766,6 +1919,13 @@ export default function PortfolioScreen() {
               (stock.highestWatermark === null
                 ? newUsdPrice
                 : applyCalibration(stripCalibration(stock.highestWatermark, existingFactor), calibrationFactor)),
+            highestWatermarkLocal:
+              entryEdit.activeHwmLocal ??
+              (stock.highestWatermarkLocal === null
+                ? newLocalPrice
+                : applyCalibration(stripCalibration(stock.highestWatermarkLocal, existingFactor), calibrationFactor)),
+            // P8: a real broker figure, so never recalibrated.
+            avgCostLocal,
             internalTargetPct,
             // PROTECTION STATE: a stored historicalHWM came from Yahoo (the
             // quote's 52-week high), so it moves to the new scale like the
@@ -1792,6 +1952,7 @@ export default function PortfolioScreen() {
         stock={item}
         accentColor={section.accentColor}
         layerTotalValue={section.layerTotalValue}
+        portfolioTotalValue={isCashLoaded ? section.portfolioTotalValue : null}
         usdIlsRate={usdIlsRate}
         onSell={handleSellTicker}
         onLogExitFill={handleLogExitFill}
@@ -1804,7 +1965,7 @@ export default function PortfolioScreen() {
         t={t}
       />
     ),
-    [handleSellTicker, handleLogExitFill, handleBuyMoreTicker, topUpPendingTicker, handleSaveEdit, usdIlsRate, colors, styles, language, t],
+    [handleSellTicker, handleLogExitFill, handleBuyMoreTicker, topUpPendingTicker, handleSaveEdit, usdIlsRate, isCashLoaded, colors, styles, language, t],
   );
 
   // SNAPSHOT HEADER: the same real-time summary heads both exports.
@@ -1824,7 +1985,7 @@ export default function PortfolioScreen() {
       '',
       ...snapshotHeader(),
       '',
-      ...formatPortfolioLines(stocks, usdIlsRate),
+      ...formatPortfolioLines(stocks, usdIlsRate, targets),
     ].join('\n');
 
     try {
@@ -1859,7 +2020,7 @@ export default function PortfolioScreen() {
         ...snapshotHeader(),
         '',
         '=== PORTFOLIO ===',
-        ...formatPortfolioLines(stocks, usdIlsRate),
+        ...formatPortfolioLines(stocks, usdIlsRate, targets),
         '',
         '=== RECENT EXECUTIONS ===',
         ...formatExecutionLines(executionLog),
@@ -1946,6 +2107,10 @@ export default function PortfolioScreen() {
       // older backup without one leaves the current ledger as it is.
       if (payload.executions !== null) {
         setExecutionLog(payload.executions.slice(-EXECUTION_LEDGER_MAX_ENTRIES));
+      }
+      // P7: mirror the restored IBI reconciliation log.
+      if (payload.cashReconciliations !== null) {
+        setCashReconciliations(payload.cashReconciliations);
       }
       // DYNAMIC LAYER TARGETS: nothing to mirror. restoreBackupPayload
       // saved them through the shared store, which already re-rendered
@@ -2099,6 +2264,25 @@ export default function PortfolioScreen() {
     );
   }, [areWeightsReliable, coreWeightPct, satelliteWeightPct, qualityWeightPct, cashWeightPct]);
 
+  // P9: each held single stock's weight, for the radar's CAP LOCK, and the
+  // denominator for the buy handlers. Unknown (null) until reliable.
+  const portfolioTotalValue = allocation.totalValue;
+  useEffect(() => {
+    portfolioTotalValueRef.current = areWeightsReliable ? portfolioTotalValue : null;
+    if (!areWeightsReliable) {
+      publishPositionWeights(null);
+      return;
+    }
+    const weights: Record<string, number> = {};
+    for (const stock of stocks) {
+      if (stock.priceStatus === 'live' && isCapApplicable(stock.assetType, stock.ticker)) {
+        const weight = positionWeightPct(positionUsdValue(stock, usdIlsRate), portfolioTotalValue);
+        weights[stock.ticker.toUpperCase()] = Math.round(weight * 100) / 100;
+      }
+    }
+    publishPositionWeights(weights);
+  }, [areWeightsReliable, portfolioTotalValue, stocks, usdIlsRate]);
+
   const allSections: PortfolioListSection[] = [
     {
       title: buildSectionTitle(t, 'Core', coreStocks, coreWeightPct, targets),
@@ -2107,6 +2291,7 @@ export default function PortfolioScreen() {
       data: coreStocks,
       currentWeightPct: coreWeightPct,
       layerTotalValue: coreLayerTotalValue,
+      portfolioTotalValue,
     },
     {
       title: buildSectionTitle(t, 'Satellite', satelliteStocks, satelliteWeightPct, targets),
@@ -2115,6 +2300,7 @@ export default function PortfolioScreen() {
       data: satelliteStocks,
       currentWeightPct: satelliteWeightPct,
       layerTotalValue: satelliteLayerTotalValue,
+      portfolioTotalValue,
     },
     {
       title: buildSectionTitle(t, 'Quality', qualityStocks, qualityWeightPct, targets),
@@ -2123,6 +2309,7 @@ export default function PortfolioScreen() {
       data: qualityStocks,
       currentWeightPct: qualityWeightPct,
       layerTotalValue: qualityLayerTotalValue,
+      portfolioTotalValue,
     },
   ];
   const visibleSections = allSections.filter(
@@ -2216,6 +2403,7 @@ export default function PortfolioScreen() {
         usdIlsRate={usdIlsRate}
         feesLoggedUsd={executionLog === null ? null : totalFeesUsd(executionLog)}
         onAdjustCash={handleOpenAdjustCash}
+        lastReconciliation={cashReconciliations.length > 0 ? cashReconciliations[cashReconciliations.length - 1] : null}
         onEditTargets={handleOpenTargets}
       />
 
@@ -2593,6 +2781,7 @@ export default function PortfolioScreen() {
         visible={isAdjustCashModalVisible}
         cashBalance={cashBalance}
         onSubmit={handleAdjustCash}
+        onReconcile={handleReconcileCash}
         onCancel={() => setIsAdjustCashModalVisible(false)}
       />
 
@@ -2787,6 +2976,9 @@ export default function PortfolioScreen() {
   );
 }
 
+// Agorot per Shekel, for broker-typed ".TA" prices (divided exactly once).
+const AGOROT_PER_SHEKEL_INPUT = 100;
+
 type PortfolioStockRowProps = {
   stock: PortfolioStock;
   accentColor: string;
@@ -2800,6 +2992,9 @@ type PortfolioStockRowProps = {
   // itself lives on PortfolioListSection still, for the section HEADER,
   // which legitimately does want the layer's whole-portfolio share.
   layerTotalValue: number;
+  // P9: invested + cash (null until the cash balance has loaded), for this
+  // row's weight against the single-stock cap.
+  portfolioTotalValue: number | null;
   // GAP 3: the live USD/ILS rate, for this row's own USD value (the
   // internal-weight numerator must use the same FX as layerTotalValue).
   usdIlsRate: number | null;
@@ -2846,6 +3041,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   stock,
   accentColor,
   layerTotalValue,
+  portfolioTotalValue,
   usdIlsRate,
   onSell,
   onLogExitFill,
@@ -2878,6 +3074,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const [purchasePriceText, setPurchasePriceText] = useState('');
   const [historicalHwmText, setHistoricalHwmText] = useState('');
   const [activeHwmText, setActiveHwmText] = useState('');
+  // P8: manual IBI average cost, typed like the entry fields above.
+  const [avgCostText, setAvgCostText] = useState('');
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
   // `units` is a Nominal Value quantity — 100 nominal units = 1 real
@@ -2895,6 +3093,16 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // independently in PortfolioScreen from `stock.price` (USD) alone; see
   // the IMPORTANT note above allSections there.
   const localTotalValue = effectiveUnits * stock.localPrice;
+
+  // P8: P&L vs. the manual IBI average cost, local currency (both sides
+  // are per-unit local prices, so no FX enters it).
+  const manualPnl =
+    stock.avgCostLocal !== null && stock.avgCostLocal > 0
+      ? {
+          amount: (stock.localPrice - stock.avgCostLocal) * effectiveUnits,
+          pct: (stock.localPrice / stock.avgCostLocal - 1) * 100,
+        }
+      : null;
 
   // CORE LAYER INTERNAL ALLOCATION FIX: (Asset Total Value / Layer Total
   // Value) * 100 — this asset's own share of ITS layer, as opposed to
@@ -2988,34 +3196,70 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const sma200Display =
     localSma200 !== null ? formatUnitPrice(stock.ticker, localSma200, stock.currencySymbol, agorotSuffix) : null;
 
-  // LAYER 2: QUALITY — Kill Switch Tracker: a position that has fallen 15%+
-  // from its 52-week high gets flagged RED with a Fundamental Audit tag,
-  // otherwise it reads HOLD. This is the drawdown-based half of "quality_
-  // status === 'FUNDAMENTAL_AUDIT_REQUIRED' (or drawdown <= -15%)" — the
-  // quality_status API field doesn't exist on the live backend yet (only in
-  // the unexecuted Supabase view — see backend/sql/001_ui_pipeline_metrics.
-  // sql), so this reads the one half of that condition that IS real,
-  // already-delivered data: stock.drawdownPct.
-  const isFundamentalAuditRequired =
-    stock.category === 'Quality' && stock.drawdownPct !== null && stock.drawdownPct <= -15;
+  // LAYER 2: QUALITY — Kill Switch Tracker (FUNDAMENTAL AUDIT REQUIRED).
+  // P5 (approved 2026-11-27): evaluated on the last COMPLETED DAILY CLOSE
+  // vs. the 52-week high of daily closes (GET /api/quality), never the live
+  // price, and LATCHED (see @/utils/audit-latch): once triggered it stays
+  // until the user marks it Audited; a recovery never clears it. AUDIT is
+  // a review prompt only and never offers or triggers a sell.
+  const qualityMetrics = stock.category === 'Quality' ? stock.qualityMetrics : null;
+  const closeDrawdownPct = qualityMetrics?.closeDrawdownPct ?? null;
+  const auditCloseDate = qualityMetrics?.auditCloseDate ?? null;
+  const auditLatch = useAuditLatch(stock.ticker);
+  const isFundamentalAuditRequired = stock.category === 'Quality' && auditLatch.status === 'triggered';
 
-  // LAYER 2: QUALITY — Buy Signal (SSOT): stock.qualityZScoreAlert is set
-  // by fetchPortfolioQuote via isQualityBuySignal — Z-Score <= -1.0 AND
-  // ROIC >= 15% AND a moat, all from /api/quality: exactly the Ambush
-  // Radar's Value Zone. A value trap (cheap but broken fundamentals) never
-  // alerts. The category check is defense in depth, so a stray value can
-  // never surface an alert on the wrong layer.
-  const isQualityZScoreAlertActive = stock.category === 'Quality' && stock.qualityZScoreAlert === true;
+  // P10: the closed Legacy list (see @/utils/legacy-hold).
+  const isLegacy = isLegacyTicker(stock.ticker);
+
+  // P9 CAP LOCK: this single stock is at or above 5% of invested + cash.
+  // Purchase lock only: Buy is disabled, nothing is sold.
+  const capWeightPct =
+    portfolioTotalValue !== null && !isPriceUnavailable && isCapApplicable(stock.assetType, stock.ticker)
+      ? positionWeightPct(positionUsdValue(stock, usdIlsRate), portfolioTotalValue)
+      : null;
+  const isCapLockActive = capWeightPct !== null && isAtOrAboveCap(capWeightPct);
+  const isBuyBlocked = isLegacy || isCapLockActive;
+
+  // LAYER 2: QUALITY — Buy Signal (SSOT): every entry rule of the active
+  // template (@/utils/quality-entry-rules) on the /api/quality reading plus
+  // the manual moat: exactly the Ambush Radar's Value Zone. Evaluated here,
+  // not at fetch time, so a moat edit or template change applies at once.
+  const { targets: rowTargets } = useTargetAllocations();
+  const { ratings: moatRatings } = useMoatRatings();
+  const qualityThresholds = qualityEntryThresholds(rowTargets);
+  const qualityReading =
+    qualityMetrics === null
+      ? null
+      : {
+          ...qualityMetrics,
+          moat: getMoatRating(stock.ticker, moatRatings),
+          // P9: the radar's Value Zone requires room under the cap.
+          withinPositionCap: capWeightPct === null ? null : !isCapLockActive,
+        };
+  const qualityEvaluation = qualityReading === null ? null : evaluateQualityReading(qualityReading, rowTargets);
+  // No buy signal for a Legacy holding (P10: no adds).
+  const isQualityZScoreAlertActive =
+    stock.category === 'Quality' && qualityEvaluation?.isBuySignal === true && !isLegacy;
 
   // LAYER 2: QUALITY — FUNDAMENTAL DEGRADATION (2026-11-22): the held
   // position's real ROIC (FMP TTM, via fetchPortfolioQuote) is below the
   // active template's floor (8% Tactical / 15% Hyper-Quality, from the live
   // target allocation). Independent of the price-based Kill Switch above:
   // a business can degrade while its price holds. Unknown ROIC never alerts.
-  const { targets: rowTargets } = useTargetAllocations();
   const roicFloorPct = qualityMinRoicPct(rowTargets);
+  // P10 LEGACY HOLD: legacy rules replace the template's DEGRADATION and
+  // entry signal for this closed list. No adds; LEGACY EXIT (a badge only)
+  // when ROIC < 8%, Moat = None, or the last audit said "thesis broken".
+  const legacyExit: LegacyExitReason[] = isLegacy
+    ? legacyExitReasons({
+        roic: stock.qualityRoic ?? null,
+        moat: getMoatRating(stock.ticker, moatRatings),
+        lastAuditOutcome: auditLatch.lastOutcome,
+      })
+    : [];
   const isFundamentalDegradationActive =
-    stock.category === 'Quality' && isFundamentalDegradation(stock.qualityRoic ?? null, rowTargets);
+    !isLegacy && stock.category === 'Quality' && isFundamentalDegradation(stock.qualityRoic ?? null, rowTargets);
+
 
   const handleStartEditing = () => {
     setEditedAssetType(stock.assetType);
@@ -3024,6 +3268,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     setPurchasePriceText('');
     setHistoricalHwmText('');
     setActiveHwmText('');
+    setAvgCostText('');
     setIsEntryEditorOpen(stock.purchasePrice === null || stock.historicalHWM === null);
     setIsEditing(true);
   };
@@ -3063,11 +3308,35 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
     return brokerQuoteToUsd(value, stock, usdIlsRate) ?? 'invalid';
   };
 
+  // Local-currency value of a broker-typed price: Agorot ÷100 exactly once
+  // for ".TA" (normalized Shekels), the instrument's currency otherwise.
+  // Blank -> null, invalid -> 'invalid'. Used for the canonical HWM (P2)
+  // and the manual average cost (P8).
+  const parseLocalEntryField = (text: string): number | null | 'invalid' => {
+    const trimmed = text.trim().replace(/,/g, '');
+    if (trimmed === '') {
+      return null;
+    }
+    const value = Number(trimmed);
+    if (!Number.isFinite(value) || value <= 0) {
+      return 'invalid';
+    }
+    return isTaseTicker(stock.ticker) ? value / AGOROT_PER_SHEKEL_INPUT : value;
+  };
+
   const handleSaveEdit = () => {
     const purchasePriceUsd = parseEntryField(purchasePriceText);
     const historicalHwmUsd = parseEntryField(historicalHwmText);
     const activeHwmUsd = parseEntryField(activeHwmText);
-    if (purchasePriceUsd === 'invalid' || historicalHwmUsd === 'invalid' || activeHwmUsd === 'invalid') {
+    const activeHwmLocal = parseLocalEntryField(activeHwmText);
+    const avgCostLocal = parseLocalEntryField(avgCostText);
+    if (
+      purchasePriceUsd === 'invalid' ||
+      historicalHwmUsd === 'invalid' ||
+      activeHwmUsd === 'invalid' ||
+      activeHwmLocal === 'invalid' ||
+      avgCostLocal === 'invalid'
+    ) {
       // Stays in edit mode so nothing typed is lost.
       Alert.alert(t('invalidEntryDataTitle'), t('invalidEntryDataMessage', { unit: entryUnit }));
       return;
@@ -3076,6 +3345,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       purchasePriceUsd,
       historicalHwmUsd,
       activeHwmUsd,
+      activeHwmLocal,
+      avgCostLocal,
     });
     setIsEditing(false);
   };
@@ -3107,12 +3378,16 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           {/* PORTFOLIO "BUY MORE": tops up this position through Execute
               Trade, without the Add Asset search. */}
           <TouchableOpacity
-            style={[styles.buyMoreButton, isBuyMorePending && styles.buyMoreButtonPending]}
+            style={[
+              styles.buyMoreButton,
+              isBuyMorePending && styles.buyMoreButtonPending,
+              isBuyBlocked && styles.buyMoreButtonBlocked,
+            ]}
             onPress={() => onBuyMore(stock)}
-            disabled={isBuyMorePending}
+            disabled={isBuyMorePending || isBuyBlocked}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             accessibilityRole="button"
-            accessibilityState={{ busy: isBuyMorePending, disabled: isBuyMorePending }}
+            accessibilityState={{ busy: isBuyMorePending, disabled: isBuyMorePending || isBuyBlocked }}
             accessibilityLabel={`${t('buy')} ${stock.ticker}`}>
             {isBuyMorePending ? (
               <ActivityIndicator size="small" color={colors.bullish} />
@@ -3198,6 +3473,25 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               <Text style={styles.editAssetTypeButtonText}>{assetTypeLabel(t, 'ETF')}</Text>
             </TouchableOpacity>
           </View>
+
+          {/* P8: MANUAL AVERAGE COST from IBI, every layer. P&L display
+              only: no rule, stop or signal reads it. Blank keeps it. */}
+          <TextInput
+            style={[styles.unitsEditInput, styles.totalValueEditInput]}
+            value={avgCostText}
+            onChangeText={setAvgCostText}
+            placeholder={t('avgCostInput', {
+              unit: entryUnit,
+              current:
+                stock.avgCostLocal === null
+                  ? '—'
+                  : formatUnitPrice(stock.ticker, stock.avgCostLocal, stock.currencySymbol, t('ag')),
+            })}
+            placeholderTextColor={colors.textSecondary}
+            keyboardType="decimal-pad"
+            maxLength={15}
+            onSubmitEditing={handleSaveEdit}
+          />
 
           {/* LEGACY ENTRY DATA: lets a position opened before trade logging
               get the purchasePrice/historicalHWM the Protection State
@@ -3365,8 +3659,13 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
               USD regardless of the instrument's own trading currency). */}
           {stock.highestWatermark !== null && (
             <View style={styles.hwmDisplayRow}>
+              {/* P2: the stored peak is local (Shekels for ".TA"); USD is
+                  its view at today's rate. */}
               <Text style={styles.macroContextText}>
-                {t('highWaterMark')}: ${stock.highestWatermark.toFixed(2)}
+                {t('highWaterMark')}:{' '}
+                {stock.highestWatermarkLocal !== null && stock.currencySymbol !== '$'
+                  ? `${formatUnitPrice(stock.ticker, stock.highestWatermarkLocal, stock.currencySymbol, agorotSuffix)} ($${stock.highestWatermark.toFixed(2)})`
+                  : `$${stock.highestWatermark.toFixed(2)}`}
               </Text>
               <TouchableOpacity
                 onPress={handleStartEditingHwm}
@@ -3399,7 +3698,8 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
           {protection !== null && trailingStopPrice !== null && (
             // Trailing Stop is a computed USD threshold (highestWatermark
-            // is tracked in USD — see computeHighestWatermark above), not
+            // is derived in USD at today's rate from the stored local peak,
+            // see @/utils/watermark), not
             // a raw quoted price, so it stays displayed in USD ('$')
             // regardless of the instrument's own trading currency —
             // converting a derived threshold back to local currency isn't
@@ -3463,22 +3763,18 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       )}
 
       {/* LAYER 2: QUALITY — Indicator Purge: no Trailing Stop, no SMA50,
-          no SMA200 at all. Kill Switch Tracker: 52-Week Drawdown + a
-          RED "[FUNDAMENTAL AUDIT REQUIRED]" block when triggered, else a
-          neutral/green "[HOLD]". */}
-      {!isEditing && !isPriceUnavailable && stock.category === 'Quality' && stock.drawdownPct !== null && (
-        <View
-          style={[
-            styles.killSwitchBlock,
-            isFundamentalAuditRequired && styles.killSwitchBlockAlert,
-          ]}>
-          <Text
-            style={[
-              styles.killSwitchDrawdownText,
-              isFundamentalAuditRequired && styles.killSwitchDrawdownTextAlert,
-            ]}>
-            {t('drop')}: {stock.drawdownPct.toFixed(2)}%
-          </Text>
+          no SMA200 at all. Kill Switch Tracker (P5): the DAILY-CLOSE
+          drawdown from the 52-week close high, and a RED latched
+          "[FUNDAMENTAL AUDIT REQUIRED]" block with a "Mark Audited" button
+          while triggered, else "[HOLD]". Never a sell action. */}
+      {!isEditing && stock.category === 'Quality' && (closeDrawdownPct !== null || isFundamentalAuditRequired) && (
+        <View style={[styles.killSwitchBlock, isFundamentalAuditRequired && styles.killSwitchBlockAlert]}>
+          {closeDrawdownPct !== null && (
+            <Text
+              style={[styles.killSwitchDrawdownText, isFundamentalAuditRequired && styles.killSwitchDrawdownTextAlert]}>
+              {t('dailyCloseDrop', { pct: closeDrawdownPct.toFixed(2), date: auditCloseDate ?? '—' })}
+            </Text>
+          )}
           <Text
             style={[
               styles.killSwitchTag,
@@ -3486,11 +3782,81 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             ]}>
             {isFundamentalAuditRequired ? `[${t('fundamentalAuditRequired')}]` : `[${t('hold')}]`}
           </Text>
+          {isFundamentalAuditRequired && (
+            <>
+              <Text style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
+                {t('auditTriggeredOn', {
+                  date: auditLatch.triggerCloseDate ?? '—',
+                  pct: auditLatch.triggerDrawdownPct === null ? '—' : auditLatch.triggerDrawdownPct.toFixed(2),
+                })}
+              </Text>
+              <TouchableOpacity
+                style={styles.markAuditedButton}
+                onPress={() =>
+                  // P10: the audit records its conclusion. "Thesis broken"
+                  // is a LEGACY EXIT trigger for a Legacy holding.
+                  Alert.alert(t('markAuditedTitle'), t('markAuditedMessage', { ticker: stock.ticker }), [
+                    { text: t('cancel'), style: 'cancel' },
+                    { text: t('auditThesisIntact'), onPress: () => markTickerAudited(stock.ticker, 'intact') },
+                    {
+                      text: t('auditThesisBroken'),
+                      style: 'destructive',
+                      onPress: () => markTickerAudited(stock.ticker, 'broken'),
+                    },
+                  ])
+                }
+                accessibilityRole="button"
+                accessibilityLabel={`${t('markAudited')} ${stock.ticker}`}>
+                <Text style={styles.markAuditedButtonText}>{t('markAudited')}</Text>
+              </TouchableOpacity>
+            </>
+          )}
         </View>
       )}
 
-      {/* LAYER 2: QUALITY — FUNDAMENTAL DEGRADATION: same loud red block as
-          the Kill Switch alert, shown only when the ROIC fails the floor. */}
+      {/* P10: the last audit's conclusion, once there is one. */}
+      {!isEditing && stock.category === 'Quality' && !isFundamentalAuditRequired && auditLatch.lastOutcome !== null && (
+        <Text style={styles.allocationText}>
+          {auditLatch.lastOutcome === 'broken' ? t('lastAuditBroken') : t('lastAuditIntact')}
+        </Text>
+      )}
+
+      {/* P10 LEGACY HOLD: replaces DEGRADATION and the entry signal for the
+          closed Legacy list. HOLD while ROIC >= 8% and Moat != None; a red
+          LEGACY EXIT block (never an automatic sell) on any exit trigger. */}
+      {!isEditing && isLegacy && (
+        <View style={[styles.killSwitchBlock, legacyExit.length > 0 && styles.killSwitchBlockAlert]}>
+          <Text style={[styles.killSwitchTag, legacyExit.length > 0 ? styles.killSwitchTagAlert : styles.killSwitchTagHold]}>
+            {legacyExit.length > 0 ? `[${t('legacyExitBadge')}]` : `[${t('legacyHoldBadge')}]`}
+          </Text>
+          {legacyExit.map((reason) => (
+            <Text key={reason} style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
+              {reason === 'roicBelowFloor'
+                ? t('legacyExitRoic', {
+                    roic: stock.qualityRoic === null ? '—' : stock.qualityRoic.toFixed(1),
+                    floor: LEGACY_MIN_ROIC_PCT,
+                  })
+                : reason === 'moatNone'
+                  ? t('legacyExitMoat')
+                  : t('legacyExitThesis')}
+            </Text>
+          ))}
+          <Text style={styles.killSwitchDrawdownText}>{t('legacyNoAddsHint')}</Text>
+        </View>
+      )}
+
+      {/* P9 CAP LOCK: purchase lock only, never a sell. */}
+      {!isEditing && isCapLockActive && capWeightPct !== null && (
+        <View style={[styles.killSwitchBlock, styles.killSwitchBlockAlert]}>
+          <Text style={[styles.killSwitchTag, styles.killSwitchTagAlert]}>{`[${t('capLockBadge')}]`}</Text>
+          <Text style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
+            {t('capLockRowText', { weight: capWeightPct.toFixed(1), cap: SINGLE_STOCK_CAP_PCT })}
+          </Text>
+        </View>
+      )}
+
+      {/* LAYER 2: QUALITY — FUNDAMENTAL DEGRADATION (P6, option C): same
+          loud red block, shown only when the ROIC fails the floor. */}
       {!isEditing && !isPriceUnavailable && isFundamentalDegradationActive && stock.qualityRoic !== null && (
         <View style={[styles.killSwitchBlock, styles.killSwitchBlockAlert]}>
           <Text style={[styles.killSwitchTag, styles.killSwitchTagAlert]}>
@@ -3499,26 +3865,29 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           <Text style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
             {t('roicBelowFloor', { roic: stock.qualityRoic.toFixed(1), floor: roicFloorPct })}
           </Text>
+          <Text style={[styles.killSwitchTag, styles.killSwitchTagAlert]}>{t('degradationAction')}</Text>
         </View>
       )}
 
-      {/* LAYER 2: QUALITY — Z-Score Module: a separate, independent signal
-          from the Kill Switch block above (drawdown vs. 52-week high) — the
-          2-year statistical Z-Score from /api/quality, not a fundamental
-          drawdown review. The score itself renders whenever the backend
-          could compute one; the ALERT tag only when
-          isQualityZScoreAlertActive (the full Buy Signal, so a value trap
-          shows its score but no alert — see its own comment above).
-          Independent of stock.drawdownPct's nullity so it still shows even
-          in the rare case the Kill Switch block above doesn't (e.g. a
-          missing 52-week high). */}
-      {!isEditing && !isPriceUnavailable && stock.category === 'Quality' && stock.qualityZScore !== null && (
+      {/* LAYER 2: QUALITY — Z-Score and the Value Zone entry rules: the
+          same evaluation as the Ambush Radar, with each rule's ✓/✗. The
+          ALERT tag only when every rule passes. The manual moat is
+          editable here too (P1). */}
+      {!isEditing && stock.category === 'Quality' && (
         <View style={styles.zScoreBlock}>
-          <Text style={styles.zScoreText}>
-            {t('qualityZScore')}: {stock.qualityZScore.toFixed(2)}
-          </Text>
-          {isQualityZScoreAlertActive && (
-            <Text style={styles.zScoreAlertTag}>{`[${t('zScoreAlert')}]`}</Text>
+          {!isPriceUnavailable && stock.qualityZScore !== null && (
+            <Text style={styles.zScoreText}>
+              {t('qualityZScore')}: {stock.qualityZScore.toFixed(2)}
+            </Text>
+          )}
+          {isQualityZScoreAlertActive && <Text style={styles.zScoreAlertTag}>{`[${t('zScoreAlert')}]`}</Text>}
+        </View>
+      )}
+      {!isEditing && stock.category === 'Quality' && (
+        <View style={styles.qualityRulesBlock}>
+          <MoatSelector ticker={stock.ticker} />
+          {!isPriceUnavailable && qualityReading !== null && qualityEvaluation !== null && (
+            <QualityRuleList reading={qualityReading} evaluation={qualityEvaluation} thresholds={qualityThresholds} />
           )}
         </View>
       )}
@@ -3553,6 +3922,17 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       {!isEditing && stock.costBasisUsd !== null && (
         <Text style={styles.allocationText}>
           {t('costBasis')}: {formatUsd(stock.costBasisUsd)}
+        </Text>
+      )}
+      {/* P8: P&L against the manual IBI average cost, in the instrument's
+          own currency. Display only. */}
+      {!isEditing && !isPriceUnavailable && manualPnl !== null && stock.avgCostLocal !== null && (
+        <Text style={[styles.allocationText, { color: manualPnl.amount >= 0 ? colors.bullish : colors.bearish }]}>
+          {t('avgCostPnl', {
+            cost: formatUnitPrice(stock.ticker, stock.avgCostLocal, stock.currencySymbol, agorotSuffix),
+            pnl: `${manualPnl.amount >= 0 ? '+' : '−'}${formatTotalValue(Math.abs(manualPnl.amount), stock.currencySymbol)}`,
+            pct: `${manualPnl.pct >= 0 ? '+' : ''}${manualPnl.pct.toFixed(1)}%`,
+          })}
         </Text>
       )}
     </View>
@@ -4038,6 +4418,10 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
     alignItems: 'center',
     justifyContent: 'center',
   },
+  // P9/P10: Buy disabled by CAP LOCK or Legacy Hold.
+  buyMoreButtonBlocked: {
+    opacity: 0.35,
+  },
   buyMoreButtonPending: {
     opacity: 0.7,
   },
@@ -4293,6 +4677,24 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   // both of Quality's alert signals read consistently.
   zScoreBlock: {
     marginTop: 8,
+  },
+  qualityRulesBlock: {
+    marginTop: 6,
+    gap: 4,
+  },
+  markAuditedButton: {
+    alignSelf: isHebrew ? 'flex-end' : 'flex-start',
+    marginTop: 6,
+    backgroundColor: colors.bearish,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  markAuditedButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+    writingDirection: isHebrew ? 'rtl' : 'ltr',
   },
   zScoreText: {
     color: colors.textSecondary,

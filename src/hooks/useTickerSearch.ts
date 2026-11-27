@@ -4,29 +4,32 @@ import { searchTickers, type TickerSearchResult } from '@/services/api';
 
 const SEARCH_DEBOUNCE_MS = 300;
 
+type ResolvedSearch = {
+  query: string;
+  results: TickerSearchResult[];
+};
+
 // Debounced ticker search, shared by the Ambush Radar and Portfolio
 // autocomplete inputs. Waits for typing to pause before calling the API,
 // and ignores results from a stale (superseded) request.
+//
+// State is only set from the request callback (react-hooks/set-state-in-
+// effect): an empty query and "still searching" are derived during render
+// from the last resolved query instead of being set inside the effect.
 export function useTickerSearch(query: string) {
-  const [results, setResults] = useState<TickerSearchResult[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
+  const trimmedQuery = query.trim();
+  const [resolved, setResolved] = useState<ResolvedSearch>({ query: '', results: [] });
 
   useEffect(() => {
-    const trimmedQuery = query.trim();
     if (!trimmedQuery) {
-      setResults([]);
-      setIsSearching(false);
       return;
     }
 
     let isCancelled = false;
-    setIsSearching(true);
-
     const timeoutId = setTimeout(() => {
       searchTickers(trimmedQuery).then((searchResults) => {
         if (!isCancelled) {
-          setResults(searchResults);
-          setIsSearching(false);
+          setResolved({ query: trimmedQuery, results: searchResults });
         }
       });
     }, SEARCH_DEBOUNCE_MS);
@@ -35,7 +38,9 @@ export function useTickerSearch(query: string) {
       isCancelled = true;
       clearTimeout(timeoutId);
     };
-  }, [query]);
+  }, [trimmedQuery]);
 
+  const results = trimmedQuery ? resolved.results : [];
+  const isSearching = trimmedQuery !== '' && resolved.query !== trimmedQuery;
   return { results, isSearching };
 }

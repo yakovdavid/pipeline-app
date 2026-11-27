@@ -1,44 +1,42 @@
-"""Quality pipeline: Z-Score, ROIC and Moat for Quality assets.
+"""Quality pipeline: the automatic inputs of the Quality entry rules.
 
-Sources (2026-11-22 ROIC fix):
-  - Z-Score and the Moat inputs: Yahoo Finance via `yfinance`.
-  - ROIC: Financial Modeling Prep (FMP), key-metrics-ttm ->
-    returnOnInvestedCapitalTTM (NOPAT-based, trailing twelve months).
-    Requires the FMP_API_KEY environment variable (Starter plan or higher
-    for all US symbols). Yahoo's ROE is NOT used as a ROIC fallback: a
-    missing ROIC (null) is safer than a wrong one, because the app gates
-    Quality signals on it.
+Sources:
+  - Z-Score: Yahoo Finance daily closes via `yfinance`.
+  - ROIC, P/E and CapEx ratios: Financial Modeling Prep (FMP). Requires the
+    FMP_API_KEY environment variable. A missing figure is returned as null,
+    never guessed: a null input fails its entry rule in the app.
+
+MOAT IS NOT COMPUTED HERE (2026-11-27). FMP has no moat data, and the old
+ROE/operating-margin proxy produced unapproved ratings (LIN/AMT/ECL/DE/CNI
+= Wide, FICO = None). Moat is now a manual, per-ticker field kept by the
+app (src/utils/moat-store.ts). This endpoint no longer returns `moat`.
 
 GET /api/quality/{ticker} returns, for one ticker:
-  - Statistics, from the last 2 years of daily closes:
-      z_score = (current_price - mean_price) / std_dev
-    current_price is the most recent close in the series. Refreshed after 24h.
-  - Fundamentals, self-calculated from up to 4 fiscal years of raw annual
-    statements (Ticker.financials and Ticker.balance_sheet):
-      per year: ROE              = Net Income / Stockholders' Equity
-                operating margin = Operating Income / Total Revenue
-      A year is viable only when both ratios can be computed (no missing
-      figure, equity > 0, revenue > 0); other years are skipped, never
-      counted as zero.
-      roic: FMP returnOnInvestedCapitalTTM as a percent (8.9 = 8.9%).
-            null when FMP has no figure (ETF, non-US listing, missing key).
-            (Before 2026-11-22 this was the average Yahoo ROE - a proxy that
-            inflated asset-heavy companies, e.g. CNI: ROE 22% vs ROIC 9%.)
-      moat: Wide   if average ROE >= 15% AND average operating margin >= 15%
-            Narrow if both averages >= 10% (and not Wide)
-            None   otherwise, or with fewer than 2 viable years
-    Refreshed after 30 days.
+  - Statistics (refreshed after 24h):
+      z_score = (current_price - mean_price) / std_dev over the last
+                Z_SCORE_WINDOW_TRADING_DAYS (504) daily closes.
+      pe_ttm  = FMP ratios-ttm priceToEarningsRatioTTM. Price-dependent,
+                so it refreshes with the statistics, not monthly.
+  - Fundamentals (refreshed after 30 days):
+      roic               = FMP key-metrics-ttm returnOnInvestedCapitalTTM, percent.
+      pe_5y_avg          = mean annual priceToEarningsRatio over the last 5
+                           fiscal years (FMP ratios, annual). Years with a
+                           non-positive P/E (a loss year) are skipped.
+      capex_to_revenue_3y = mean of yearly capexPerShare / revenuePerShare
+                            over the last 3 fiscal years, percent.
+      capex_to_ocf_3y     = mean of yearly capexPerShare /
+                            operatingCashFlowPerShare over the same years, percent.
+    Verified against ZTS (FY2023-2025): CapEx/Revenue 7.4%, CapEx/OCF 24.9%.
 
 Each half is cached with its own timestamp (see backend/sql/
-004_quality_metrics_cache.sql), so a daily price refresh never refetches
-financial statements.
+004_quality_metrics_cache.sql and 005_quality_entry_rules.sql).
 
 Caching: Supabase when it is configured (main.py passes its client in),
 otherwise an in-memory cache with the same lifetimes.
 
-Failure policy: if a refresh fails (rate limit, network, Yahoo down) and an
-expired cached value exists, that value is served and flagged *_stale in the
-response, rather than failing the request.
+Failure policy: if a refresh fails (rate limit, network, Yahoo/FMP down) and
+an expired cached value exists, that value is served and flagged *_stale in
+the response, rather than failing the request.
 """
 
 import math
@@ -49,9 +47,8 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
-import pandas as pd
 import requests
 import yfinance as yf
 from fastapi import APIRouter, HTTPException
@@ -62,7 +59,10 @@ from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
 STATS_TTL = timedelta(hours=24)
 FUNDAMENTALS_TTL = timedelta(days=30)
 
-PRICE_HISTORY_DAYS = 730  # "the last 2 years of daily closing prices"
+# Z-Score window: the last 504 trading days (about 2 years). Enough
+# calendar days are fetched to always cover 504 sessions, holidays included.
+Z_SCORE_WINDOW_TRADING_DAYS = 504
+PRICE_HISTORY_DAYS = 760
 
 # Yahoo Finance requests. A transient failure is retried once; a rate limit
 # is not retried, since retrying straight away only prolongs the block.
@@ -70,39 +70,28 @@ YF_MAX_ATTEMPTS = 2
 YF_RETRY_BACKOFF_SECONDS = 1.5
 YF_TIMEOUT_SECONDS = 15
 
-# Fundamentals window and moat thresholds. Thresholds are ratios
-# (0.15 = 15%), applied to the multi-year average ROE and average operating
-# margin together.
-FUNDAMENTALS_MAX_YEARS = 4
-MOAT_MIN_VIABLE_YEARS = 2
-WIDE_MOAT_MIN_RATIO = 0.15
-NARROW_MOAT_MIN_RATIO = 0.10
-
-# Statement row labels, tried in order for each fiscal year. The first name
-# in each tuple is the one the PRD specifies; the others are the labels
-# yfinance actually uses for the same line where they differ (for example,
-# it has no plain "Total Equity" or "Total Liabilities" row).
-NET_INCOME_LABELS = ("Net Income", "Net Income Common Stockholders")
-OPERATING_INCOME_LABELS = ("Operating Income", "Total Operating Income As Reported")
-TOTAL_REVENUE_LABELS = ("Total Revenue", "Operating Revenue")
-EQUITY_LABELS = ("Stockholders Equity", "Total Equity", "Total Equity Gross Minority Interest")
-TOTAL_ASSETS_LABELS = ("Total Assets",)
-TOTAL_LIABILITIES_LABELS = ("Total Liabilities", "Total Liabilities Net Minority Interest")
+# Fundamentals windows (fiscal years).
+PE_AVERAGE_YEARS = 5
+CAPEX_AVERAGE_YEARS = 3
 
 QUALITY_METRICS_TABLE = "quality_metrics"
 
 # FMP (Financial Modeling Prep) - the ROIC source. Stable API.
 FMP_KEY_METRICS_TTM_URL = "https://financialmodelingprep.com/stable/key-metrics-ttm"
+FMP_RATIOS_TTM_URL = "https://financialmodelingprep.com/stable/ratios-ttm"
+FMP_RATIOS_ANNUAL_URL = "https://financialmodelingprep.com/stable/ratios"
 FMP_TIMEOUT_SECONDS = 15
 FMP_ROIC_FIELD = "returnOnInvestedCapitalTTM"
+FMP_PE_TTM_FIELD = "priceToEarningsRatioTTM"
+FMP_PE_FIELD = "priceToEarningsRatio"
+FMP_CAPEX_PER_SHARE_FIELD = "capexPerShare"
+FMP_REVENUE_PER_SHARE_FIELD = "revenuePerShare"
+FMP_OCF_PER_SHARE_FIELD = "operatingCashFlowPerShare"
 
 # Accepted ticker shape: US-style symbols plus dot or dash classes and
 # exchange suffixes (BRK-B, RY.TO). Validated before the symbol is sent to
 # Yahoo Finance.
 TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
-
-Moat = Literal["Wide", "Narrow", "None"]
-
 
 # --- Errors ---------------------------------------------------------------
 
@@ -120,7 +109,7 @@ class PriceHistoryError(QualityDataError):
 
 
 class FundamentalsError(QualityDataError):
-    """Fetching the annual financial statements failed."""
+    """An FMP fundamentals request failed."""
 
 
 class QualityTickerNotFoundError(Exception):
@@ -152,7 +141,21 @@ def _with_retries(action: Callable[[], Any], error_type: type[QualityDataError],
     raise error_type(f"Yahoo Finance {description} failed.")
 
 
+# FUNDAMENTAL AUDIT (2026-11-27): evaluated on the last COMPLETED daily
+# close, never a live price. yfinance includes today's in-progress bar
+# while the exchange is open, so a bar dated today (exchange time) is
+# dropped until this local hour, which is after both the NYSE (16:00) and
+# TASE (17:25) closes.
+SESSION_COMPLETE_LOCAL_HOUR = 18
+AUDIT_HIGH_WINDOW_TRADING_DAYS = 252  # 52 weeks of sessions
+
+
 def fetch_daily_closes(symbol: str, today: date) -> list[float]:
+    """Daily closes, oldest first (see fetch_dated_daily_closes)."""
+    return [close for _, close in fetch_dated_daily_closes(symbol, today)]
+
+
+def fetch_dated_daily_closes(symbol: str, today: date) -> list[tuple[date, float]]:
     """Daily closes for the last PRICE_HISTORY_DAYS, oldest first.
 
     Uses the "Close" column with auto_adjust=False: Yahoo adjusts it for
@@ -196,44 +199,41 @@ def fetch_daily_closes(symbol: str, today: date) -> list[float]:
             continue
         # NaN rows (e.g. a trading halt) fail isfinite and are skipped.
         if row_date >= start and math.isfinite(close) and close > 0:
+            if _is_in_progress_session(timestamp):
+                continue
             dated_closes.append((row_date, close))
     dated_closes.sort(key=lambda pair: pair[0])
-    return [close for _, close in dated_closes]
+    return dated_closes
+
+
+def _is_in_progress_session(timestamp: Any) -> bool:
+    """True for a bar dated today (in its exchange's own time zone) before
+    SESSION_COMPLETE_LOCAL_HOUR: its "close" is still a live price."""
+    tz = getattr(timestamp, "tzinfo", None)
+    if tz is None:
+        return False
+    now_local = datetime.now(tz)
+    return timestamp.date() == now_local.date() and now_local.hour < SESSION_COMPLETE_LOCAL_HOUR
 
 
 @dataclass(frozen=True)
-class FinancialStatements:
-    """Annual statements as yfinance returns them: rows are line items,
-    columns are fiscal year-end dates. Either may be empty, e.g. for an
-    ETF, which files no statements."""
-
-    income_statement: pd.DataFrame
-    balance_sheet: pd.DataFrame
-
-    @property
-    def is_empty(self) -> bool:
-        return self.income_statement.empty and self.balance_sheet.empty
+class DailyCloseDrawdown:
+    close: float
+    close_date: date
+    high_52w_close: float
+    drawdown_pct: float  # negative below the high
 
 
-def _as_frame(value: Any) -> pd.DataFrame:
-    return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
-
-
-def fetch_financial_statements(symbol: str) -> FinancialStatements:
-    """Ticker.financials (income statement) and Ticker.balance_sheet, both
-    annual. Anything that isn't a DataFrame is treated as empty."""
-
-    def load() -> FinancialStatements:
-        ticker = yf.Ticker(symbol)
-        return FinancialStatements(_as_frame(ticker.financials), _as_frame(ticker.balance_sheet))
-
-    try:
-        return _with_retries(load, FundamentalsError, f"financial statements request for '{symbol}'")
-    except YFTickerMissingError:
-        return FinancialStatements(pd.DataFrame(), pd.DataFrame())
-
-
-# --- Statement parsing ----------------------------------------------------
+def compute_close_drawdown(dated_closes: list[tuple[date, float]]) -> DailyCloseDrawdown | None:
+    """The last completed close against the highest close of the last
+    AUDIT_HIGH_WINDOW_TRADING_DAYS sessions (the last close included).
+    `dated_closes` must be oldest first."""
+    if not dated_closes:
+        return None
+    window = dated_closes[-AUDIT_HIGH_WINDOW_TRADING_DAYS:]
+    close_date, close = window[-1]
+    high = max(value for _, value in window)
+    return DailyCloseDrawdown(close, close_date, high, (close - high) / high * 100)
 
 
 def _finite_float(value: Any) -> float | None:
@@ -247,102 +247,6 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _cell(frame: pd.DataFrame, label: str, column: Any) -> float | None:
-    """One figure, safely: None when the label is absent or the value is
-    unusable. A label that appears more than once yields a Series, of which
-    the first usable value is taken."""
-    try:
-        if label not in frame.index:
-            return None
-        value = frame.loc[label, column]
-    except (KeyError, TypeError, ValueError, IndexError):
-        return None
-    if isinstance(value, (pd.Series, pd.DataFrame)):
-        for item in pd.Series(value.to_numpy().ravel()):
-            number = _finite_float(item)
-            if number is not None:
-                return number
-        return None
-    return _finite_float(value)
-
-
-def _first_figure(frame: pd.DataFrame, labels: tuple[str, ...], column: Any) -> float | None:
-    for label in labels:
-        number = _cell(frame, label, column)
-        if number is not None:
-            return number
-    return None
-
-
-def _columns_by_fiscal_year(frame: pd.DataFrame) -> dict[int, Any]:
-    """Maps each fiscal year to its column, keeping the latest column when
-    a year appears twice (e.g. after a fiscal-year-end change). Keyed by
-    year rather than exact date, so the income statement and balance sheet
-    still line up if their dates differ by a few days."""
-    dated: list[tuple[pd.Timestamp, Any]] = []
-    for column in frame.columns:
-        try:
-            dated.append((pd.Timestamp(column), column))
-        except (TypeError, ValueError):
-            continue
-    columns: dict[int, Any] = {}
-    for timestamp, column in sorted(dated, key=lambda pair: pair[0], reverse=True):
-        columns.setdefault(timestamp.year, column)
-    return columns
-
-
-def _equity(balance_sheet: pd.DataFrame, column: Any) -> float | None:
-    """Stockholders' equity, falling back to Total Assets - Total
-    Liabilities when no equity row has a value."""
-    equity = _first_figure(balance_sheet, EQUITY_LABELS, column)
-    if equity is not None:
-        return equity
-    assets = _first_figure(balance_sheet, TOTAL_ASSETS_LABELS, column)
-    liabilities = _first_figure(balance_sheet, TOTAL_LIABILITIES_LABELS, column)
-    if assets is None or liabilities is None:
-        return None
-    return assets - liabilities
-
-
-@dataclass(frozen=True)
-class FiscalYearRatios:
-    fiscal_year: int
-    roe: float  # ratio, 0.28 = 28%
-    operating_margin: float  # ratio
-
-
-def compute_yearly_ratios(statements: FinancialStatements) -> list[FiscalYearRatios]:
-    """ROE and operating margin for each viable year among the most recent
-    FUNDAMENTALS_MAX_YEARS fiscal years, newest first.
-
-    A year is skipped (never counted as zero) when a figure is missing, or
-    equity or revenue is zero or negative. ROE on negative equity is
-    meaningless (losses would show as positive returns), as is a margin on
-    no revenue."""
-    income_columns = _columns_by_fiscal_year(statements.income_statement)
-    balance_columns = _columns_by_fiscal_year(statements.balance_sheet)
-
-    ratios: list[FiscalYearRatios] = []
-    for year in sorted(income_columns, reverse=True)[:FUNDAMENTALS_MAX_YEARS]:
-        if year not in balance_columns:
-            continue
-        try:
-            income_column = income_columns[year]
-            net_income = _first_figure(statements.income_statement, NET_INCOME_LABELS, income_column)
-            operating_income = _first_figure(statements.income_statement, OPERATING_INCOME_LABELS, income_column)
-            revenue = _first_figure(statements.income_statement, TOTAL_REVENUE_LABELS, income_column)
-            equity = _equity(statements.balance_sheet, balance_columns[year])
-        except Exception as error:  # noqa: BLE001 - one malformed year must not sink the others
-            print(f"[quality] Skipping fiscal year {year}: unreadable statements ({type(error).__name__}).")
-            continue
-        if net_income is None or operating_income is None or revenue is None or equity is None:
-            continue
-        if equity <= 0 or revenue <= 0:
-            continue
-        ratios.append(FiscalYearRatios(year, net_income / equity, operating_income / revenue))
-    return ratios
-
-
 # --- Calculations ---------------------------------------------------------
 
 
@@ -354,50 +258,130 @@ class PriceStatistics:
     z_score: float | None
 
 
-def fetch_fmp_roic_ttm(symbol: str) -> float | None:
-    """ROIC (TTM, NOPAT-based) from FMP as a percent, or None when FMP has
-    no figure for the symbol (ETF, non-US listing) or no API key is set.
+def _fmp_get(url: str, symbol: str, description: str, extra_params: dict[str, Any] | None = None) -> list[dict[str, Any]] | None:
+    """One FMP stable-API call. Returns the list of row dicts, or None when
+    FMP has nothing for the symbol or no API key is set.
 
     Raises QualityRateLimitError on HTTP 429 and FundamentalsError on any
     other transport/HTTP failure, so the caller serves the cached value
-    (flagged stale) instead of caching a wrong "no ROIC" for 30 days.
-    Plan restrictions (401/402/403) are reported as None + a log line: the
-    symbol is simply outside the plan's coverage."""
+    (flagged stale) instead of caching a wrong "no data". Plan restrictions
+    (401/402/403) are reported as None + a log line."""
     api_key = os.environ.get("FMP_API_KEY", "").strip()
     if not api_key:
-        print("[quality] FMP_API_KEY is not set; ROIC unavailable.")
+        print(f"[quality] FMP_API_KEY is not set; {description} unavailable.")
         return None
     try:
         response = requests.get(
-            FMP_KEY_METRICS_TTM_URL,
-            params={"symbol": symbol, "apikey": api_key},
+            url,
+            params={"symbol": symbol, "apikey": api_key, **(extra_params or {})},
             timeout=FMP_TIMEOUT_SECONDS,
         )
     except requests.RequestException as error:
-        raise FundamentalsError(f"FMP request failed for '{symbol}': {type(error).__name__}") from None
+        raise FundamentalsError(f"FMP {description} request failed for '{symbol}': {type(error).__name__}") from None
     if response.status_code == 429:
-        raise QualityRateLimitError(f"FMP rate-limited the ROIC request for '{symbol}'.")
+        raise QualityRateLimitError(f"FMP rate-limited the {description} request for '{symbol}'.")
     if response.status_code in (401, 402, 403):
-        print(f"[quality] FMP denied ROIC for '{symbol}' (HTTP {response.status_code}); outside plan coverage.")
+        print(f"[quality] FMP denied {description} for '{symbol}' (HTTP {response.status_code}); outside plan coverage.")
         return None
     if response.status_code != 200:
-        raise FundamentalsError(f"FMP returned HTTP {response.status_code} for '{symbol}'.")
+        raise FundamentalsError(f"FMP returned HTTP {response.status_code} for the {description} of '{symbol}'.")
     try:
         payload = response.json()
     except ValueError:
-        raise FundamentalsError(f"FMP returned a non-JSON body for '{symbol}'.") from None
-    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-        return None  # FMP has no key metrics for this symbol (e.g. an ETF).
-    value = _finite_float(payload[0].get(FMP_ROIC_FIELD))
+        raise FundamentalsError(f"FMP returned a non-JSON {description} body for '{symbol}'.") from None
+    if not isinstance(payload, list):
+        return None
+    rows = [row for row in payload if isinstance(row, dict)]
+    return rows or None
+
+
+def fetch_fmp_roic_ttm(symbol: str) -> float | None:
+    """ROIC (TTM, NOPAT-based) as a percent, or None (ETF, non-US listing,
+    no API key)."""
+    rows = _fmp_get(FMP_KEY_METRICS_TTM_URL, symbol, "ROIC")
+    if rows is None:
+        return None
+    value = _finite_float(rows[0].get(FMP_ROIC_FIELD))
     return value * 100 if value is not None else None
 
 
+def fetch_fmp_pe_ttm(symbol: str) -> float | None:
+    """P/E TTM, or None. A non-positive P/E (trailing losses) is returned as
+    is; the app's rule P/E TTM < 5y avg P/E rejects it explicitly."""
+    rows = _fmp_get(FMP_RATIOS_TTM_URL, symbol, "P/E TTM")
+    if rows is None:
+        return None
+    return _finite_float(rows[0].get(FMP_PE_TTM_FIELD))
+
+
+def fetch_fmp_annual_ratios(symbol: str) -> list[dict[str, Any]]:
+    """Annual FMP ratios, newest first, at most PE_AVERAGE_YEARS rows."""
+    rows = _fmp_get(
+        FMP_RATIOS_ANNUAL_URL,
+        symbol,
+        "annual ratios",
+        {"period": "annual", "limit": PE_AVERAGE_YEARS},
+    )
+    if rows is None:
+        return []
+    return sorted(rows, key=lambda row: str(row.get("date", "")), reverse=True)[:PE_AVERAGE_YEARS]
+
+
+@dataclass(frozen=True)
+class EntryRuleFundamentals:
+    pe_5y_avg: float | None
+    capex_to_revenue_3y: float | None  # percent
+    capex_to_ocf_3y: float | None  # percent
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    return statistics.fmean(values) if values else None
+
+
+def compute_entry_rule_fundamentals(annual_rows: list[dict[str, Any]]) -> EntryRuleFundamentals:
+    """The 5y average P/E and the 3y Capital Light ratios from FMP annual
+    ratio rows (newest first).
+
+    5y average P/E: loss years (P/E <= 0) are skipped, not averaged in.
+    CapEx ratios: the mean of each year's ratio. FMP reports capexPerShare
+    as a positive number on the ratios endpoint; abs() guards against a
+    sign change. A year with a non-positive revenue or OCF is skipped.
+    Both CapEx averages require all CAPEX_AVERAGE_YEARS years: a partial
+    window is reported as None (unknown), which fails the rule in the app."""
+    pe_values = [
+        pe for pe in (_finite_float(row.get(FMP_PE_FIELD)) for row in annual_rows[:PE_AVERAGE_YEARS]) if pe is not None and pe > 0
+    ]
+
+    capex_rows = annual_rows[:CAPEX_AVERAGE_YEARS]
+    revenue_ratios: list[float] = []
+    ocf_ratios: list[float] = []
+    for row in capex_rows:
+        capex = _finite_float(row.get(FMP_CAPEX_PER_SHARE_FIELD))
+        revenue = _finite_float(row.get(FMP_REVENUE_PER_SHARE_FIELD))
+        ocf = _finite_float(row.get(FMP_OCF_PER_SHARE_FIELD))
+        if capex is None:
+            continue
+        if revenue is not None and revenue > 0:
+            revenue_ratios.append(abs(capex) / revenue * 100)
+        if ocf is not None and ocf > 0:
+            ocf_ratios.append(abs(capex) / ocf * 100)
+
+    return EntryRuleFundamentals(
+        pe_5y_avg=_mean_or_none(pe_values),
+        capex_to_revenue_3y=_mean_or_none(revenue_ratios) if len(revenue_ratios) == CAPEX_AVERAGE_YEARS else None,
+        capex_to_ocf_3y=_mean_or_none(ocf_ratios) if len(ocf_ratios) == CAPEX_AVERAGE_YEARS else None,
+    )
+
+
 def compute_price_statistics(closes: list[float]) -> PriceStatistics:
-    """Z-Score of the latest close against the whole window, using the
+    """Z-Score of the latest close against the last
+    Z_SCORE_WINDOW_TRADING_DAYS closes (fewer when the history is shorter),
+    using the
     population standard deviation (statistics.pstdev, the same convention as
     the rest of this backend). With a single close, or a perfectly flat
     series, the spread is unusable, so z_score is None instead of a
     division by zero. `closes` must be oldest first and non-empty."""
+    closes = closes[-Z_SCORE_WINDOW_TRADING_DAYS:]
     current_price = closes[-1]
     mean_price = statistics.fmean(closes)
     if len(closes) < 2:
@@ -405,28 +389,6 @@ def compute_price_statistics(closes: list[float]) -> PriceStatistics:
     std_dev = statistics.pstdev(closes, mu=mean_price)
     z_score = (current_price - mean_price) / std_dev if std_dev > 0 else None
     return PriceStatistics(current_price, mean_price, std_dev, z_score)
-
-
-def compute_moat(yearly: list[FiscalYearRatios]) -> tuple[float | None, Moat]:
-    """Returns (roic, moat) from the viable years.
-
-    roic is the average ROE as a percent, reported whenever at least one
-    viable year exists. The moat is judged on the average ROE and average
-    operating margin over the same years, and is 'None' with fewer than
-    MOAT_MIN_VIABLE_YEARS of them.
-    """
-    if not yearly:
-        return None, "None"
-    average_roe = statistics.fmean(year.roe for year in yearly)
-    average_margin = statistics.fmean(year.operating_margin for year in yearly)
-    roic = average_roe * 100
-    if len(yearly) < MOAT_MIN_VIABLE_YEARS:
-        return roic, "None"
-    if average_roe >= WIDE_MOAT_MIN_RATIO and average_margin >= WIDE_MOAT_MIN_RATIO:
-        return roic, "Wide"
-    if average_roe >= NARROW_MOAT_MIN_RATIO and average_margin >= NARROW_MOAT_MIN_RATIO:
-        return roic, "Narrow"
-    return roic, "None"
 
 
 # --- Cache ----------------------------------------------------------------
@@ -510,7 +472,7 @@ def _has_stats(row: dict[str, Any]) -> bool:
 
 
 def _has_fundamentals(row: dict[str, Any]) -> bool:
-    return row.get("moat") is not None
+    return row.get("last_updated_fundamentals") is not None
 
 
 def _to_float(value: Any) -> float | None:
@@ -523,10 +485,12 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
       2. Refresh statistics if older than 24h or missing.
       3. Refresh fundamentals if older than 30 days or missing.
       4. Save the row if anything was refreshed, then return the payload.
-    A failed refresh falls back to the expired cached half (flagged stale);
-    with nothing cached for that half, the error is raised. Statistics are
-    refreshed first, so an unknown ticker stops before the heavier
-    financial statements requests are made.
+    A failed statistics refresh falls back to the expired cached half
+    (flagged stale); with nothing cached, the error is raised. A failed FMP
+    fundamentals refresh never fails the request (the Z-Score is still
+    valid): cached values are kept, or left null, and flagged stale, and the
+    timestamp is not advanced, so the next request retries. Statistics are
+    refreshed first, so an unknown ticker stops before any FMP call.
     """
     now = now or datetime.now(timezone.utc)
     with _symbol_lock(symbol):
@@ -538,13 +502,21 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
 
         if not (_has_stats(row) and _is_fresh(row.get("last_updated_stats"), STATS_TTL, now)):
             try:
-                closes = fetch_daily_closes(symbol, now.date())
+                dated_closes = fetch_dated_daily_closes(symbol, now.date())
+                closes = [close for _, close in dated_closes]
                 if not closes:
                     if not _has_stats(row):
                         raise QualityTickerNotFoundError(f"Yahoo Finance has no price history for '{symbol}'.")
                     stats_stale = True
                 else:
                     stats = compute_price_statistics(closes)
+                    audit = compute_close_drawdown(dated_closes)
+                    row.update(
+                        audit_close=round(audit.close, 4) if audit else None,
+                        audit_close_date=audit.close_date.isoformat() if audit else None,
+                        high_52w_close=round(audit.high_52w_close, 4) if audit else None,
+                        close_drawdown_pct=round(audit.drawdown_pct, 2) if audit else None,
+                    )
                     row.update(
                         current_price=round(stats.current_price, 4),
                         mean_price=round(stats.mean_price, 4),
@@ -559,42 +531,32 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
                 print(f"[quality] Statistics refresh failed for '{symbol}' ({error}); serving cached values.")
                 stats_stale = True
 
+            # P/E TTM moves with the price, so it refreshes with the
+            # statistics. Its failure only marks the statistics stale.
+            try:
+                pe_ttm = fetch_fmp_pe_ttm(symbol)
+                row.update(pe_ttm=round(pe_ttm, 2) if pe_ttm is not None else None)
+                refreshed = True
+            except QualityDataError as fmp_error:
+                print(f"[quality] FMP P/E TTM refresh failed for '{symbol}' ({fmp_error}); keeping cached P/E.")
+                stats_stale = True
+
         if not (_has_fundamentals(row) and _is_fresh(row.get("last_updated_fundamentals"), FUNDAMENTALS_TTL, now)):
             try:
-                statements = fetch_financial_statements(symbol)
-                # yfinance's statement properties swallow request errors and
-                # return empty tables, so "no statements at all" for a ticker
-                # that HAD real figures is treated as a failed refresh, not
-                # cached as "no moat" for 30 days. A ticker that never had
-                # any (an ETF) is simply re-confirmed as having none.
-                if statements.is_empty and row.get("roic") is not None:
-                    raise FundamentalsError(f"Yahoo Finance returned no financial statements for '{symbol}'.")
-                _roe_proxy, moat = compute_moat(compute_yearly_ratios(statements))
-                fmp_failed = False
-                try:
-                    roic = fetch_fmp_roic_ttm(symbol)
-                except QualityDataError as fmp_error:
-                    # An FMP outage must not fail the whole endpoint (the
-                    # Z-Score is still valid): keep the cached ROIC, if any,
-                    # and flag the fundamentals as stale.
-                    print(f"[quality] FMP ROIC refresh failed for '{symbol}' ({fmp_error}); keeping cached ROIC.")
-                    roic = _to_float(row.get("roic"))
-                    fundamentals_stale = True
-                    fmp_failed = True
+                roic = fetch_fmp_roic_ttm(symbol)
+                entry = compute_entry_rule_fundamentals(fetch_fmp_annual_ratios(symbol))
                 row.update(
                     roic=round(roic, 2) if roic is not None else None,
-                    moat=moat,
-                    # After an FMP failure the timestamp is NOT advanced, so
-                    # the next request retries instead of waiting 30 days.
-                    last_updated_fundamentals=(
-                        row.get("last_updated_fundamentals") if fmp_failed else now.isoformat()
+                    pe_5y_avg=round(entry.pe_5y_avg, 2) if entry.pe_5y_avg is not None else None,
+                    capex_to_revenue_3y=(
+                        round(entry.capex_to_revenue_3y, 2) if entry.capex_to_revenue_3y is not None else None
                     ),
+                    capex_to_ocf_3y=round(entry.capex_to_ocf_3y, 2) if entry.capex_to_ocf_3y is not None else None,
+                    last_updated_fundamentals=now.isoformat(),
                 )
                 refreshed = True
-            except QualityDataError as error:
-                if not _has_fundamentals(row):
-                    raise
-                print(f"[quality] Fundamentals refresh failed for '{symbol}' ({error}); serving cached values.")
+            except QualityDataError as fmp_error:
+                print(f"[quality] FMP fundamentals refresh failed for '{symbol}' ({fmp_error}); keeping cached values.")
                 fundamentals_stale = True
 
         if refreshed:
@@ -607,7 +569,17 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
             "std_dev": _to_float(row.get("std_dev")),
             "z_score": _to_float(row.get("z_score")),
             "roic": _to_float(row.get("roic")),
-            "moat": row.get("moat"),
+            "pe_ttm": _to_float(row.get("pe_ttm")),
+            "pe_5y_avg": _to_float(row.get("pe_5y_avg")),
+            "capex_to_revenue_3y": _to_float(row.get("capex_to_revenue_3y")),
+            "capex_to_ocf_3y": _to_float(row.get("capex_to_ocf_3y")),
+            "z_score_window_trading_days": Z_SCORE_WINDOW_TRADING_DAYS,
+            # FUNDAMENTAL AUDIT inputs: last completed daily close vs. the
+            # 52-week high of daily closes.
+            "audit_close": _to_float(row.get("audit_close")),
+            "audit_close_date": row.get("audit_close_date"),
+            "high_52w_close": _to_float(row.get("high_52w_close")),
+            "close_drawdown_pct": _to_float(row.get("close_drawdown_pct")),
             "last_updated_stats": row.get("last_updated_stats"),
             "last_updated_fundamentals": row.get("last_updated_fundamentals"),
             # True when a refresh failed and an expired cached value is shown.

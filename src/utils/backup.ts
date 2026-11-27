@@ -8,7 +8,28 @@ import {
 import type { AmbushTickerEntry } from '@/types/ambush';
 import type { AssetType } from '@/types/asset';
 import type { PortfolioCategory, PortfolioTickerEntry } from '@/types/portfolio';
-import { parseCashBalance, saveCashBalance } from '@/utils/cash-storage';
+import {
+  loadCashReconciliations,
+  parseCashBalance,
+  parseCashReconciliations,
+  saveCashBalance,
+  saveCashReconciliations,
+  type CashReconciliation,
+} from '@/utils/cash-storage';
+import {
+  ensureAuditLatchesLoaded,
+  getAuditLatches,
+  parseAuditLatches,
+  replaceAuditLatches,
+  type AuditLatches,
+} from '@/utils/audit-latch-store';
+import {
+  ensureMoatRatingsLoaded,
+  getMoatRatingsState,
+  parseMoatRatings,
+  replaceMoatRatings,
+  type MoatRatings,
+} from '@/utils/moat-store';
 import {
   loadExecutionLedger,
   parseExecutionRecords,
@@ -46,6 +67,15 @@ export type BackupPayload = {
   // restoring such a backup leaves the device's targets untouched. An
   // invalid set fails parseBackupPayload (see parseBackupTargets).
   targetAllocations: TargetAllocations | null;
+  // 2026-11-27 additions. Each is null when the backup predates it;
+  // restoring such a backup leaves the device's value untouched.
+  //   moatRatings: the manual per-ticker moat (P1).
+  //   auditLatches: the FUNDAMENTAL AUDIT latch per ticker (P5), so a
+  //     triggered, un-audited alert survives a device migration.
+  //   cashReconciliations: the IBI reconciliation log (P7).
+  moatRatings: MoatRatings | null;
+  auditLatches: AuditLatches | null;
+  cashReconciliations: CashReconciliation[] | null;
 };
 
 // Reads both screens' persisted ticker lists, the cash balance and the
@@ -59,12 +89,15 @@ export type BackupPayload = {
 // default, so a migrated device ends up with exactly the targets the old
 // one was using.
 export async function createBackupPayload(): Promise<BackupPayload> {
-  const [storedPortfolio, storedAmbush, storedCash, executions] = await Promise.all([
+  const [storedPortfolio, storedAmbush, storedCash, executions, cashReconciliations] = await Promise.all([
     AsyncStorage.getItem(PORTFOLIO_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(AMBUSH_TICKERS_STORAGE_KEY),
     AsyncStorage.getItem(CASH_BALANCE_STORAGE_KEY),
     loadExecutionLedger(),
+    loadCashReconciliations(),
     ensureTargetAllocationsLoaded(),
+    ensureMoatRatingsLoaded(),
+    ensureAuditLatchesLoaded(),
   ]);
 
   return {
@@ -76,6 +109,9 @@ export async function createBackupPayload(): Promise<BackupPayload> {
     cashBalance: storedCash ? parseCashBalance(JSON.parse(storedCash)) : 0,
     executions,
     targetAllocations: { ...getTargetAllocationState().targets },
+    moatRatings: { ...getMoatRatingsState().ratings },
+    auditLatches: { ...getAuditLatches() },
+    cashReconciliations,
   };
 }
 
@@ -97,11 +133,13 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
           category: 'Satellite',
           assetType: 'Stock',
           units: 0,
+          highestWatermarkLocal: null,
           highestWatermark: null,
           internalTargetPct: null,
           costBasisUsd: null,
           purchasePrice: null,
           historicalHWM: null,
+          avgCostLocal: null,
         }
       : null;
   }
@@ -120,6 +158,9 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
         : 'Satellite',
     assetType: normalizeAssetType(entry.assetType),
     units: typeof entry.units === 'number' && entry.units >= 0 ? entry.units : 0,
+    // P2: the canonical local-currency peak. A backup from before it has
+    // only the USD value, which is migrated at the first live quote.
+    highestWatermarkLocal: positiveNumberOrNull(entry.highestWatermarkLocal),
     highestWatermark: typeof entry.highestWatermark === 'number' ? entry.highestWatermark : null,
     // AUTO-CALIBRATION FOR BROKEN PRICES: must round-trip through backup
     // export/import same as every other persisted field — dropping it here
@@ -147,6 +188,8 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
     // position in Recovery State to trailing off its watermark.
     purchasePrice: positiveNumberOrNull(entry.purchasePrice),
     historicalHWM: positiveNumberOrNull(entry.historicalHWM),
+    // P8: user-entered IBI average cost.
+    avgCostLocal: positiveNumberOrNull(entry.avgCostLocal),
   };
 }
 
@@ -230,6 +273,9 @@ export function parseBackupPayload(rawText: string): BackupPayload {
     // value means "no ledger in this backup" (null).
     executions: parseExecutionRecords(payload.executions),
     targetAllocations: parseBackupTargets(payload),
+    moatRatings: 'moatRatings' in payload ? parseMoatRatings(payload.moatRatings) : null,
+    auditLatches: 'auditLatches' in payload ? parseAuditLatches(payload.auditLatches) : null,
+    cashReconciliations: parseCashReconciliations(payload.cashReconciliations),
   };
 }
 
@@ -266,5 +312,10 @@ export async function restoreBackupPayload(payload: BackupPayload): Promise<void
     ...(payload.cashBalance !== null ? [saveCashBalance(payload.cashBalance)] : []),
     ...(payload.executions !== null ? [replaceExecutionLedger(payload.executions)] : []),
     ...(payload.targetAllocations !== null ? [saveTargetAllocations(payload.targetAllocations)] : []),
+    ...(payload.moatRatings !== null ? [replaceMoatRatings(payload.moatRatings)] : []),
+    ...(payload.cashReconciliations !== null ? [saveCashReconciliations(payload.cashReconciliations)] : []),
   ]);
+  if (payload.auditLatches !== null) {
+    replaceAuditLatches(payload.auditLatches);
+  }
 }

@@ -18,7 +18,9 @@ export type AmbushTickerEntry = {
   layer: AmbushLayer;
 };
 
-export type QualityMoat = 'Wide' | 'Narrow' | 'None';
+// MANUAL MOAT: user-rated per ticker (@/utils/moat-store); 'Unrated' until
+// rated. Only Wide/Narrow pass the Value Zone's moat rule.
+export type QualityMoat = 'Wide' | 'Narrow' | 'None' | 'Unrated';
 
 // A Satellite row is the live Ambush row (the StockCard `Stock`, including
 // macroTrend and pullbackDepth) tagged with its layer.
@@ -38,13 +40,21 @@ export type QualityAmbushAsset = {
   price: number;
   localPrice: number;
   currencySymbol: string;
-  // Most recent year's ROIC as a percent (28 = 28%). Null when the company
-  // has no financial statements on file (e.g. an ETF).
+  // ROIC TTM as a percent (28 = 28%, FMP). Null when FMP has no figure.
   roic: number | null;
-  // Null only while unavailable (the fetch failed).
-  moat: QualityMoat | null;
-  // 2-year Z-Score. Null when there wasn't enough price data to compute one.
+  // The user's manual rating (@/utils/moat-store), never fetched.
+  moat: QualityMoat;
+  // Z-Score over 504 trading days. Null with too little price data.
   zScore: number | null;
+  // VALUE ZONE inputs (FMP via GET /api/quality); null when unknown.
+  peTtm: number | null;
+  pe5yAvg: number | null;
+  capexToRevenue3y: number | null;
+  capexToOcf3y: number | null;
+  // P9: whether this single stock is below the 5% cap (see
+  // withPortfolioContext in @/utils/ambush-assets). Absent/null when the
+  // cap doesn't apply or the Portfolio weights aren't known.
+  withinPositionCap?: boolean | null;
   // 'unavailable' when the fetch failed. The row stays on the radar (so the
   // saved watchlist never shrinks) and every number above is a placeholder.
   priceStatus: PriceStatus;

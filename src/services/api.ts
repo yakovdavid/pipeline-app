@@ -1,7 +1,5 @@
-import type { QualityMoat } from '@/types/ambush';
 import type { AssetType, TrendLabel } from '@/types/asset';
 import type { PortfolioCategory } from '@/types/portfolio';
-import { isQualityBuySignal } from '@/utils/quality-signal';
 
 export type StockQuote = {
   // Multi-Currency engine: normalized to USD by the backend — this is the
@@ -53,10 +51,12 @@ export type StockQuote = {
   // Quality positions only. fetchStockData itself always leaves it null,
   // since /api/stock no longer computes any Z-Score.
   qualityZScore: number | null;
-  // The Quality Buy Signal (isQualityBuySignal in @/utils/quality-signal):
-  // Z-Score <= -1.0 AND ROIC >= 15% AND a moat, all from /api/quality —
-  // exactly the Ambush Radar's Value Zone. A value trap never alerts.
-  qualityZScoreAlert: boolean;
+  // QUALITY ENTRY RULES: the full GET /api/quality reading, Quality
+  // positions only (null otherwise or when that call failed). The Buy
+  // Signal is evaluated from it at render time (evaluateQualityReading in
+  // @/utils/quality-signal) together with the manual moat and the live
+  // template, so editing either updates the row at once.
+  qualityMetrics: QualityMetrics | null;
   // ROIC (percent, FMP TTM) from GET /api/quality, filled in by
   // fetchPortfolioQuote for Quality positions only; null otherwise or when
   // FMP has no figure. Drives [FUNDAMENTAL DEGRADATION] in the Portfolio.
@@ -93,7 +93,7 @@ export function createUnavailableQuote(): StockQuote {
     drawdownPct: null,
     pullbackDepth: null,
     qualityZScore: null,
-    qualityZScoreAlert: false,
+    qualityMetrics: null,
     qualityRoic: null,
     priceStatus: 'unavailable',
   };
@@ -257,7 +257,7 @@ export async function fetchStockData(
     pullbackDepth: typeof data.pullback_depth === 'number' ? data.pullback_depth : null,
     // Filled in by fetchPortfolioQuote for Quality positions.
     qualityZScore: null,
-    qualityZScoreAlert: false,
+    qualityMetrics: null,
     qualityRoic: null,
     priceStatus: 'live',
   };
@@ -271,13 +271,26 @@ export type QualityMetrics = {
   zScore: number | null;
   // ROIC as a percent (FMP, TTM, NOPAT-based); null when FMP has no figure.
   roic: number | null;
-  moat: QualityMoat | null;
+  // VALUE ZONE inputs (FMP). Moat is NOT here: it is manual
+  // (@/utils/moat-store) and the backend no longer derives one.
+  peTtm: number | null;
+  pe5yAvg: number | null;
+  // 3-year averages, percent.
+  capexToRevenue3y: number | null;
+  capexToOcf3y: number | null;
+  // FUNDAMENTAL AUDIT inputs: the last COMPLETED daily close and its
+  // drawdown from the 52-week high of daily closes (percent, negative).
+  auditCloseDate: string | null;
+  high52wClose: number | null;
+  closeDrawdownPct: number | null;
   // True when a backend refresh failed and expired cached values are shown.
   statsStale: boolean;
   fundamentalsStale: boolean;
 };
 
-const QUALITY_MOATS: readonly QualityMoat[] = ['Wide', 'Narrow', 'None'];
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
 
 // QUALITY SINGLE SOURCE OF TRUTH: GET /api/quality/{ticker} (backend
 // quality.py): Z-Score, ROIC and Moat, cached server-side (24h statistics,
@@ -309,7 +322,13 @@ export async function fetchQualityMetrics(ticker: string): Promise<QualityMetric
     current_price?: number | null;
     z_score?: number | null;
     roic?: number | null;
-    moat?: string | null;
+    pe_ttm?: number | null;
+    pe_5y_avg?: number | null;
+    capex_to_revenue_3y?: number | null;
+    capex_to_ocf_3y?: number | null;
+    audit_close_date?: string | null;
+    high_52w_close?: number | null;
+    close_drawdown_pct?: number | null;
     stats_stale?: boolean;
     fundamentals_stale?: boolean;
   };
@@ -319,7 +338,13 @@ export async function fetchQualityMetrics(ticker: string): Promise<QualityMetric
     currentPrice: typeof data.current_price === 'number' ? data.current_price : null,
     zScore: typeof data.z_score === 'number' ? data.z_score : null,
     roic: typeof data.roic === 'number' ? data.roic : null,
-    moat: QUALITY_MOATS.includes(data.moat as QualityMoat) ? (data.moat as QualityMoat) : null,
+    peTtm: numberOrNull(data.pe_ttm),
+    pe5yAvg: numberOrNull(data.pe_5y_avg),
+    capexToRevenue3y: numberOrNull(data.capex_to_revenue_3y),
+    capexToOcf3y: numberOrNull(data.capex_to_ocf_3y),
+    auditCloseDate: typeof data.audit_close_date === 'string' ? data.audit_close_date : null,
+    high52wClose: numberOrNull(data.high_52w_close),
+    closeDrawdownPct: numberOrNull(data.close_drawdown_pct),
     statsStale: data.stats_stale === true,
     fundamentalsStale: data.fundamentals_stale === true,
   };
@@ -327,9 +352,8 @@ export async function fetchQualityMetrics(ticker: string): Promise<QualityMetric
 
 // What the Portfolio screen fetches for every position. Non-Quality
 // positions are a plain fetchStockData. Quality positions ALSO fetch
-// GET /api/quality in parallel, for the Z-Score and the Buy Signal alert
-// (isQualityBuySignal: the Ambush Radar's Value Zone rule, so broken
-// fundamentals suppress the alert). The Yahoo quote is still required
+// GET /api/quality in parallel: the Z-Score, the Value Zone inputs (the
+// row evaluates the Buy Signal from them) and the daily-close audit input. The Yahoo quote is still required
 // (valuation, currency, calibration and the watermark all depend on it),
 // so if it fails the whole fetch fails, as before. If only the quality call
 // fails, the position keeps its price and shows no Z-Score and no alert
@@ -350,7 +374,7 @@ export async function fetchPortfolioQuote(
   return {
     ...quote,
     qualityZScore: metrics.zScore,
-    qualityZScoreAlert: isQualityBuySignal(metrics),
+    qualityMetrics: metrics,
     qualityRoic: metrics.roic,
   };
 }

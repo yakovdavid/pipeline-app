@@ -66,6 +66,9 @@ export type StockCardProps = {
   // CIRCUIT BREAKER: this card's layer (Satellite) is above target + 1%,
   // so the card is dimmed, badged and its Buy button disabled.
   isOverweightLocked: boolean;
+  // P9: the lock badge's text when the lock is a single-stock CAP LOCK
+  // rather than a layer lock. Defaults to the overweight badge.
+  lockBadgeText?: string;
 };
 
 // Wrapped in memo() so a price/SMA update on one ticker doesn't re-render
@@ -81,6 +84,7 @@ export const StockCard = memo(function StockCard({
   onBuy,
   canBuy,
   isOverweightLocked,
+  lockBadgeText,
 }: StockCardProps) {
   const { colors, isDarkMode } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read (like usePipelineTheme()
@@ -221,7 +225,7 @@ export const StockCard = memo(function StockCard({
         <View style={styles.lockOverlay}>
           <View style={styles.lockBadge} accessibilityRole="text">
             <Ionicons name="lock-closed" size={14} color="#FFFFFF" />
-            <Text style={styles.lockBadgeText}>{t('overweightLockBadge')}</Text>
+            <Text style={styles.lockBadgeText}>{lockBadgeText ?? t('overweightLockBadge')}</Text>
           </View>
         </View>
       )}

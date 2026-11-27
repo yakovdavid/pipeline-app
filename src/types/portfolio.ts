@@ -1,4 +1,4 @@
-import type { PriceStatus } from '@/services/api';
+import type { PriceStatus, QualityMetrics } from '@/services/api';
 import type { AssetType, TrendLabel } from '@/types/asset';
 
 export type PortfolioCategory = 'Core' | 'Satellite' | 'Quality';
@@ -11,10 +11,18 @@ export type PortfolioTickerEntry = {
   category: PortfolioCategory;
   assetType: AssetType;
   units: number;
-  // Highest price observed for this position since it was added, tracked
-  // for every asset type (drives the Satellite trailing-stop trigger price
-  // — a single hard 12% for Stocks and ETFs alike, see SATELLITE_TS_PCT in
-  // thresholds.ts). Null until the first live price is fetched.
+  // HIGH WATER MARK (canonical unit, 2026-11-27 — see @/utils/watermark):
+  //   highestWatermarkLocal: the SOURCE OF TRUTH. Highest local price seen
+  //     since the position was added, in the instrument's own currency as
+  //     the API delivers it (normalized SHEKELS for ".TA": Agorot ÷100
+  //     exactly once, in the backend). Null until the first live price,
+  //     or for an entry saved before this field existed (migrated from the
+  //     USD value at the first live quote).
+  //   highestWatermark: the same peak in USD at the CURRENT quote's rate.
+  //     Derived on every quote; kept on the entry only so older backups
+  //     and app versions still read a value. Drives the Satellite
+  //     trailing-stop trigger (a single hard 12%, see SATELLITE_TS_PCT).
+  highestWatermarkLocal: number | null;
   highestWatermark: number | null;
   // AUTO-CALIBRATION FOR BROKEN PRICES: for a handful of funds (observed:
   // HRL-F95.TA) Yahoo Finance returns a raw index value instead of a real
@@ -57,6 +65,11 @@ export type PortfolioTickerEntry = {
   // Null for positions opened before trade logging (no recorded entry).
   purchasePrice: number | null;
   historicalHWM: number | null;
+  // MANUAL AVERAGE COST (2026-11-27, backlog P8): the average cost per unit
+  // as IBI reports it, entered by hand, in the instrument's local currency
+  // (Shekels for ".TA"; typed in Agorot and ÷100 once on entry). For P&L
+  // display ONLY: no rule, stop or signal reads it. Null = not entered.
+  avgCostLocal: number | null;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {
@@ -106,11 +119,10 @@ export type PortfolioStock = PortfolioTickerEntry & {
   // every non-Quality asset, or when that endpoint has no Z-Score or
   // failed. Live/ephemeral, never persisted, same as drawdownPct.
   qualityZScore: number | null;
-  // The Quality Buy Signal: Z-Score <= -1.0 AND ROIC >= the template floor (8%/15%) AND a moat,
-  // the Ambush Radar's Value Zone rule (isQualityBuySignal in
-  // @/utils/quality-signal). PortfolioStockRow additionally checks
-  // `stock.category === 'Quality'` before showing it.
-  qualityZScoreAlert: boolean;
+  // QUALITY ENTRY RULES: the full GET /api/quality reading (Quality only;
+  // see StockQuote.qualityMetrics). PortfolioStockRow evaluates the Buy
+  // Signal from it with the manual moat. Live/ephemeral, never persisted.
+  qualityMetrics: QualityMetrics | null;
   // ROIC (percent, FMP TTM) from GET /api/quality, Quality positions only.
   // Live/ephemeral, never persisted. See StockQuote.qualityRoic.
   qualityRoic: number | null;

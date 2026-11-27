@@ -31,23 +31,48 @@ export type AdjustCashModalProps = {
   cashBalance: number;
   // Signed USD amount: positive adds to the balance, negative removes.
   onSubmit: (deltaUsd: number) => void;
+  // IBI CASH RECONCILIATION (P7): sets the balance to exactly what IBI
+  // shows (IBI is the source of truth).
+  onReconcile: (ibiBalanceUsd: number) => void;
   onCancel: () => void;
 };
+
+type CashModalMode = CashAdjustmentDirection | 'reconcile';
+
+// A reconciliation may legitimately be $0.00 or negative (a debit balance),
+// unlike a deposit/withdrawal amount.
+function parseIbiBalance(text: string): number | null {
+  const trimmed = text.trim().replace(/,/g, '');
+  if (trimmed === '') {
+    return null;
+  }
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? roundToCents(value) : null;
+}
 
 // YIELD LEDGER / CASH CORRECTION: "Adjust Cash". Deposit / Dividend adds to
 // the buying power; Withdraw / Correction removes from it (a withdrawal
 // from the broker, or fixing an earlier wrong entry). The parent remounts
 // it (a fresh `key`) each time it opens, so it always starts on Deposit
-// with an empty amount.
-export function AdjustCashModal({ visible, cashBalance, onSubmit, onCancel }: AdjustCashModalProps) {
+// with an empty amount. A third mode, "Reconcile to IBI", takes the exact
+// balance IBI shows instead of an amount.
+export function AdjustCashModal({ visible, cashBalance, onSubmit, onReconcile, onCancel }: AdjustCashModalProps) {
   const { colors } = usePipelineTheme();
   const { language, t } = usePipelineLanguage();
   const styles = useMemo(() => createStyles(colors, language), [colors, language]);
-  const [direction, setDirection] = useState<CashAdjustmentDirection>('deposit');
+  const [direction, setDirection] = useState<CashModalMode>('deposit');
   const [amountText, setAmountText] = useState('');
+  const isReconcile = direction === 'reconcile';
 
-  const amount = parseCashAmount(amountText);
-  const delta = amount === null ? null : signedCashDelta(amount, direction);
+  const ibiBalance = isReconcile ? parseIbiBalance(amountText) : null;
+  const amount = isReconcile ? null : parseCashAmount(amountText);
+  const delta = isReconcile
+    ? ibiBalance === null
+      ? null
+      : roundToCents(ibiBalance - cashBalance)
+    : amount === null
+      ? null
+      : signedCashDelta(amount, direction);
   const balanceAfter = delta === null ? null : roundToCents(cashBalance + delta);
 
   const handleSubmit = () => {
@@ -56,6 +81,10 @@ export function AdjustCashModal({ visible, cashBalance, onSubmit, onCancel }: Ad
       return;
     }
     Keyboard.dismiss();
+    if (isReconcile && ibiBalance !== null) {
+      onReconcile(ibiBalance);
+      return;
+    }
     onSubmit(delta);
   };
 
@@ -91,19 +120,27 @@ export function AdjustCashModal({ visible, cashBalance, onSubmit, onCancel }: Ad
                   <Text style={styles.toggleText}>{t('withdrawOrCorrect')}</Text>
                 </TouchableOpacity>
               </View>
+              <TouchableOpacity
+                style={[styles.toggleButton, styles.reconcileToggle, isReconcile && styles.toggleReconcileActive]}
+                onPress={() => setDirection('reconcile')}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: isReconcile }}>
+                <Text style={styles.toggleText}>{t('reconcileToIbi')}</Text>
+              </TouchableOpacity>
+              {isReconcile && <Text style={styles.label}>{t('reconcileToIbiHint')}</Text>}
 
-              <Text style={styles.label}>{t('cashAmountLabel')}</Text>
+              <Text style={styles.label}>{isReconcile ? t('ibiCashBalanceLabel') : t('cashAmountLabel')}</Text>
               <TextInput
                 style={styles.input}
                 value={amountText}
                 onChangeText={setAmountText}
-                placeholder={t('cashAmountPlaceholder')}
+                placeholder={isReconcile ? t('ibiCashBalancePlaceholder') : t('cashAmountPlaceholder')}
                 placeholderTextColor={colors.textSecondary}
-                keyboardType="decimal-pad"
+                keyboardType={isReconcile ? 'numbers-and-punctuation' : 'decimal-pad'}
                 maxLength={15}
                 autoFocus
                 onSubmitEditing={handleSubmit}
-                accessibilityLabel={t('cashAmountLabel')}
+                accessibilityLabel={isReconcile ? t('ibiCashBalanceLabel') : t('cashAmountLabel')}
               />
 
               <View style={styles.summaryRow}>
@@ -123,7 +160,9 @@ export function AdjustCashModal({ visible, cashBalance, onSubmit, onCancel }: Ad
                 ]}
                 onPress={handleSubmit}
                 accessibilityRole="button">
-                <Text style={styles.submitButtonText}>{t('applyAdjustment')}</Text>
+                <Text style={styles.submitButtonText}>
+                  {isReconcile ? t('applyReconciliation') : t('applyAdjustment')}
+                </Text>
               </TouchableOpacity>
             </View>
           </TouchableWithoutFeedback>
@@ -192,6 +231,15 @@ function createStyles(colors: PipelineColorScheme, language: Language) {
     toggleWithdrawActive: {
       backgroundColor: colors.bearish,
       borderColor: colors.bearish,
+    },
+    reconcileToggle: {
+      flex: 0,
+      marginTop: -6,
+      marginBottom: 14,
+    },
+    toggleReconcileActive: {
+      backgroundColor: colors.core,
+      borderColor: colors.core,
     },
     toggleText: {
       color: colors.textPrimary,

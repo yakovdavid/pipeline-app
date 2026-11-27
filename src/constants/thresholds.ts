@@ -40,7 +40,7 @@ export const AMBUSH_MIN_STOP_MARGIN_PCT = 2;
 // QUALITY MARGIN OF SAFETY: the single Z-Score line for every Quality asset,
 // app-wide. At or below it, a fundamentally sound Quality asset is a Buy
 // Signal: the Ambush Radar's Value Zone and the Portfolio's Quality alert.
-// Both apply it through isQualityBuySignal (@/utils/quality-signal) to the
+// Both apply it through evaluateQualityReading (@/utils/quality-signal) to the
 // same backend values (GET /api/quality/{ticker}), so they can't disagree.
 export const QUALITY_MARGIN_OF_SAFETY_ZSCORE = -1.0;
 
@@ -55,3 +55,9 @@ export const QUALITY_MARGIN_OF_SAFETY_ZSCORE = -1.0;
 // position shows [FUNDAMENTAL DEGRADATION].
 export const QUALITY_MIN_ROIC_PCT_TACTICAL = 8;
 export const QUALITY_MIN_ROIC_PCT_HYPER_QUALITY = 15;
+
+// CAPITAL LIGHT (Hyper-Quality entry rule, 2026-11-27): both 3-year
+// averages must be at or under these percents (FMP annual ratios, see
+// backend/quality.py). Not applied to Tactical templates.
+export const QUALITY_MAX_CAPEX_TO_REVENUE_PCT = 5;
+export const QUALITY_MAX_CAPEX_TO_OCF_PCT = 20;

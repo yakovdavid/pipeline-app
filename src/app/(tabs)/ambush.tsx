@@ -41,6 +41,8 @@ import {
 } from '@/utils/ambush-grouping';
 import {
   buildQualityAmbushAsset,
+  isCapLocked,
+  withPortfolioContext,
   buildSatelliteAmbushAsset,
   buildUnavailableAmbushAsset,
   fetchAmbushAsset,
@@ -50,6 +52,8 @@ import {
 import { loadAmbushTickerEntries, subscribeToAmbushAdditions, subscribeToAmbushRemovals } from '@/utils/ambush-storage';
 import { isLayerClosed, isLayerOverweight, overweightLimitPct } from '@/utils/allocation';
 import { useLayerWeights } from '@/utils/layer-weights-store';
+import { ensureMoatRatingsLoaded, getMoatRatingsState, useMoatRatings } from '@/utils/moat-store';
+import { getPositionWeights, usePositionWeights } from '@/utils/position-weights-store';
 import { ensureTargetAllocationsLoaded, useTargetAllocations } from '@/utils/target-allocation-store';
 import { requestPortfolioBuy } from '@/utils/portfolio-buy-handoff';
 import { sendStructuralStopNotification } from '@/utils/notifications';
@@ -96,7 +100,8 @@ const DEFAULT_ENTRIES: AmbushTickerEntry[] = [
 // "Ambush Radar" (מכ"ם מארבים): one watchlist of re-entry candidates in two
 // layers, grouped by readiness. Satellite tickers are judged on Yahoo
 // technicals (Macro Trend + Pullback Depth, see StockCard); Quality tickers
-// on the backend's 2-year Z-Score, ROIC and Moat (see QualityAmbushCard).
+// on every Quality entry rule of the active template, from the backend's
+// Z-Score/ROIC/P/E/CapEx plus the manual moat (see QualityAmbushCard).
 export default function AmbushRadarScreen() {
   const { colors, isDarkMode } = usePipelineTheme();
   // ROBUST LANGUAGE CONTEXT: a plain context read, same as usePipelineTheme
@@ -513,7 +518,12 @@ export default function AmbushRadarScreen() {
   const { targets, isLoaded: areTargetsLoaded } = useTargetAllocations();
   useEffect(() => {
     void ensureTargetAllocationsLoaded();
+    void ensureMoatRatingsLoaded();
   }, []);
+  // MANUAL MOAT: the live ratings, re-applied to every Quality row.
+  const { ratings: moatRatings } = useMoatRatings();
+  // P9: held single stocks' live weights, for CAP LOCK.
+  const positionWeights = usePositionWeights();
   const lockedLayers = useMemo<Record<AmbushLayer, boolean>>(
     () => ({
       Satellite: layerWeights !== null && areTargetsLoaded && isLayerOverweight('Satellite', layerWeights, targets),
@@ -533,7 +543,9 @@ export default function AmbushRadarScreen() {
       // locked layer; this is the second layer of both blocks.
       if (
         asset === undefined ||
-        classifyAmbushReadiness(asset) !== 'valueZone' ||
+        classifyAmbushReadiness(withPortfolioContext(asset, getMoatRatingsState().ratings, getPositionWeights())) !==
+          'valueZone' ||
+        isCapLocked(asset, getPositionWeights()) ||
         lockedLayersRef.current[asset.layer]
       ) {
         return;
@@ -561,7 +573,12 @@ export default function AmbushRadarScreen() {
   // asset objects are passed through unchanged, so StockCard's and
   // QualityAmbushCard's memo() still skip rows that didn't change.
   const sections = useMemo<AmbushSection[]>(() => {
-    const groups = groupAmbushByReadiness(assets);
+    // Re-grouped on a moat edit, a template change or a weight change
+    // (all change which entry rules pass), not only on new data.
+    const groups = groupAmbushByReadiness(
+      assets.map((asset) => withPortfolioContext(asset, moatRatings, positionWeights)),
+      targets,
+    );
     return AMBUSH_READINESS_ORDER.filter((zone) => groups[zone].length > 0).map((zone) => ({
       key: zone,
       title: t(AMBUSH_ZONE_TITLE_KEY[zone]),
@@ -570,7 +587,7 @@ export default function AmbushRadarScreen() {
       isCollapsed: collapsedSections[zone],
       data: collapsedSections[zone] ? [] : groups[zone],
     }));
-  }, [assets, collapsedSections, colors, t]);
+  }, [assets, moatRatings, positionWeights, targets, collapsedSections, colors, t]);
 
   // Picks the card by layer. A Quality card gets its section's zone for
   // its status strip. Both share the same delete and buy handlers, and get
@@ -583,7 +600,8 @@ export default function AmbushRadarScreen() {
           zone={section.key}
           onDelete={handleDeleteTicker}
           onBuy={handleBuyTicker}
-          isOverweightLocked={lockedLayers.Quality}
+          isOverweightLocked={lockedLayers.Quality || isCapLocked(item, positionWeights)}
+          lockBadgeText={!lockedLayers.Quality && isCapLocked(item, positionWeights) ? t('capLockBadge') : undefined}
         />
       ) : (
         <StockCard
@@ -591,10 +609,11 @@ export default function AmbushRadarScreen() {
           onDelete={handleDeleteTicker}
           onBuy={handleBuyTicker}
           canBuy={section.key === 'valueZone'}
-          isOverweightLocked={lockedLayers.Satellite}
+          isOverweightLocked={lockedLayers.Satellite || isCapLocked(item, positionWeights)}
+          lockBadgeText={!lockedLayers.Satellite && isCapLocked(item, positionWeights) ? t('capLockBadge') : undefined}
         />
       ),
-    [handleDeleteTicker, handleBuyTicker, lockedLayers],
+    [handleDeleteTicker, handleBuyTicker, lockedLayers, positionWeights, t],
   );
 
   const renderSectionHeader = useCallback(
