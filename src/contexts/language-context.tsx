@@ -297,7 +297,9 @@ export type TranslationKey =
   | 'auditThesisIntact'
   | 'auditThesisBroken'
   | 'lastAuditIntact'
-  | 'lastAuditBroken';
+  | 'lastAuditBroken'
+  | 'qualityPeakLine'
+  | 'qualityPeakPending';
 
 // t(key, params?) — params are substituted into `{{paramName}}` tokens in
 // the resolved string (e.g. 'fetchFailedForTicker': "Failed to fetch data
@@ -538,7 +540,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     ruleCapexToOcf: 'CapEx/תזרים תפעולי (ממוצע 3 שנים) ≤ {{max}}%',
     rulePeBelowAverage: 'P/E TTM < ממוצע 5 שנים',
     ruleZScore: 'Z-Score (504 ימי מסחר) ≤ {{max}}',
-    dailyCloseDrop: 'ירידה מהשיא השנתי (סגירה יומית {{date}}): {{pct}}%',
+    dailyCloseDrop: 'ירידה מהשיא מאז הכניסה (סגירה יומית {{date}}): {{pct}}%',
     auditTriggeredOn: 'הופעל בסגירה של {{date}} ({{pct}}%). נשאר פעיל עד סימון "נבדק".',
     markAudited: 'סמן כנבדק',
     markAuditedTitle: 'סימון בדיקה יסודית',
@@ -554,6 +556,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     neverReconciledCaption: 'טרם בוצעה התאמה ל-IBI',
     lastReconciledCaption: 'התאמה אחרונה ל-IBI: {{date}} (הפרש {{delta}})',
     cashReconciledToast: 'המזומן הותאם ל-IBI: {{balance}} (הפרש {{delta}})',
+    qualityPeakLine: 'שיא מאז הכניסה: {{peak}} | סף בדיקה יסודית (‎-15%): {{trigger}}',
+    qualityPeakPending: 'שיא מאז הכניסה: בחישוב…',
     capLockBadge: 'CAP LOCK',
     capLockTitle: 'נעילת תקרה (CAP LOCK)',
     capLockMessage: '{{ticker}} כבר מהווה {{weight}}% מהתיק (מושקע + מזומן). התקרה למניה בודדת היא {{cap}}%, ולכן קניות נוספות חסומות. אין מכירה כפויה.',
@@ -808,7 +812,7 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     ruleCapexToOcf: '3y CapEx/OCF ≤ {{max}}%',
     rulePeBelowAverage: 'P/E TTM < 5y avg P/E',
     ruleZScore: 'Z-Score (504 trading days) ≤ {{max}}',
-    dailyCloseDrop: 'Drop from 52w high (daily close {{date}}): {{pct}}%',
+    dailyCloseDrop: 'Drop from peak since entry (daily close {{date}}): {{pct}}%',
     auditTriggeredOn: 'Triggered on the {{date}} close ({{pct}}%). Stays active until marked Audited.',
     markAudited: 'Mark Audited',
     markAuditedTitle: 'Mark fundamental audit done',
@@ -824,6 +828,8 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     neverReconciledCaption: 'Not yet reconciled with IBI',
     lastReconciledCaption: 'Last reconciled with IBI: {{date}} (difference {{delta}})',
     cashReconciledToast: 'Cash reconciled to IBI: {{balance}} (difference {{delta}})',
+    qualityPeakLine: 'Peak since entry: {{peak}} | audit trigger (−15%): {{trigger}}',
+    qualityPeakPending: 'Peak since entry: initializing…',
     capLockBadge: 'CAP LOCK',
     capLockTitle: 'CAP LOCK',
     capLockMessage: '{{ticker}} is already {{weight}}% of the portfolio (invested + cash). The single-stock cap is {{cap}}%, so adds are blocked. Nothing is sold.',

@@ -51,7 +51,7 @@ from typing import Any, Callable
 
 import requests
 import yfinance as yf
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from yfinance.exceptions import YFRateLimitError, YFTickerMissingError
 
 # --- Configuration --------------------------------------------------------
@@ -222,6 +222,32 @@ class DailyCloseDrawdown:
     close_date: date
     high_52w_close: float
     drawdown_pct: float  # negative below the high
+
+
+def compute_max_close_since(dated_closes: list[tuple[date, float]], since: date) -> float | None:
+    """P12: the highest completed daily close on or after `since` (a
+    position's first BUY date). None when no close falls in the window.
+    The history fetched covers PRICE_HISTORY_DAYS; an older `since` is
+    bounded by it."""
+    values = [close for close_date, close in dated_closes if close_date >= since]
+    return max(values) if values else None
+
+
+# P12: the dated closes of the last statistics refresh, kept in memory with
+# the statistics TTL so a ?since= lookup doesn't refetch the history.
+_dated_closes_cache: dict[str, tuple[datetime, list[tuple[date, float]]]] = {}
+_dated_closes_guard = threading.Lock()
+
+
+def _cached_dated_closes(symbol: str, now: datetime) -> list[tuple[date, float]]:
+    with _dated_closes_guard:
+        cached = _dated_closes_cache.get(symbol)
+    if cached is not None and now - cached[0] < STATS_TTL:
+        return cached[1]
+    dated_closes = fetch_dated_daily_closes(symbol, now.date())
+    with _dated_closes_guard:
+        _dated_closes_cache[symbol] = (now, dated_closes)
+    return dated_closes
 
 
 def compute_close_drawdown(dated_closes: list[tuple[date, float]]) -> DailyCloseDrawdown | None:
@@ -503,6 +529,8 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
         if not (_has_stats(row) and _is_fresh(row.get("last_updated_stats"), STATS_TTL, now)):
             try:
                 dated_closes = fetch_dated_daily_closes(symbol, now.date())
+                with _dated_closes_guard:
+                    _dated_closes_cache[symbol] = (now, dated_closes)
                 closes = [close for _, close in dated_closes]
                 if not closes:
                     if not _has_stats(row):
@@ -576,6 +604,7 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
             "z_score_window_trading_days": Z_SCORE_WINDOW_TRADING_DAYS,
             # FUNDAMENTAL AUDIT inputs: last completed daily close vs. the
             # 52-week high of daily closes.
+            # P12: the raw close in the listing currency (Agorot for ".TA").
             "audit_close": _to_float(row.get("audit_close")),
             "audit_close_date": row.get("audit_close_date"),
             "high_52w_close": _to_float(row.get("high_52w_close")),
@@ -605,12 +634,36 @@ def create_quality_router(get_supabase_client: Callable[[], Any]) -> APIRouter:
     store = QualityMetricsStore(get_supabase_client)
 
     @router.get("/api/quality/{ticker}")
-    def get_quality(ticker: str) -> dict[str, Any]:
+    def get_quality(
+        ticker: str,
+        since: str | None = Query(default=None, description="P12: YYYY-MM-DD, a position's first BUY date."),
+    ) -> dict[str, Any]:
         symbol = normalize_quality_ticker(ticker)
         if symbol is None:
             raise HTTPException(status_code=400, detail=f"'{ticker}' is not a valid ticker symbol.")
+        since_date: date | None = None
+        if since is not None:
+            try:
+                since_date = date.fromisoformat(since)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"'{since}' is not a YYYY-MM-DD date.") from None
         try:
-            return get_quality_metrics(symbol, store)
+            payload = get_quality_metrics(symbol, store)
+            if since_date is not None:
+                # P12: highest completed close since the first BUY. A failed
+                # history fetch returns null rather than failing the request.
+                try:
+                    dated_closes = _cached_dated_closes(symbol, datetime.now(timezone.utc))
+                    max_close = compute_max_close_since(dated_closes, since_date)
+                except QualityDataError as error:
+                    print(f"[quality] max-close-since lookup failed for '{symbol}' ({error}).")
+                    max_close = None
+                payload = {
+                    **payload,
+                    "since": since_date.isoformat(),
+                    "max_close_since": round(max_close, 4) if max_close is not None else None,
+                }
+            return payload
         except QualityTickerNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from None
         except QualityRateLimitError as error:

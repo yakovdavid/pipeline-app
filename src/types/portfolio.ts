@@ -70,6 +70,11 @@ export type PortfolioTickerEntry = {
   // (Shekels for ".TA"; typed in Agorot and ÷100 once on entry). For P&L
   // display ONLY: no rule, stop or signal reads it. Null = not entered.
   avgCostLocal: number | null;
+  // P12 QUALITY AUDIT REFERENCE: max(highest daily close since the first
+  // BUY, first entry price), normalized local currency, one-way (only
+  // rises; add-on buys don't reset it). Null until initialized (see
+  // @/utils/quality-peak). Used by Quality positions only.
+  qualityPeakSinceEntry: number | null;
 };
 
 export type PortfolioStock = PortfolioTickerEntry & {

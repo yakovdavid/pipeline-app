@@ -45,6 +45,7 @@ import {
   fetchInChunks,
   fetchIntel,
   fetchPortfolioQuote,
+  fetchQualityMetrics,
   fetchUsdIlsRate,
   liquidatePortfolioAsset,
   type IntelBatchResponse,
@@ -124,6 +125,15 @@ import {
 import { ensureMoatRatingsLoaded, getMoatRating, useMoatRatings } from '@/utils/moat-store';
 import { ensureAuditLatchesLoaded, markTickerAudited, recordDailyCloseReading, useAuditLatch } from '@/utils/audit-latch-store';
 import { MoatSelector } from '@/components/MoatSelector';
+import {
+  auditTriggerLevel,
+  brokerPriceToLocal,
+  closeToLocal,
+  drawdownFromPeakPct,
+  firstBuyRecord,
+  initialPeak,
+  seedPeakFor,
+} from '@/utils/quality-peak';
 import {
   exceedsCapAfterBuy,
   isAtOrAboveCap,
@@ -827,6 +837,11 @@ export default function PortfolioScreen() {
           typeof entry.historicalHWM === 'number' && entry.historicalHWM > 0 ? entry.historicalHWM : null,
         avgCostLocal:
           typeof entry.avgCostLocal === 'number' && entry.avgCostLocal > 0 ? entry.avgCostLocal : null,
+        // P12: null until initialized (see the peak effect below).
+        qualityPeakSinceEntry:
+          typeof entry.qualityPeakSinceEntry === 'number' && entry.qualityPeakSinceEntry > 0
+            ? entry.qualityPeakSinceEntry
+            : null,
       }));
     } catch (error) {
       console.error(
@@ -1030,17 +1045,95 @@ export default function PortfolioScreen() {
   // reading is fed to the latch here, at screen level, so a row that is
   // scrolled out of view (the list is virtualized) is still evaluated.
   // Readings are idempotent; the latch only ever moves on a new close.
+  // P12: the drawdown is measured from the position's peak since entry, not
+  // the 52-week high; nothing is fed until that peak is initialized.
   useEffect(() => {
     for (const stock of stocks) {
-      const closeDrawdownPct = stock.category === 'Quality' ? (stock.qualityMetrics?.closeDrawdownPct ?? null) : null;
+      if (stock.category !== 'Quality' || stock.qualityMetrics === null) {
+        continue;
+      }
+      const closeDrawdownPct = drawdownFromPeakPct(
+        closeToLocal(stock.ticker, stock.qualityMetrics.auditClose),
+        stock.qualityPeakSinceEntry,
+      );
       if (closeDrawdownPct !== null) {
         recordDailyCloseReading(stock.ticker, {
           closeDrawdownPct,
-          closeDate: stock.qualityMetrics?.auditCloseDate ?? null,
+          closeDate: stock.qualityMetrics.auditCloseDate,
         });
       }
     }
   }, [stocks]);
+
+  // P12 PEAK INITIALIZATION, once per Quality holding without a peak (held
+  // before this rule, or restored from an older backup): an approved seed,
+  // else max(highest close since its first BUY in the execution ledger,
+  // that BUY's price), else the current 52-week high of daily closes.
+  // Waits for the ledger, so a missing BUY date is never assumed. Runs
+  // asynchronously (the state update lands after the effect), and the ref
+  // keeps each ticker to one attempt per session.
+  const peakInitAttemptedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (executionLog === null) {
+      return;
+    }
+    for (const stock of stocks) {
+      if (
+        stock.category !== 'Quality' ||
+        stock.qualityPeakSinceEntry !== null ||
+        stock.qualityMetrics === null ||
+        peakInitAttemptedRef.current.has(stock.ticker)
+      ) {
+        continue;
+      }
+      peakInitAttemptedRef.current.add(stock.ticker);
+      const ticker = stock.ticker;
+      const metrics = stock.qualityMetrics;
+      const firstBuy = firstBuyRecord(executionLog, ticker);
+      const latestClose = closeToLocal(ticker, metrics.auditClose);
+      const resolvePeak = async (): Promise<number | null> => {
+        const seed = seedPeakFor(ticker);
+        if (seed !== null || firstBuy === null) {
+          return initialPeak({
+            seed,
+            hasFirstBuy: false,
+            maxCloseSinceFirstBuy: null,
+            firstEntryPrice: null,
+            high52wClose: closeToLocal(ticker, metrics.high52wClose),
+            latestClose,
+          });
+        }
+        const sinceMetrics = await fetchQualityMetrics(ticker, firstBuy.executedAt.slice(0, 10));
+        return initialPeak({
+          seed: null,
+          hasFirstBuy: true,
+          maxCloseSinceFirstBuy: closeToLocal(ticker, sinceMetrics.maxCloseSince),
+          firstEntryPrice: brokerPriceToLocal(ticker, firstBuy.price),
+          high52wClose: null,
+          latestClose,
+        });
+      };
+      resolvePeak()
+        .then((peak) => {
+          if (peak === null || !isMountedRef.current) {
+            // Nothing to initialize from yet: retry on a later load.
+            peakInitAttemptedRef.current.delete(ticker);
+            return;
+          }
+          setStocksTrusted((previous) =>
+            previous.map((candidate) =>
+              candidate.ticker === ticker && candidate.qualityPeakSinceEntry === null
+                ? { ...candidate, qualityPeakSinceEntry: peak }
+                : candidate,
+            ),
+          );
+        })
+        .catch((error) => {
+          console.warn(`[audit] Could not initialize the peak since entry for ${ticker}; will retry.`, error);
+          peakInitAttemptedRef.current.delete(ticker);
+        });
+    }
+  }, [stocks, executionLog, setStocksTrusted]);
 
   // CACHE INTEGRITY: keep AsyncStorage in sync with the current portfolio
   // — but ONLY once there's trustworthy data to sync. Skipped while
@@ -1406,6 +1499,10 @@ export default function PortfolioScreen() {
         purchasePrice: fillPriceUsd,
         historicalHWM: historicalHwmUsd,
         avgCostLocal: null,
+        // P12: a new Quality position's AUDIT reference starts at its entry
+        // price (local currency) and rises with each daily close. A top-up
+        // above (the held branch) never resets it.
+        qualityPeakSinceEntry: trade.category === 'Quality' ? brokerPriceToLocal(trade.ticker, inputs.price) : null,
       };
       // buildPortfolioStock calibrates the quote and seeds the watermark
       // from the live price, exactly like a freshly loaded position.
@@ -3203,7 +3300,10 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   // until the user marks it Audited; a recovery never clears it. AUDIT is
   // a review prompt only and never offers or triggers a sell.
   const qualityMetrics = stock.category === 'Quality' ? stock.qualityMetrics : null;
-  const closeDrawdownPct = qualityMetrics?.closeDrawdownPct ?? null;
+  // P12: measured from the position's peak since entry.
+  const auditCloseLocal = closeToLocal(stock.ticker, qualityMetrics?.auditClose ?? null);
+  const qualityPeak = stock.category === 'Quality' ? stock.qualityPeakSinceEntry : null;
+  const closeDrawdownPct = drawdownFromPeakPct(auditCloseLocal, qualityPeak);
   const auditCloseDate = qualityMetrics?.auditCloseDate ?? null;
   const auditLatch = useAuditLatch(stock.ticker);
   const isFundamentalAuditRequired = stock.category === 'Quality' && auditLatch.status === 'triggered';
@@ -3767,8 +3867,18 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           drawdown from the 52-week close high, and a RED latched
           "[FUNDAMENTAL AUDIT REQUIRED]" block with a "Mark Audited" button
           while triggered, else "[HOLD]". Never a sell action. */}
-      {!isEditing && stock.category === 'Quality' && (closeDrawdownPct !== null || isFundamentalAuditRequired) && (
+      {!isEditing && stock.category === 'Quality' && (
         <View style={[styles.killSwitchBlock, isFundamentalAuditRequired && styles.killSwitchBlockAlert]}>
+          {/* P12: the reference peak and the close that would trigger AUDIT. */}
+          <Text
+            style={[styles.killSwitchDrawdownText, isFundamentalAuditRequired && styles.killSwitchDrawdownTextAlert]}>
+            {qualityPeak === null
+              ? t('qualityPeakPending')
+              : t('qualityPeakLine', {
+                  peak: formatUnitPrice(stock.ticker, qualityPeak, stock.currencySymbol, agorotSuffix),
+                  trigger: formatUnitPrice(stock.ticker, auditTriggerLevel(qualityPeak), stock.currencySymbol, agorotSuffix),
+                })}
+          </Text>
           {closeDrawdownPct !== null && (
             <Text
               style={[styles.killSwitchDrawdownText, isFundamentalAuditRequired && styles.killSwitchDrawdownTextAlert]}>

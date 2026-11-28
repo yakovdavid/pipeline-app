@@ -11,6 +11,7 @@ from quality import (
     AUDIT_HIGH_WINDOW_TRADING_DAYS,
     Z_SCORE_WINDOW_TRADING_DAYS,
     compute_close_drawdown,
+    compute_max_close_since,
     compute_entry_rule_fundamentals,
     compute_price_statistics,
 )
@@ -86,3 +87,10 @@ def test_close_drawdown_ignores_highs_older_than_252_sessions():
 
 def test_close_drawdown_without_history_is_unknown():
     assert compute_close_drawdown([]) is None
+
+
+def test_max_close_since_first_buy():
+    closes = _dated([100.0, 140.0, 120.0, 130.0])  # 2025-01-01 .. 2025-01-04
+    assert compute_max_close_since(closes, date(2025, 1, 3)) == 130.0
+    assert compute_max_close_since(closes, date(2025, 1, 1)) == 140.0
+    assert compute_max_close_since(closes, date(2025, 2, 1)) is None

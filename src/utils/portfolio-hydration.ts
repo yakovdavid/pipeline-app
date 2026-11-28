@@ -1,6 +1,7 @@
 import { createUnavailableQuote, type StockQuote } from '@/services/api';
 import type { PortfolioStock, PortfolioTickerEntry } from '@/types/portfolio';
 import { calibrateQuote, DEFAULT_CALIBRATION_FACTOR } from '@/utils/calibration';
+import { advancePeak, closeToLocal } from '@/utils/quality-peak';
 import { resolveWatermark } from '@/utils/watermark';
 
 // The "Highest Watermark" (highest price seen since a position was added)
@@ -32,11 +33,17 @@ export function buildPortfolioStock(entry: PortfolioTickerEntry, quote: StockQuo
   // set one) and its USD view is re-derived at this quote's rate. A legacy
   // USD-only entry is migrated here, once.
   const watermark = resolveWatermark(entry, calibratedQuote);
+  // P12: each new completed daily close can only raise the Quality peak.
+  const qualityPeakSinceEntry =
+    entry.category === 'Quality' && quote.qualityMetrics !== null
+      ? advancePeak(entry.qualityPeakSinceEntry, closeToLocal(entry.ticker, quote.qualityMetrics.auditClose))
+      : entry.qualityPeakSinceEntry;
   return {
     ...entry,
     ...calibratedQuote,
     highestWatermarkLocal: watermark.local,
     highestWatermark: watermark.usd,
+    qualityPeakSinceEntry,
   };
 }
 
@@ -65,5 +72,7 @@ export function toPortfolioTickerEntry(stock: PortfolioStock): PortfolioTickerEn
     historicalHWM: stock.historicalHWM,
     // P8: user-entered from IBI, so it must survive every save.
     avgCostLocal: stock.avgCostLocal,
+    // P12: the persisted AUDIT reference peak.
+    qualityPeakSinceEntry: stock.qualityPeakSinceEntry,
   };
 }

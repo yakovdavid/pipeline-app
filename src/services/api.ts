@@ -281,6 +281,11 @@ export type QualityMetrics = {
   // FUNDAMENTAL AUDIT inputs: the last COMPLETED daily close and its
   // drawdown from the 52-week high of daily closes (percent, negative).
   auditCloseDate: string | null;
+  // P12: that close itself, raw listing currency (Agorot for ".TA").
+  auditClose: number | null;
+  // P12: highest completed close since the `since` date passed to
+  // fetchQualityMetrics (a position's first BUY); null when not asked.
+  maxCloseSince: number | null;
   high52wClose: number | null;
   closeDrawdownPct: number | null;
   // True when a backend refresh failed and expired cached values are shown.
@@ -296,12 +301,14 @@ function numberOrNull(value: unknown): number | null {
 // quality.py): Z-Score, ROIC and Moat, cached server-side (24h statistics,
 // 30-day fundamentals). Used for every Quality asset, in both the Portfolio
 // and the Ambush Radar. Throws on any failure; callers decide the fallback.
-export async function fetchQualityMetrics(ticker: string): Promise<QualityMetrics> {
+// `since` (YYYY-MM-DD, P12) also asks for the highest close since that date.
+export async function fetchQualityMetrics(ticker: string, since?: string): Promise<QualityMetrics> {
   const symbol = ticker.trim().toUpperCase();
+  const sinceQuery = since === undefined ? '' : `?since=${encodeURIComponent(since)}`;
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/api/quality/${encodeURIComponent(symbol)}`);
+    response = await fetch(`${API_BASE_URL}/api/quality/${encodeURIComponent(symbol)}${sinceQuery}`);
   } catch {
     throw new Error(`Could not reach the Pipeline API at ${API_BASE_URL}.`);
   }
@@ -327,6 +334,8 @@ export async function fetchQualityMetrics(ticker: string): Promise<QualityMetric
     capex_to_revenue_3y?: number | null;
     capex_to_ocf_3y?: number | null;
     audit_close_date?: string | null;
+    audit_close?: number | null;
+    max_close_since?: number | null;
     high_52w_close?: number | null;
     close_drawdown_pct?: number | null;
     stats_stale?: boolean;
@@ -343,6 +352,8 @@ export async function fetchQualityMetrics(ticker: string): Promise<QualityMetric
     capexToRevenue3y: numberOrNull(data.capex_to_revenue_3y),
     capexToOcf3y: numberOrNull(data.capex_to_ocf_3y),
     auditCloseDate: typeof data.audit_close_date === 'string' ? data.audit_close_date : null,
+    auditClose: numberOrNull(data.audit_close),
+    maxCloseSince: numberOrNull(data.max_close_since),
     high52wClose: numberOrNull(data.high_52w_close),
     closeDrawdownPct: numberOrNull(data.close_drawdown_pct),
     statsStale: data.stats_stale === true,

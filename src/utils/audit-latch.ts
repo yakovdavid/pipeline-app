@@ -3,7 +3,8 @@
 // @/utils/audit-latch-store.
 //
 // Rule: a held Quality position triggers FUNDAMENTAL AUDIT REQUIRED when
-// its DAILY CLOSE is 15% or more below its 52-week high (of daily closes).
+// its DAILY CLOSE is 15% or more below its peak since entry (P12, see
+// @/utils/quality-peak; it was the 52-week high before 2026-11-28).
 // Never the live intraday price. Once triggered it stays latched until the
 // user marks it "Audited": a price recovery never clears it. AUDIT is a
 // review prompt only and never generates a sell.
@@ -23,7 +24,13 @@ export type AuditLatchStatus = 'armed' | 'triggered' | 'audited';
 // triggers LEGACY EXIT for a Legacy holding. Kept until the next audit.
 export type AuditOutcome = 'intact' | 'broken';
 
+// P12: which drawdown reference the latch was evaluated against. Latches
+// saved under the old 52-week-high reference (no marker) are discarded on
+// load, so a holding that "triggered" at purchase starts armed again.
+export const AUDIT_LATCH_BASIS = 'peakSinceEntry';
+
 export type AuditLatch = {
+  basis: typeof AUDIT_LATCH_BASIS;
   status: AuditLatchStatus;
   lastOutcome: AuditOutcome | null;
   // The close that triggered the current/last audit.
@@ -34,6 +41,7 @@ export type AuditLatch = {
 };
 
 export const ARMED_LATCH: AuditLatch = {
+  basis: AUDIT_LATCH_BASIS,
   status: 'armed',
   lastOutcome: null,
   triggerCloseDate: null,
@@ -89,7 +97,11 @@ export function parseAuditLatch(raw: unknown): AuditLatch | null {
   if (value.status !== 'armed' && value.status !== 'triggered' && value.status !== 'audited') {
     return null;
   }
+  if (value.basis !== AUDIT_LATCH_BASIS) {
+    return null;
+  }
   return {
+    basis: AUDIT_LATCH_BASIS,
     status: value.status,
     lastOutcome: value.lastOutcome === 'intact' || value.lastOutcome === 'broken' ? value.lastOutcome : null,
     triggerCloseDate: typeof value.triggerCloseDate === 'string' ? value.triggerCloseDate : null,

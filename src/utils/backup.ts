@@ -140,6 +140,7 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
           purchasePrice: null,
           historicalHWM: null,
           avgCostLocal: null,
+          qualityPeakSinceEntry: null,
         }
       : null;
   }
@@ -190,6 +191,9 @@ function coercePortfolioEntry(value: unknown): PortfolioTickerEntry | null {
     historicalHWM: positiveNumberOrNull(entry.historicalHWM),
     // P8: user-entered IBI average cost.
     avgCostLocal: positiveNumberOrNull(entry.avgCostLocal),
+    // P12: the AUDIT reference peak must survive a restore, or it would be
+    // re-initialized (possibly lower) on the new device.
+    qualityPeakSinceEntry: positiveNumberOrNull(entry.qualityPeakSinceEntry),
   };
 }
 
