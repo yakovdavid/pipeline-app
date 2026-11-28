@@ -1,13 +1,14 @@
 import { Ionicons } from '@expo/vector-icons';
-import { memo, useMemo } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { AMBUSH_ZONE_BADGE_KEY, ambushZoneColors } from '@/constants/ambush-zones';
 import type { PipelineColorScheme } from '@/constants/pipeline-colors';
 import { usePipelineLanguage, type Language } from '@/contexts/language-context';
 import { usePipelineTheme } from '@/contexts/theme-context';
-import { MoatSelector } from '@/components/MoatSelector';
+import { MoatSelector, moatLabel } from '@/components/MoatSelector';
 import { QualityRuleList } from '@/components/QualityRuleList';
+import type { QualityEntryRuleId } from '@/utils/quality-entry-rules';
 import type { QualityAmbushAsset } from '@/types/ambush';
 import { evaluateQualityReading, qualityEntryThresholds, qualityMinRoicPct } from '@/utils/quality-signal';
 import { useTargetAllocations } from '@/utils/target-allocation-store';
@@ -50,6 +51,18 @@ export type QualityAmbushCardProps = {
 // Follows the app's light/dark theme like every other card. Wrapped in
 // memo() so refreshing other rows doesn't re-render this one; theme and
 // language are context reads, which still re-render it.
+// COLLAPSED SUMMARY: short, language-neutral rule names for the one-line
+// "which rules failed" read-out.
+const RULE_SHORT_NAME: Record<QualityEntryRuleId, string> = {
+  roic: 'ROIC',
+  moat: 'Moat',
+  capexToRevenue: 'CapEx/Rev',
+  capexToOcf: 'CapEx/OCF',
+  peBelowAverage: 'P/E',
+  zScore: 'Z',
+  positionCap: 'Cap 5%',
+};
+
 export const QualityAmbushCard = memo(function QualityAmbushCard({
   asset,
   zone,
@@ -70,6 +83,14 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
     asset.roic === null ? colors.textSecondary : asset.roic > qualityMinRoicPct(targets) ? colors.bullish : colors.bearish;
   const thresholds = qualityEntryThresholds(targets);
   const evaluation = evaluateQualityReading(asset, targets);
+  // COLLAPSIBLE: collapsed by default (in memory only). Collapsed, the card
+  // shows price, ROIC, Z-Score, the moat and which rules failed; expanded,
+  // the moat editor and the full ✓/✗ rule list.
+  const [isExpanded, setIsExpanded] = useState(false);
+  const failedSummary =
+    evaluation.failedRules.length === 0
+      ? `✓ ${evaluation.rules.length}/${evaluation.rules.length}`
+      : `✗ ${evaluation.failedRules.map((rule) => RULE_SHORT_NAME[rule]).join(', ')}`;
   // SAFE BUTTONS: Buy is rendered only for a Value Zone asset. In Watch or
   // Invalidated it doesn't exist at all, so it can't be hit by accident.
   const canBuy = zone === 'valueZone';
@@ -130,14 +151,32 @@ export const QualityAmbushCard = memo(function QualityAmbushCard({
           </View>
         )}
 
-        {/* MANUAL MOAT: editable even while the price is unavailable. */}
-        <View style={styles.moatRow}>
-          <MoatSelector ticker={asset.ticker} />
-        </View>
-        {!isUnavailable && (
-          <View style={styles.rulesRow}>
-            <QualityRuleList reading={asset} evaluation={evaluation} thresholds={thresholds} />
-          </View>
+        <TouchableOpacity
+          style={styles.summaryRow}
+          onPress={() => setIsExpanded((previous) => !previous)}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: isExpanded }}
+          accessibilityLabel={`${t('qualityDetails')} ${asset.ticker}`}>
+          <Text style={styles.summaryText} numberOfLines={1}>
+            {`${t('moatLabel')}: ${moatLabel(t, asset.moat)}`}
+            {isUnavailable ? '' : `  ·  ${failedSummary}`}
+          </Text>
+          <Ionicons name={isExpanded ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textSecondary} />
+        </TouchableOpacity>
+
+        {isExpanded && (
+          <>
+            {/* MANUAL MOAT: editable even while the price is unavailable. */}
+            <View style={styles.moatRow}>
+              <MoatSelector ticker={asset.ticker} />
+            </View>
+            {!isUnavailable && (
+              <View style={styles.rulesRow}>
+                <QualityRuleList reading={asset} evaluation={evaluation} thresholds={thresholds} />
+              </View>
+            )}
+          </>
         )}
 
         <View style={[styles.statusStrip, { backgroundColor: zoneColors.badgeBackground }]}>
@@ -314,6 +353,22 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
       fontWeight: '800',
       marginTop: 1,
       writingDirection: 'ltr',
+    },
+    summaryRow: {
+      flexDirection: rowDirection,
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
+      paddingHorizontal: 12,
+      marginBottom: 6,
+    },
+    summaryText: {
+      flex: 1,
+      color: colors.textSecondary,
+      fontSize: 12,
+      fontWeight: '600',
+      textAlign,
+      writingDirection,
     },
     moatRow: {
       paddingHorizontal: 12,

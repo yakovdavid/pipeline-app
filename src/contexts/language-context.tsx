@@ -299,7 +299,10 @@ export type TranslationKey =
   | 'lastAuditIntact'
   | 'lastAuditBroken'
   | 'qualityPeakLine'
-  | 'qualityPeakPending';
+  | 'qualityPeakPending'
+  | 'qualityDetails'
+  | 'qualitySummaryDrawdown'
+  | 'qualitySummaryRules';
 
 // t(key, params?) — params are substituted into `{{paramName}}` tokens in
 // the resolved string (e.g. 'fetchFailedForTicker': "Failed to fetch data
@@ -556,6 +559,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     neverReconciledCaption: 'טרם בוצעה התאמה ל-IBI',
     lastReconciledCaption: 'התאמה אחרונה ל-IBI: {{date}} (הפרש {{delta}})',
     cashReconciledToast: 'המזומן הותאם ל-IBI: {{balance}} (הפרש {{delta}})',
+    qualityDetails: 'פרטי איכות',
+    qualitySummaryDrawdown: 'מהשיא: {{pct}}% (סף {{trigger}})',
+    qualitySummaryRules: 'כללי כניסה: {{passed}}/{{total}}',
     qualityPeakLine: 'שיא מאז הכניסה: {{peak}} | סף בדיקה יסודית (‎-15%): {{trigger}}',
     qualityPeakPending: 'שיא מאז הכניסה: בחישוב…',
     capLockBadge: 'CAP LOCK',
@@ -828,6 +834,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     neverReconciledCaption: 'Not yet reconciled with IBI',
     lastReconciledCaption: 'Last reconciled with IBI: {{date}} (difference {{delta}})',
     cashReconciledToast: 'Cash reconciled to IBI: {{balance}} (difference {{delta}})',
+    qualityDetails: 'Quality details',
+    qualitySummaryDrawdown: 'From peak: {{pct}}% (trigger {{trigger}})',
+    qualitySummaryRules: 'Entry rules: {{passed}}/{{total}}',
     qualityPeakLine: 'Peak since entry: {{peak}} | audit trigger (−15%): {{trigger}}',
     qualityPeakPending: 'Peak since entry: initializing…',
     capLockBadge: 'CAP LOCK',

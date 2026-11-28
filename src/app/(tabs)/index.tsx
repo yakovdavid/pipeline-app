@@ -3173,6 +3173,10 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const [activeHwmText, setActiveHwmText] = useState('');
   // P8: manual IBI average cost, typed like the entry fields above.
   const [avgCostText, setAvgCostText] = useState('');
+  // COLLAPSIBLE QUALITY DETAILS: collapsed by default (in memory only), so
+  // a Quality card shows one status line; tapping it opens the full audit,
+  // moat and entry-rule detail.
+  const [isQualityExpanded, setIsQualityExpanded] = useState(false);
 
   // TASE ETF MATH FIX (Nominal Value / Erech Nakuv): a TASE ETF's raw
   // `units` is a Nominal Value quantity — 100 nominal units = 1 real
@@ -3360,6 +3364,48 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
   const isFundamentalDegradationActive =
     !isLegacy && stock.category === 'Quality' && isFundamentalDegradation(stock.qualityRoic ?? null, rowTargets);
 
+
+  // COLLAPSED QUALITY SUMMARY: one status by priority (an alert always wins
+  // over a signal, a signal over a plain hold), with a count of the other
+  // active alerts, plus one line of numbers.
+  const qualityAlerts: string[] = [];
+  if (isFundamentalAuditRequired) {
+    qualityAlerts.push(t('fundamentalAuditRequired'));
+  }
+  if (legacyExit.length > 0) {
+    qualityAlerts.push(t('legacyExitBadge'));
+  }
+  if (isFundamentalDegradationActive) {
+    qualityAlerts.push(t('fundamentalDegradation'));
+  }
+  if (isCapLockActive) {
+    qualityAlerts.push(t('capLockBadge'));
+  }
+  const qualityStatus = {
+    label:
+      qualityAlerts[0] ??
+      (isQualityZScoreAlertActive ? t('zScoreAlert') : isLegacy ? t('legacyHoldBadge') : t('hold')),
+    isAlert: qualityAlerts.length > 0,
+    isSignal: qualityAlerts.length === 0 && isQualityZScoreAlertActive,
+    extraCount: Math.max(0, qualityAlerts.length - 1),
+  };
+  const passedRuleCount = qualityEvaluation?.rules.filter((rule) => rule.passed).length ?? 0;
+  const qualitySummaryLine = [
+    closeDrawdownPct !== null && qualityPeak !== null
+      ? t('qualitySummaryDrawdown', {
+          pct: closeDrawdownPct.toFixed(1),
+          trigger: formatUnitPrice(stock.ticker, auditTriggerLevel(qualityPeak), stock.currencySymbol, agorotSuffix),
+        })
+      : t('qualityPeakPending'),
+    qualityEvaluation !== null && !isPriceUnavailable
+      ? t('qualitySummaryRules', { passed: passedRuleCount, total: qualityEvaluation.rules.length })
+      : null,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(' · ');
+  // Non-Quality rows (e.g. BRK-B's CAP LOCK, Legacy outside Quality) keep
+  // their blocks always visible; only Quality rows collapse.
+  const showQualityDetails = stock.category !== 'Quality' || isQualityExpanded;
 
   const handleStartEditing = () => {
     setEditedAssetType(stock.assetType);
@@ -3867,7 +3913,43 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           drawdown from the 52-week close high, and a RED latched
           "[FUNDAMENTAL AUDIT REQUIRED]" block with a "Mark Audited" button
           while triggered, else "[HOLD]". Never a sell action. */}
+      {/* COLLAPSED QUALITY SUMMARY: the single most important status, the
+          drawdown from the peak against its -15% trigger, and how many entry
+          rules pass. Every alert state is visible here without expanding;
+          the actions (Mark Audited, moat) are in the expanded detail. */}
       {!isEditing && stock.category === 'Quality' && (
+        <TouchableOpacity
+          style={[styles.qualitySummary, qualityStatus.isAlert && styles.killSwitchBlockAlert]}
+          onPress={() => setIsQualityExpanded((previous) => !previous)}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: isQualityExpanded }}
+          accessibilityLabel={`${t('qualityDetails')} ${stock.ticker}`}>
+          <View style={styles.qualitySummaryHeader}>
+            <Text
+              style={[
+                styles.killSwitchTag,
+                styles.qualitySummaryTag,
+                qualityStatus.isAlert
+                  ? styles.killSwitchTagAlert
+                  : qualityStatus.isSignal
+                    ? styles.zScoreAlertTag
+                    : styles.killSwitchTagHold,
+              ]}>
+              {`[${qualityStatus.label}]`}
+              {qualityStatus.extraCount > 0 ? ` +${qualityStatus.extraCount}` : ''}
+            </Text>
+            <Ionicons name={isQualityExpanded ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textSecondary} />
+          </View>
+          {!isQualityExpanded && (
+            <Text style={[styles.killSwitchDrawdownText, qualityStatus.isAlert && styles.killSwitchDrawdownTextAlert]}>
+              {qualitySummaryLine}
+            </Text>
+          )}
+        </TouchableOpacity>
+      )}
+
+      {!isEditing && stock.category === 'Quality' && isQualityExpanded && (
         <View style={[styles.killSwitchBlock, isFundamentalAuditRequired && styles.killSwitchBlockAlert]}>
           {/* P12: the reference peak and the close that would trigger AUDIT. */}
           <Text
@@ -3925,7 +4007,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       )}
 
       {/* P10: the last audit's conclusion, once there is one. */}
-      {!isEditing && stock.category === 'Quality' && !isFundamentalAuditRequired && auditLatch.lastOutcome !== null && (
+      {!isEditing && showQualityDetails && stock.category === 'Quality' && !isFundamentalAuditRequired && auditLatch.lastOutcome !== null && (
         <Text style={styles.allocationText}>
           {auditLatch.lastOutcome === 'broken' ? t('lastAuditBroken') : t('lastAuditIntact')}
         </Text>
@@ -3934,7 +4016,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       {/* P10 LEGACY HOLD: replaces DEGRADATION and the entry signal for the
           closed Legacy list. HOLD while ROIC >= 8% and Moat != None; a red
           LEGACY EXIT block (never an automatic sell) on any exit trigger. */}
-      {!isEditing && isLegacy && (
+      {!isEditing && showQualityDetails && isLegacy && (
         <View style={[styles.killSwitchBlock, legacyExit.length > 0 && styles.killSwitchBlockAlert]}>
           <Text style={[styles.killSwitchTag, legacyExit.length > 0 ? styles.killSwitchTagAlert : styles.killSwitchTagHold]}>
             {legacyExit.length > 0 ? `[${t('legacyExitBadge')}]` : `[${t('legacyHoldBadge')}]`}
@@ -3956,7 +4038,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
       )}
 
       {/* P9 CAP LOCK: purchase lock only, never a sell. */}
-      {!isEditing && isCapLockActive && capWeightPct !== null && (
+      {!isEditing && showQualityDetails && isCapLockActive && capWeightPct !== null && (
         <View style={[styles.killSwitchBlock, styles.killSwitchBlockAlert]}>
           <Text style={[styles.killSwitchTag, styles.killSwitchTagAlert]}>{`[${t('capLockBadge')}]`}</Text>
           <Text style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
@@ -3967,7 +4049,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
 
       {/* LAYER 2: QUALITY — FUNDAMENTAL DEGRADATION (P6, option C): same
           loud red block, shown only when the ROIC fails the floor. */}
-      {!isEditing && !isPriceUnavailable && isFundamentalDegradationActive && stock.qualityRoic !== null && (
+      {!isEditing && showQualityDetails && !isPriceUnavailable && isFundamentalDegradationActive && stock.qualityRoic !== null && (
         <View style={[styles.killSwitchBlock, styles.killSwitchBlockAlert]}>
           <Text style={[styles.killSwitchTag, styles.killSwitchTagAlert]}>
             {`[${t('fundamentalDegradation')}]`}
@@ -3983,7 +4065,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           same evaluation as the Ambush Radar, with each rule's ✓/✗. The
           ALERT tag only when every rule passes. The manual moat is
           editable here too (P1). */}
-      {!isEditing && stock.category === 'Quality' && (
+      {!isEditing && stock.category === 'Quality' && isQualityExpanded && (
         <View style={styles.zScoreBlock}>
           {!isPriceUnavailable && stock.qualityZScore !== null && (
             <Text style={styles.zScoreText}>
@@ -3993,7 +4075,7 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           {isQualityZScoreAlertActive && <Text style={styles.zScoreAlertTag}>{`[${t('zScoreAlert')}]`}</Text>}
         </View>
       )}
-      {!isEditing && stock.category === 'Quality' && (
+      {!isEditing && stock.category === 'Quality' && isQualityExpanded && (
         <View style={styles.qualityRulesBlock}>
           <MoatSelector ticker={stock.ticker} />
           {!isPriceUnavailable && qualityReading !== null && qualityEvaluation !== null && (
@@ -4787,6 +4869,22 @@ function createStyles(colors: PipelineColorScheme, isDarkMode: boolean, language
   // both of Quality's alert signals read consistently.
   zScoreBlock: {
     marginTop: 8,
+  },
+  qualitySummary: {
+    marginTop: 8,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: colors.quality,
+  },
+  qualitySummaryHeader: {
+    flexDirection: isHebrew ? 'row-reverse' : 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  qualitySummaryTag: {
+    marginTop: 0,
   },
   qualityRulesBlock: {
     marginTop: 6,
