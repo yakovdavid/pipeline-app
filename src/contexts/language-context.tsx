@@ -302,7 +302,10 @@ export type TranslationKey =
   | 'qualityPeakPending'
   | 'qualityDetails'
   | 'qualitySummaryDrawdown'
-  | 'qualitySummaryRules';
+  | 'qualitySummaryRules'
+  | 'auditTriggeredStep'
+  | 'auditTriggeredEarnings'
+  | 'nextAuditStep';
 
 // t(key, params?) — params are substituted into `{{paramName}}` tokens in
 // the resolved string (e.g. 'fetchFailedForTicker': "Failed to fetch data
@@ -559,6 +562,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     neverReconciledCaption: 'טרם בוצעה התאמה ל-IBI',
     lastReconciledCaption: 'התאמה אחרונה ל-IBI: {{date}} (הפרש {{delta}})',
     cashReconciledToast: 'המזומן הותאם ל-IBI: {{balance}} (הפרש {{delta}})',
+    auditTriggeredStep: 'הופעל בסגירה של {{date}} ({{pct}}% מהשיא): ירידה נוספת אחרי בדיקה שסומנה "תקינה". נשאר פעיל עד סימון "נבדק".',
+    auditTriggeredEarnings: 'בדיקה אחרי דוח רבעוני (3 ימי מסחר אחרי הדוח, סגירה של {{date}}). נשאר פעיל עד סימון "נבדק".',
+    nextAuditStep: 'בדיקה יסודית הבאה אם הסגירה תרד ל-{{level}} או פחות (מדרגה אחרי "התזה תקינה")',
     qualityDetails: 'פרטי איכות',
     qualitySummaryDrawdown: 'מהשיא: {{pct}}% (סף {{trigger}})',
     qualitySummaryRules: 'כללי כניסה: {{passed}}/{{total}}',
@@ -834,6 +840,9 @@ const TRANSLATIONS: Record<Language, Record<TranslationKey, string>> = {
     neverReconciledCaption: 'Not yet reconciled with IBI',
     lastReconciledCaption: 'Last reconciled with IBI: {{date}} (difference {{delta}})',
     cashReconciledToast: 'Cash reconciled to IBI: {{balance}} (difference {{delta}})',
+    auditTriggeredStep: 'Triggered on the {{date}} close ({{pct}}% from peak): a further fall after an audit marked "intact". Stays active until marked Audited.',
+    auditTriggeredEarnings: 'Post-earnings audit (3 trading days after the report, {{date}} close). Stays active until marked Audited.',
+    nextAuditStep: 'Next audit if a close reaches {{level}} or lower (step after "thesis intact")',
     qualityDetails: 'Quality details',
     qualitySummaryDrawdown: 'From peak: {{pct}}% (trigger {{trigger}})',
     qualitySummaryRules: 'Entry rules: {{passed}}/{{total}}',

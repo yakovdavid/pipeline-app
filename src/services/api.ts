@@ -286,6 +286,10 @@ export type QualityMetrics = {
   // P12: highest completed close since the `since` date passed to
   // fetchQualityMetrics (a position's first BUY); null when not asked.
   maxCloseSince: number | null;
+  // P13-B: the latest quarterly report out, and the close date of the 3rd
+  // completed session after it (null until then).
+  lastEarningsDate: string | null;
+  earningsAuditDueDate: string | null;
   high52wClose: number | null;
   closeDrawdownPct: number | null;
   // True when a backend refresh failed and expired cached values are shown.
@@ -336,6 +340,8 @@ export async function fetchQualityMetrics(ticker: string, since?: string): Promi
     audit_close_date?: string | null;
     audit_close?: number | null;
     max_close_since?: number | null;
+    last_earnings_date?: string | null;
+    earnings_audit_due_date?: string | null;
     high_52w_close?: number | null;
     close_drawdown_pct?: number | null;
     stats_stale?: boolean;
@@ -354,6 +360,8 @@ export async function fetchQualityMetrics(ticker: string, since?: string): Promi
     auditCloseDate: typeof data.audit_close_date === 'string' ? data.audit_close_date : null,
     auditClose: numberOrNull(data.audit_close),
     maxCloseSince: numberOrNull(data.max_close_since),
+    lastEarningsDate: typeof data.last_earnings_date === 'string' ? data.last_earnings_date : null,
+    earningsAuditDueDate: typeof data.earnings_audit_due_date === 'string' ? data.earnings_audit_due_date : null,
     high52wClose: numberOrNull(data.high_52w_close),
     closeDrawdownPct: numberOrNull(data.close_drawdown_pct),
     statsStale: data.stats_stale === true,

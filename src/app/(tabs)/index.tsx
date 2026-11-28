@@ -1052,14 +1052,16 @@ export default function PortfolioScreen() {
       if (stock.category !== 'Quality' || stock.qualityMetrics === null) {
         continue;
       }
-      const closeDrawdownPct = drawdownFromPeakPct(
-        closeToLocal(stock.ticker, stock.qualityMetrics.auditClose),
-        stock.qualityPeakSinceEntry,
-      );
+      const closeLocal = closeToLocal(stock.ticker, stock.qualityMetrics.auditClose);
+      const closeDrawdownPct = drawdownFromPeakPct(closeLocal, stock.qualityPeakSinceEntry);
       if (closeDrawdownPct !== null) {
         recordDailyCloseReading(stock.ticker, {
           closeDrawdownPct,
           closeDate: stock.qualityMetrics.auditCloseDate,
+          // P13-A step and P13-B earnings audit inputs.
+          closeLocal,
+          lastEarningsDate: stock.qualityMetrics.lastEarningsDate,
+          earningsAuditDueDate: stock.qualityMetrics.earningsAuditDueDate,
         });
       }
     }
@@ -3977,10 +3979,12 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
           {isFundamentalAuditRequired && (
             <>
               <Text style={[styles.killSwitchDrawdownText, styles.killSwitchDrawdownTextAlert]}>
-                {t('auditTriggeredOn', {
-                  date: auditLatch.triggerCloseDate ?? '—',
-                  pct: auditLatch.triggerDrawdownPct === null ? '—' : auditLatch.triggerDrawdownPct.toFixed(2),
-                })}
+                {auditLatch.triggerReason === 'earnings'
+                  ? t('auditTriggeredEarnings', { date: auditLatch.triggerCloseDate ?? '—' })
+                  : t(auditLatch.triggerReason === 'step' ? 'auditTriggeredStep' : 'auditTriggeredOn', {
+                      date: auditLatch.triggerCloseDate ?? '—',
+                      pct: auditLatch.triggerDrawdownPct === null ? '—' : auditLatch.triggerDrawdownPct.toFixed(2),
+                    })}
               </Text>
               <TouchableOpacity
                 style={styles.markAuditedButton}
@@ -3989,11 +3993,11 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
                   // is a LEGACY EXIT trigger for a Legacy holding.
                   Alert.alert(t('markAuditedTitle'), t('markAuditedMessage', { ticker: stock.ticker }), [
                     { text: t('cancel'), style: 'cancel' },
-                    { text: t('auditThesisIntact'), onPress: () => markTickerAudited(stock.ticker, 'intact') },
+                    { text: t('auditThesisIntact'), onPress: () => markTickerAudited(stock.ticker, 'intact', auditCloseLocal) },
                     {
                       text: t('auditThesisBroken'),
                       style: 'destructive',
-                      onPress: () => markTickerAudited(stock.ticker, 'broken'),
+                      onPress: () => markTickerAudited(stock.ticker, 'broken', auditCloseLocal),
                     },
                   ])
                 }
@@ -4004,6 +4008,15 @@ const PortfolioStockRow = memo(function PortfolioStockRow({
             </>
           )}
         </View>
+      )}
+
+      {/* P13-A: the step level after an "intact" audit. */}
+      {!isEditing && showQualityDetails && stock.category === 'Quality' && auditLatch.status === 'audited' && auditLatch.nextAuditLevel !== null && (
+        <Text style={styles.allocationText}>
+          {t('nextAuditStep', {
+            level: formatUnitPrice(stock.ticker, auditLatch.nextAuditLevel, stock.currencySymbol, agorotSuffix),
+          })}
+        </Text>
       )}
 
       {/* P10: the last audit's conclusion, once there is one. */}

@@ -11,6 +11,7 @@ from quality import (
     AUDIT_HIGH_WINDOW_TRADING_DAYS,
     Z_SCORE_WINDOW_TRADING_DAYS,
     compute_close_drawdown,
+    compute_earnings_audit,
     compute_max_close_since,
     compute_entry_rule_fundamentals,
     compute_price_statistics,
@@ -94,3 +95,18 @@ def test_max_close_since_first_buy():
     assert compute_max_close_since(closes, date(2025, 1, 3)) == 130.0
     assert compute_max_close_since(closes, date(2025, 1, 1)) == 140.0
     assert compute_max_close_since(closes, date(2025, 2, 1)) is None
+
+
+def test_earnings_audit_is_due_on_the_third_session_after_the_report():
+    # FICO reported 2026-11-04 (after the close); sessions 11-05, 11-06, 11-09.
+    reports = [(date(2027, 1, 27), False), (date(2026, 11, 4), True), (date(2026, 7, 29), True)]
+    closes = [(date(2026, 11, 4), 1.0), (date(2026, 11, 5), 1.0), (date(2026, 11, 6), 1.0)]
+    state = compute_earnings_audit(reports, closes, date(2026, 11, 7))
+    assert state.last_report_date == date(2026, 11, 4)
+    assert state.due_close_date is None
+    state = compute_earnings_audit(reports, closes + [(date(2026, 11, 9), 1.0)], date(2026, 11, 10))
+    assert state.due_close_date == date(2026, 11, 9)
+
+
+def test_no_past_report_means_no_earnings_audit():
+    assert compute_earnings_audit([(date(2027, 1, 27), False)], [], date(2026, 11, 28)) is None

@@ -80,6 +80,10 @@ QUALITY_METRICS_TABLE = "quality_metrics"
 FMP_KEY_METRICS_TTM_URL = "https://financialmodelingprep.com/stable/key-metrics-ttm"
 FMP_RATIOS_TTM_URL = "https://financialmodelingprep.com/stable/ratios-ttm"
 FMP_RATIOS_ANNUAL_URL = "https://financialmodelingprep.com/stable/ratios"
+FMP_EARNINGS_URL = "https://financialmodelingprep.com/stable/earnings"
+# P13-B: the earnings audit fires this many completed trading sessions
+# after a quarterly report, so FMP's TTM figures (ROIC) have been updated.
+EARNINGS_AUDIT_DELAY_SESSIONS = 3
 FMP_TIMEOUT_SECONDS = 15
 FMP_ROIC_FIELD = "returnOnInvestedCapitalTTM"
 FMP_PE_TTM_FIELD = "priceToEarningsRatioTTM"
@@ -353,6 +357,54 @@ def fetch_fmp_annual_ratios(symbol: str) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: str(row.get("date", "")), reverse=True)[:PE_AVERAGE_YEARS]
 
 
+def fetch_fmp_earnings_dates(symbol: str) -> list[tuple[date, bool]]:
+    """Report dates from FMP's earnings endpoint, newest first, each with
+    whether it has an actual EPS (i.e. the report is out). Empty when FMP
+    has none (an ETF) or no API key is set."""
+    rows = _fmp_get(FMP_EARNINGS_URL, symbol, "earnings dates", {"limit": 8})
+    if rows is None:
+        return []
+    dates: list[tuple[date, bool]] = []
+    for row in rows:
+        try:
+            report_date = date.fromisoformat(str(row.get("date", ""))[:10])
+        except ValueError:
+            continue
+        dates.append((report_date, _finite_float(row.get("epsActual")) is not None))
+    return sorted(dates, key=lambda pair: pair[0], reverse=True)
+
+
+@dataclass(frozen=True)
+class EarningsAuditState:
+    last_report_date: date
+    # The close date of the EARNINGS_AUDIT_DELAY_SESSIONS-th completed
+    # session after the report; None while fewer sessions have closed.
+    due_close_date: date | None
+
+
+def compute_earnings_audit(
+    earnings_dates: list[tuple[date, bool]],
+    dated_closes: list[tuple[date, float]],
+    today: date,
+) -> EarningsAuditState | None:
+    """P13-B: the latest report that is out (actual EPS, or dated before
+    today), and whether EARNINGS_AUDIT_DELAY_SESSIONS completed sessions
+    have closed since it. A report published after the close counts the
+    next session as the first, so sessions strictly after the report date
+    are counted. None when there is no past report."""
+    past = [report for report, has_actual in earnings_dates if report <= today and (has_actual or report < today)]
+    if not past:
+        return None
+    last_report = max(past)
+    sessions_after = sorted(close_date for close_date, _ in dated_closes if close_date > last_report)
+    due = (
+        sessions_after[EARNINGS_AUDIT_DELAY_SESSIONS - 1]
+        if len(sessions_after) >= EARNINGS_AUDIT_DELAY_SESSIONS
+        else None
+    )
+    return EarningsAuditState(last_report, due)
+
+
 @dataclass(frozen=True)
 class EntryRuleFundamentals:
     pe_5y_avg: float | None
@@ -559,6 +611,27 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
                 print(f"[quality] Statistics refresh failed for '{symbol}' ({error}); serving cached values.")
                 stats_stale = True
 
+            # P13-B: the latest quarterly report and whether the audit after
+            # it is due, refreshed with the statistics (it depends on the
+            # sessions closed since). A failure keeps the cached values.
+            try:
+                earnings_dates = fetch_fmp_earnings_dates(symbol)
+                with _dated_closes_guard:
+                    cached_closes = _dated_closes_cache.get(symbol)
+                earnings = compute_earnings_audit(
+                    earnings_dates, cached_closes[1] if cached_closes else [], now.date()
+                )
+                row.update(
+                    last_earnings_date=earnings.last_report_date.isoformat() if earnings else None,
+                    earnings_audit_due_date=(
+                        earnings.due_close_date.isoformat() if earnings and earnings.due_close_date else None
+                    ),
+                )
+                refreshed = True
+            except QualityDataError as fmp_error:
+                print(f"[quality] FMP earnings refresh failed for '{symbol}' ({fmp_error}); keeping cached dates.")
+                stats_stale = True
+
             # P/E TTM moves with the price, so it refreshes with the
             # statistics. Its failure only marks the statistics stale.
             try:
@@ -609,6 +682,10 @@ def get_quality_metrics(symbol: str, store: QualityMetricsStore, now: datetime |
             "audit_close_date": row.get("audit_close_date"),
             "high_52w_close": _to_float(row.get("high_52w_close")),
             "close_drawdown_pct": _to_float(row.get("close_drawdown_pct")),
+            # P13-B: the latest quarterly report, and the close date of the
+            # 3rd completed session after it (null until then).
+            "last_earnings_date": row.get("last_earnings_date"),
+            "earnings_audit_due_date": row.get("earnings_audit_due_date"),
             "last_updated_stats": row.get("last_updated_stats"),
             "last_updated_fundamentals": row.get("last_updated_fundamentals"),
             # True when a refresh failed and an expired cached value is shown.

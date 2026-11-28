@@ -116,13 +116,20 @@ export function recordDailyCloseReading(ticker: string, reading: DailyCloseReadi
   }
 }
 
-export function markTickerAudited(ticker: string, outcome: AuditOutcome, now: Date = new Date()): void {
+// `closeLocal`: the latest completed close (normalized local currency),
+// which sets the P13-A step for an "intact" outcome.
+export function markTickerAudited(
+  ticker: string,
+  outcome: AuditOutcome,
+  closeLocal: number | null,
+  now: Date = new Date(),
+): void {
   if (!state.isLoaded) {
     return;
   }
   const key = normalizeTicker(ticker);
   const current = state.latches[key] ?? ARMED_LATCH;
-  const updated = markAudited(current, now, outcome);
+  const updated = markAudited(current, now, outcome, closeLocal);
   if (updated !== current) {
     const latches = { ...state.latches, [key]: updated };
     publish({ ...state, latches });
